@@ -16,28 +16,55 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tests"))
 
-from cases.swe_bed_friction_1d import make_test_case
+import argparse
+
 from zoomy_core.fvm.riemann_solvers import Rusanov
 from zoomy_core.transformation.to_openfoam import (
     FoamNumericsPrinter,
     FoamSystemModelPrinter,
+    FoamUpdateAuxPrinter,
 )
 
 
+# Map a case-name CLI flag to the factory module under tests/cases/.
+_CASE_FACTORIES = {
+    "swe_bed_friction_1d": "cases.swe_bed_friction_1d:make_test_case",
+    "swe_bed_as_aux_1d":   "cases.swe_bed_as_aux_1d:make_test_case",
+}
+
+
+def _load_factory(spec):
+    import importlib
+    mod_name, fn_name = spec.split(":")
+    mod = importlib.import_module(mod_name)
+    return getattr(mod, fn_name)
+
+
 def main():
-    sm = make_test_case()
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--case", default="swe_bed_friction_1d", choices=_CASE_FACTORIES,
+    )
+    args = ap.parse_args()
+    sm = _load_factory(_CASE_FACTORIES[args.case])()
     numerics = Rusanov(model=sm)
 
-    model_h = ROOT / "Model.H"
-    numerics_kernels_h = ROOT / "NumericsKernels.H"
+    paths = {
+        "Model.H":             FoamSystemModelPrinter,
+        "NumericsKernels.H":   FoamNumericsPrinter,
+        "UpdateAuxVariables.H": FoamUpdateAuxPrinter,
+    }
+    targets = {
+        "Model.H":              (sm, {"analytical_eigenvalues": True}),
+        "NumericsKernels.H":    (numerics, {}),
+        "UpdateAuxVariables.H": (sm, {}),
+    }
 
-    FoamSystemModelPrinter.write_code(
-        sm, model_h, analytical_eigenvalues=True
-    )
-    FoamNumericsPrinter.write_code(numerics, numerics_kernels_h)
-
-    print(f"wrote {model_h}")
-    print(f"wrote {numerics_kernels_h}")
+    for fname, cls in paths.items():
+        out = ROOT / fname
+        payload, opts = targets[fname]
+        cls.write_code(payload, out, **opts)
+        print(f"wrote {out}")
 
 
 if __name__ == "__main__":

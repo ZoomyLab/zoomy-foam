@@ -14,10 +14,48 @@
 #include "word.H"
 #include "label.H"
 
+#include "fvc.H"
+#include "fvcGrad.H"
+
 #include "Model.H"
 
 namespace numerics
 {
+
+// ── compute_derivative ─ spatial derivative helper for aux_registry ──────
+//
+// Writes ``D^(dx,dy,dz) source`` into ``result`` over the OpenFOAM mesh.
+// Phase 3 supports total order <= 1 via Gauss-linear cell gradient.
+// Higher orders will land via per-cell LSQ; for now they FatalError.
+inline void compute_derivative
+(
+    Foam::volScalarField& result,
+    const Foam::volScalarField& source,
+    int dx, int dy, int dz,
+    const Foam::fvMesh& /*mesh*/
+)
+{
+    const int total = dx + dy + dz;
+    if (total == 0)
+    {
+        result.primitiveFieldRef() = source.primitiveField();
+        return;
+    }
+    if (total == 1)
+    {
+        // Primitive-field assignment bypasses the dimension check —
+        // our Qaux convention is dimensionless, but ∇field has [1/length].
+        const Foam::tmp<Foam::volVectorField> tgrad = Foam::fvc::grad(source);
+        const int axis = (dx == 1 ? 0 : (dy == 1 ? 1 : 2));
+        result.primitiveFieldRef() =
+            tgrad().primitiveField().component(axis);
+        return;
+    }
+    FatalErrorInFunction
+        << "compute_derivative: total order " << total
+        << " not yet supported (Phase 3 covers order <= 1)."
+        << Foam::exit(Foam::FatalError);
+}
 
 // ── max_wavespeed — opaque helper consumed by generated NumericsKernels.H ─
 //
@@ -48,6 +86,7 @@ inline Foam::scalar max_wavespeed
 }  // namespace numerics — generated kernels reference it below
 
 #include "NumericsKernels.H"
+#include "UpdateAuxVariables.H"
 
 namespace numerics
 {

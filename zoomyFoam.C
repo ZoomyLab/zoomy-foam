@@ -78,11 +78,14 @@ int main(int argc, char *argv[])
 
     forAll(Q,    QI)    Q[QI]->write();
     forAll(Qaux, QauxI) Qaux[QauxI]->write();
+    numerics::update_aux_variables(Q, Qaux, mesh);
     numerics::correct_boundary_q(Q, Qaux, p, runTime.value());
 
     while (runTime.loop())
     {
         Info<< nl << "Time = " << runTime.userTimeName() << nl << endl;
+
+        numerics::update_aux_variables(Q, Qaux, mesh);
 
         const scalar dt = numerics::compute_dt(Q, Qaux, p, minInradius, Co);
         runTime.setDeltaT(dt);

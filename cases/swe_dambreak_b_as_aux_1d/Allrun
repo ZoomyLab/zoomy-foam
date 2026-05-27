@@ -1,0 +1,10 @@
+#!/bin/sh
+cd "${0%/*}" || exit 1
+set -e
+
+rm -rf 0 constant/polyMesh log.* postProcessing
+cp -r 0.orig 0
+
+blockMesh > log.blockMesh 2>&1
+setFields > log.setFields 2>&1
+zoomyFoam > log.zoomyFoam 2>&1

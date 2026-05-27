@@ -1,0 +1,27 @@
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    object      setFieldsDict;
+}
+
+// state = [h, hu]; Q0 = h, Q1 = hu.  Bed b lives in Qaux0 (loaded from
+// 0/Qaux0 if present, default uniform 0 — flat bed).
+
+defaultFieldValues
+(
+    volScalarFieldValue Q0 0.01    // downstream depth
+    volScalarFieldValue Q1 0       // momentum
+);
+
+regions
+(
+    boxToCell
+    {
+        box (0 -1 -1) (5 2 2);
+        fieldValues
+        (
+            volScalarFieldValue Q0 0.5    // upstream depth
+        );
+    }
+);
