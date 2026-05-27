@@ -1,0 +1,10 @@
+FoamFile
+{ format ascii; class dictionary; object controlDict; }
+application zoomyFoam;
+startFrom startTime; startTime 0;
+stopAt endTime; endTime 2.0;
+deltaT 0.001;
+writeControl adjustableRunTime; writeInterval 0.5;
+purgeWrite 0; writeFormat ascii; writePrecision 12; timeFormat general;
+runTimeModifiable true; adjustTimeStep no; maxCo 0.4;
+reconstructionOrder 1;   // start with 1st-order to isolate WB question

@@ -3,6 +3,11 @@ Make/linux*
 Make/darwin*
 Make/win*
 
+# Per-case generated headers (each cases/<name>/run.py emits these fresh)
+Model.H
+NumericsKernels.H
+UpdateAuxVariables.H
+
 # Python cache (test scripts under tests/)
 __pycache__/
 *.pyc
