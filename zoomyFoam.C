@@ -5,26 +5,13 @@
     \\  /    A nd           | Copyright (C) 2025 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
-License
-    This file is part of OpenFOAM.
-
-    OpenFOAM is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    OpenFOAM is distributed in the hope that it will be useful, but WITHOUT
-    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
-    FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
-    for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
-
 Application
-    shallowTest
+    zoomyFoam
 
 Description
+    SystemModel-driven explicit FV solver.  Model.H and NumericsKernels.H
+    are emitted from a frozen Zoomy SystemModel + Numerics
+    (Rusanov / HLL / NCP / ...) by ``tools/generate_headers.py``.
 
 \*---------------------------------------------------------------------------*/
 
@@ -51,8 +38,6 @@ Description
 
 using namespace Foam;
 
-// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
-
 int main(int argc, char *argv[])
 {
     argList args(argc, argv);
@@ -62,13 +47,9 @@ int main(int argc, char *argv[])
     }
 
     Info<< "Create time\n" << endl;
-    Time runTime(Foam::Time::controlDictName, args);
+    Time runTime(Time::controlDictName, args);
 
-    Info
-        << "Create mesh for time = "
-        << runTime.name() << Foam::nl << Foam::endl;
-
-
+    Info<< "Create mesh for time = " << runTime.name() << nl << endl;
     fvMesh mesh
     (
         IOobject
@@ -80,71 +61,52 @@ int main(int argc, char *argv[])
         )
     );
 
-
-    List<volScalarField*> Q (Model::n_dof_q);
-    List<volScalarField*> Qaux (Model::n_dof_qaux);
-    List<surfaceScalarField*> Dp(Q.size());
-    List<surfaceScalarField*> Dm(Q.size());
+    List<volScalarField*>     Q  (Model::n_dof_q);
+    List<volScalarField*>     Qaux(Model::n_dof_qaux);
+    List<surfaceScalarField*> Dp (Q.size());
+    List<surfaceScalarField*> Dm (Q.size());
     initialize_fields(runTime.name(), mesh, Q, Qaux, Dp, Dm);
 
-    // Set initial condition based on position
-    forAll(Q[1]->internalField(), cellI)
-    {
-        const point& C = mesh.C()[cellI];   // cell center
-        scalar x = C.x();
-        Q[1]->internalFieldRef()[cellI] = 0.2;
-        if (x > 5) Q[1]->internalFieldRef()[cellI] = 0.4;
-    }   
-    forAll(Q, QI)
-    {
-        Q[QI]->write();
-    }
-    forAll(Qaux, QauxI)
-    {
-        Qaux[QauxI]->write();
-    }
+    // Parameter vector p — default values from the generated header.
+    const List<scalar> p = Model::default_parameters();
 
-    surfaceScalarField minInradius = numerics::computeFaceMinInradius(mesh, runTime);
+    // Geometric helper for CFL.
+    surfaceScalarField minInradius =
+        numerics::computeFaceMinInradius(mesh, runTime);
 
-    const dimensionedScalar diffusivity("diffusivity", dimKinematicViscosity, 0.01);
+    const scalar Co = readScalar(runTime.controlDict().lookup("maxCo"));
 
-    scalar Co = readScalar(runTime.controlDict().lookup("maxCo"));
-    scalar dt = numerics::compute_dt(Q, Qaux, minInradius, Co);
-    numerics::correctBoundaryQ(Q, Qaux, runTime.value());
-
+    forAll(Q,    QI)    Q[QI]->write();
+    forAll(Qaux, QauxI) Qaux[QauxI]->write();
+    numerics::correct_boundary_q(Q, Qaux, p, runTime.value());
 
     while (runTime.loop())
     {
         Info<< nl << "Time = " << runTime.userTimeName() << nl << endl;
 
-        dt = numerics::compute_dt(Q, Qaux, minInradius, Co);
+        const scalar dt = numerics::compute_dt(Q, Qaux, p, minInradius, Co);
         runTime.setDeltaT(dt);
 
-        numerics::updateNumericalQuasilinearFlux(Dp, Dm, Q, Qaux);
+        numerics::update_numerical_flux(Dp, Dm, Q, Qaux, p);
+
         forAll(Q, QI)
         {
             fvScalarMatrix
             (
-                //fvm::ddt(*Q[QI]) + fvc::div(*F[QI]) - fvm::laplacian(diffusivity, *Q[QI])
-                Foam::fvm::ddt(*Q[QI]) + numerics::quasilinear_operator(*Dp[QI], *Dm[QI])
-                //fvm::ddt(*Q[QI]) + fvc::div(*F[QI])
-                // fvm::ddt(*Q[QI]) + fvc::div(*F[QI]) - fvm::laplacian(diffusivity, *Q[QI])
+                fvm::ddt(*Q[QI])
+                + numerics::quasilinear_operator(*Dp[QI], *Dm[QI])
             ).solve();
         }
-        numerics::correctBoundaryQ(Q, Qaux, runTime.value());
+
+        numerics::correct_boundary_q(Q, Qaux, p, runTime.value());
         runTime.write();
     }
 
-    // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
-
-    Info<< nl << "ExecutionTime = " << runTime.elapsedCpuTime() << " s"
-        << "  ClockTime = " << runTime.elapsedClockTime() << " s"
+    Info<< nl
+        << "ExecutionTime = " << runTime.elapsedCpuTime() << " s"
+        << "  ClockTime = "   << runTime.elapsedClockTime() << " s"
         << nl << endl;
-
     Info<< "End\n" << endl;
 
     return 0;
 }
-
-
-// ************************************************************************* //
