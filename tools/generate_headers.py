@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 import argparse
 
-from zoomy_core.fvm.riemann_solvers import Rusanov
+from zoomy_core.fvm import riemann_solvers
 from zoomy_core.transformation.to_openfoam import (
     FoamNumericsPrinter,
     FoamSystemModelPrinter,
@@ -31,6 +31,17 @@ _CASE_FACTORIES = {
     "swe_bed_friction_1d": "cases.swe_bed_friction_1d:make_test_case",
     "swe_bed_as_aux_1d":   "cases.swe_bed_as_aux_1d:make_test_case",
 }
+
+# Riemann solver classes exposed for --riemann.
+_RIEMANN_SOLVERS = (
+    "Rusanov",
+    "HLL",
+    "HLLC",
+    "PositiveRusanov",
+    "NonconservativeRusanov",
+    "PositiveNonconservativeRusanov",
+    "PositiveNonconservativeHLL",
+)
 
 
 def _load_factory(spec):
@@ -45,9 +56,13 @@ def main():
     ap.add_argument(
         "--case", default="swe_bed_friction_1d", choices=_CASE_FACTORIES,
     )
+    ap.add_argument(
+        "--riemann", default="Rusanov", choices=_RIEMANN_SOLVERS,
+    )
     args = ap.parse_args()
     sm = _load_factory(_CASE_FACTORIES[args.case])()
-    numerics = Rusanov(model=sm)
+    Solver = getattr(riemann_solvers, args.riemann)
+    numerics = Solver(model=sm)
 
     paths = {
         "Model.H":             FoamSystemModelPrinter,

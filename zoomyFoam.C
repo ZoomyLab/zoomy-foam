@@ -67,6 +67,24 @@ int main(int argc, char *argv[])
     List<surfaceScalarField*> Dm (Q.size());
     initialize_fields(runTime.name(), mesh, Q, Qaux, Dp, Dm);
 
+    // Source fields — populated each step from Model::source(Q, Qaux, p).
+    // Dimensions must match fvm::ddt(Q) (= [Q]/[time]) for the matrix add.
+    List<volScalarField*> Src(Model::n_dof_q);
+    forAll(Src, SrcI)
+    {
+        Src[SrcI] = new volScalarField
+        (
+            IOobject
+            (
+                "Src" + std::to_string(SrcI),
+                runTime.name(), mesh,
+                IOobject::NO_READ, IOobject::NO_WRITE
+            ),
+            mesh,
+            dimensionedScalar("zero", dimless/dimTime, scalar(0.0))
+        );
+    }
+
     // Parameter vector p — default values from the generated header.
     const List<scalar> p = Model::default_parameters();
 
@@ -90,6 +108,7 @@ int main(int argc, char *argv[])
         const scalar dt = numerics::compute_dt(Q, Qaux, p, minInradius, Co);
         runTime.setDeltaT(dt);
 
+        numerics::update_source(Src, Q, Qaux, p);
         numerics::update_numerical_flux(Dp, Dm, Q, Qaux, p);
 
         forAll(Q, QI)
@@ -98,6 +117,7 @@ int main(int argc, char *argv[])
             (
                 fvm::ddt(*Q[QI])
                 + numerics::quasilinear_operator(*Dp[QI], *Dm[QI])
+                - *Src[QI]
             ).solve();
         }
 

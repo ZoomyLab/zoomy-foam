@@ -60,24 +60,45 @@ inline void compute_derivative
 // ── max_wavespeed — opaque helper consumed by generated NumericsKernels.H ─
 //
 // Wraps Model::eigenvalues, returning max|λ| of the normal-projected
-// spectrum at the given (Q, Qaux, p, n).  Same role as the
-// ``max_wavespeed`` Python callback injected into numpy / jax.
-inline Foam::scalar max_wavespeed
-(
-    const Foam::List<Foam::scalar>& Q,
-    const Foam::List<Foam::scalar>& Qaux,
-    const Foam::List<Foam::scalar>& p,
-    const Foam::vector& n
-)
+// spectrum at the given state.  The printer emits the symbolic
+// ``max_wavespeed(*Q, *Qaux, *p, *n)`` as a flat variadic call — this
+// helper unpacks back into the per-side Lists using the Model::
+// constants, then dispatches to Model::eigenvalues.  Works uniformly
+// for cell-centre, ±-side, and HR-reconstructed mixed-side invocations.
+template <typename... Ts>
+inline Foam::scalar max_wavespeed(Ts... args)
 {
+    constexpr int NQ = Model::n_dof_q;
+    constexpr int NA = Model::n_dof_qaux;
+    constexpr int NP = Model::n_parameters;
+    constexpr int ND = Model::dimension;
+    static_assert(
+        sizeof...(args) == NQ + NA + NP + ND,
+        "max_wavespeed: arg count must equal n_dof_q + n_dof_qaux + "
+        "n_parameters + dimension."
+    );
+    const Foam::scalar packed[] = { static_cast<Foam::scalar>(args)... };
+
+    Foam::List<Foam::scalar> Q(NQ);
+    Foam::List<Foam::scalar> Qaux(NA);
+    Foam::List<Foam::scalar> p(NP);
+    int i = 0;
+    for (int k = 0; k < NQ; ++k) Q[k] = packed[i++];
+    for (int k = 0; k < NA; ++k) Qaux[k] = packed[i++];
+    for (int k = 0; k < NP; ++k) p[k] = packed[i++];
+    Foam::vector n(0, 0, 0);
+    n.x() = packed[i];
+    if (ND >= 2) n.y() = packed[i + 1];
+    if (ND >= 3) n.z() = packed[i + 2];
+
     const auto evs = Model::eigenvalues(Q, Qaux, p, n);
     Foam::scalar mx = 0.0;
-    forAll(evs, i)
+    forAll(evs, j)
     {
-        const auto& row = evs[i];
-        forAll(row, j)
+        const auto& row = evs[j];
+        forAll(row, k)
         {
-            mx = std::max(mx, std::abs(row[j]));
+            mx = std::max(mx, std::abs(row[k]));
         }
     }
     return mx;
@@ -162,7 +183,21 @@ quasilinear_operator
     return tResult;
 }
 
-// ── Per-face Riemann driver: write Dp/Dm from Numerics::numerical_flux ──
+// ── Per-face Riemann driver: write Dp/Dm from Numerics ──────────────────
+//
+// Combines the conservative ``numerical_flux`` and the non-conservative
+// ``numerical_fluctuations`` (shape (2, n_eq) — row 0 is Dp-side, row 1
+// is Dm-side).  Cell residual updates per the numpy convention:
+//
+//   own (A) += ( + flux + fluct_minus ) * area / V
+//   nei (B) += ( - flux + fluct_plus  ) * area / V
+//
+// which we encode here as
+//
+//   Dm[face] = ( + flux + fluct_minus ) * area    // → owner cell
+//   Dp[face] = ( - flux + fluct_plus  ) * area    // → neighbour cell
+//
+// quasilinear_operator() does the cell-side summation and the /V.
 inline void update_numerical_flux
 (
     Foam::List<Foam::surfaceScalarField*>& Dp,
@@ -196,14 +231,16 @@ inline void update_numerical_flux
             Qaux_plus[i]  = (*Qaux[i])[nei];
         }
 
-        auto F = Numerics::numerical_flux
+        const auto F = Numerics::numerical_flux
+            (Q_minus, Q_plus, Qaux_minus, Qaux_plus, p, n);
+        const auto FL = Numerics::numerical_fluctuations
             (Q_minus, Q_plus, Qaux_minus, Qaux_plus, p, n);
         const Foam::scalar magS = mesh.magSf()[faceI];
 
         forAll(Dp, i)
         {
-            (*Dp[i])[faceI] = -F[i] * magS;
-            (*Dm[i])[faceI] =  F[i] * magS;
+            (*Dp[i])[faceI] = (-F[i] + FL[0][i]) * magS;
+            (*Dm[i])[faceI] = ( F[i] + FL[1][i]) * magS;
         }
     }
 
@@ -233,7 +270,9 @@ inline void update_numerical_flux
                                         [localFaceI];
             }
 
-            auto F = Numerics::numerical_flux
+            const auto F = Numerics::numerical_flux
+                (Q_minus, Q_plus, Qaux_minus, Qaux_plus, p, n);
+            const auto FL = Numerics::numerical_fluctuations
                 (Q_minus, Q_plus, Qaux_minus, Qaux_plus, p, n);
             const Foam::scalar magS =
                 mesh.magSf().boundaryField()[patchI][localFaceI];
@@ -241,9 +280,9 @@ inline void update_numerical_flux
             forAll(Dp, i)
             {
                 Dp[i]->boundaryFieldRef()[patchI][localFaceI] =
-                    -F[i] * magS;
+                    (-F[i] + FL[0][i]) * magS;
                 Dm[i]->boundaryFieldRef()[patchI][localFaceI] =
-                     F[i] * magS;
+                    ( F[i] + FL[1][i]) * magS;
             }
         }
     }
@@ -292,6 +331,30 @@ inline void correct_boundary_q
             {
                 Q[i]->boundaryFieldRef()[patchI][localFaceI] = bc_value[i];
             }
+        }
+    }
+}
+
+// ── Cell-centre source evaluation: writes Model::source per cell ────────
+inline void update_source
+(
+    Foam::List<Foam::volScalarField*>& Src,
+    const Foam::List<Foam::volScalarField*>& Q,
+    const Foam::List<Foam::volScalarField*>& Qaux,
+    const Foam::List<Foam::scalar>& p
+)
+{
+    const Foam::label nC = Q[0]->size();
+    Foam::List<Foam::scalar> q(Model::n_dof_q);
+    Foam::List<Foam::scalar> qa(Model::n_dof_qaux);
+    for (Foam::label cellI = 0; cellI < nC; ++cellI)
+    {
+        forAll(Q, i)    q[i]  = (*Q[i])[cellI];
+        forAll(Qaux, i) qa[i] = (*Qaux[i])[cellI];
+        const auto S = Model::source(q, qa, p);
+        forAll(Src, i)
+        {
+            Src[i]->primitiveFieldRef()[cellI] = S[i][0];
         }
     }
 }
