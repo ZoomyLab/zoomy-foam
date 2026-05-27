@@ -210,7 +210,7 @@ inline void update_numerical_flux
     }
 }
 
-// ── BC dispatch — Phase 4 will wire boundary_conditions Piecewise here. ──
+// ── BC dispatch via Model::boundary_conditions Piecewise ────────────────
 inline void correct_boundary_q
 (
     const Foam::List<Foam::volScalarField*>& Q,
@@ -219,12 +219,42 @@ inline void correct_boundary_q
     const Foam::scalar& time
 )
 {
-    // Phase 4 work — for now boundary fields rely on the patch types set
-    // up in init.H (fixedValue / zeroGradient).
-    (void)Q;
-    (void)Qaux;
-    (void)p;
-    (void)time;
+    auto patchMap = get_map_patchNameToPatchIndex();
+    const Foam::fvMesh& mesh = Q[0]->mesh();
+
+    Foam::List<Foam::scalar> q_inner(Model::n_dof_q);
+    Foam::List<Foam::scalar> qaux_inner(Model::n_dof_qaux);
+
+    forAll(mesh.boundaryMesh(), patchI)
+    {
+        const Foam::polyPatch& pp = mesh.boundaryMesh()[patchI];
+        if (!patchMap.found(pp.name()))
+        {
+            continue;
+        }
+        const Foam::label bc_idx = patchMap[pp.name()];
+
+        forAll(pp, localFaceI)
+        {
+            const Foam::label& cellI = pp.faceCells()[localFaceI];
+            const Foam::vector& n = pp.faceNormals()[localFaceI];
+            const Foam::vector& X = mesh.cellCentres()[cellI];
+            const Foam::scalar dX = Foam::mag(
+                pp.faceCentres()[localFaceI] - mesh.cellCentres()[cellI]
+            );
+
+            forAll(Q, i)    q_inner[i]    = (*Q[i])[cellI];
+            forAll(Qaux, i) qaux_inner[i] = (*Qaux[i])[cellI];
+
+            const auto bc_value = Model::boundary_conditions
+                (bc_idx, time, X, dX, q_inner, qaux_inner, p, n);
+
+            forAll(Q, i)
+            {
+                Q[i]->boundaryFieldRef()[patchI][localFaceI] = bc_value[i];
+            }
+        }
+    }
 }
 
 // ── CFL-limited timestep using Numerics::local_max_abs_eigenvalue ───────

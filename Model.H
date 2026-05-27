@@ -94,4 +94,26 @@ inline Foam::List<Foam::List<Foam::scalar>> source(
     return res;
 }
 
+
+inline Foam::List<Foam::scalar> boundary_conditions(
+    const int bc_idx,
+    const Foam::scalar& time,
+    const Foam::vector& X,
+    const Foam::scalar& dX,
+    const Foam::List<Foam::scalar>& Q,
+    const Foam::List<Foam::scalar>& Qaux,
+    const Foam::List<Foam::scalar>& p,
+    const Foam::vector& n)
+{
+    if (bc_idx == 0 || bc_idx == 1 || bc_idx == 2) {
+        auto res = Foam::List<Foam::scalar>(3, 0.0);
+        res[0] = Q[0];
+        res[1] = Q[1];
+        res[2] = Q[2];
+        return res;
+    }
+    auto default_res = Foam::List<Foam::scalar>(3, 0.0);
+    return default_res;
+}
+
 } // namespace Model
