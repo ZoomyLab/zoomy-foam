@@ -1,0 +1,8 @@
+# OpenFOAM build artifacts
+Make/linux*
+Make/darwin*
+Make/win*
+
+# Python cache (test scripts under tests/)
+__pycache__/
+*.pyc
