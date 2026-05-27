@@ -8,11 +8,11 @@ namespace Model
 {
 constexpr int n_dof_q    = 3;
 constexpr int n_dof_qaux = 0;
-constexpr int n_parameters = 2;
+constexpr int n_parameters = 1;
 constexpr int dimension  = 1;
-const Foam::List<Foam::word> map_boundary_tag_to_function_index{ "inflow", "outflow", "wall" };
-const Foam::List<Foam::word> parameter_names{ "g", "n_m" };
-inline Foam::List<Foam::scalar> default_parameters() { return { 9.81, 0.0 }; }
+const Foam::List<Foam::word> map_boundary_tag_to_function_index{ "inflow", "outflow" };
+const Foam::List<Foam::word> parameter_names{ "g" };
+inline Foam::List<Foam::scalar> default_parameters() { return { 9.81 }; }
 
 inline Foam::List<Foam::List<Foam::scalar>> flux_x(
     const Foam::List<Foam::scalar>& Q,
@@ -90,7 +90,34 @@ inline Foam::List<Foam::List<Foam::scalar>> source(
     auto res = Foam::List<Foam::List<Foam::scalar>>(3, Foam::List<Foam::scalar>(1, 0.0));
     res[0][0] = 0;
     res[1][0] = 0;
-    res[2][0] = -p[0]*Foam::pow(Q[1], -2.3333333333333335)*Q[2]*Foam::pow(p[1], 2)*Foam::mag(Q[2]);
+    res[2][0] = 0;
+    return res;
+}
+
+
+inline Foam::List<Foam::scalar> reconstruction_variables(
+    const Foam::List<Foam::scalar>& Q,
+    const Foam::List<Foam::scalar>& Qaux,
+    const Foam::List<Foam::scalar>& p)
+{
+    auto res = Foam::List<Foam::scalar>(3, 0.0);
+    res[0] = Q[0];
+    res[1] = Q[0] + Q[1];
+    res[2] = Q[2]/Q[1];
+    return res;
+}
+
+
+inline Foam::List<Foam::scalar> state_from_reconstruction(
+    const Foam::List<Foam::scalar>& W,
+    const Foam::List<Foam::scalar>& Qaux,
+    const Foam::List<Foam::scalar>& p)
+{
+    Foam::scalar t0 = -W[0] + W[1];
+    auto res = Foam::List<Foam::scalar>(3, 0.0);
+    res[0] = W[0];
+    res[1] = t0;
+    res[2] = W[2]*t0;
     return res;
 }
 
@@ -105,7 +132,7 @@ inline Foam::List<Foam::scalar> boundary_conditions(
     const Foam::List<Foam::scalar>& p,
     const Foam::vector& n)
 {
-    if (bc_idx == 0 || bc_idx == 1 || bc_idx == 2) {
+    if (bc_idx == 0 || bc_idx == 1) {
         auto res = Foam::List<Foam::scalar>(3, 0.0);
         res[0] = Q[0];
         res[1] = Q[1];

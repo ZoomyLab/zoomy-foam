@@ -10,8 +10,12 @@ Application
 
 Description
     SystemModel-driven explicit FV solver.  Model.H and NumericsKernels.H
-    are emitted from a frozen Zoomy SystemModel + Numerics
-    (Rusanov / HLL / NCP / ...) by ``tools/generate_headers.py``.
+    are emitted from a frozen Zoomy SystemModel + Numerics via the
+    per-case Python config script (cases/<name>/run.py).
+
+    Time integration is purely explicit (forward Euler or Heun SSP-RK2)
+    and bypasses OpenFOAM's fvm::ddt — which would otherwise carry
+    Q.oldTime() across both RK2 stages and break Heun's stage 2.
 
 \*---------------------------------------------------------------------------*/
 
@@ -21,8 +25,6 @@ Description
 #include "dimensionSets.H"
 #include "dimensionedScalar.H"
 #include "fvcDiv.H"
-#include "fvmDdt.H"
-#include "fvmLaplacian.H"
 #include "messageStream.H"
 #include "vector.H"
 #include "vectorField.H"
@@ -67,16 +69,15 @@ int main(int argc, char *argv[])
     List<surfaceScalarField*> Dm (Q.size());
     initialize_fields(runTime.name(), mesh, Q, Qaux, Dp, Dm);
 
-    // Source fields — populated each step from Model::source(Q, Qaux, p).
-    // Dimensions must match fvm::ddt(Q) (= [Q]/[time]) for the matrix add.
+    // Source fields per equation.
     List<volScalarField*> Src(Model::n_dof_q);
-    forAll(Src, SrcI)
+    forAll(Src, i)
     {
-        Src[SrcI] = new volScalarField
+        Src[i] = new volScalarField
         (
             IOobject
             (
-                "Src" + std::to_string(SrcI),
+                "Src" + std::to_string(i),
                 runTime.name(), mesh,
                 IOobject::NO_READ, IOobject::NO_WRITE
             ),
@@ -85,7 +86,48 @@ int main(int argc, char *argv[])
         );
     }
 
-    // Parameter vector p — default values from the generated header.
+    // W (reconstruction variables) + gradW for 2nd-order Phase 5.
+    // W copy-constructs from Q so it inherits the same boundary patch
+    // types (zeroGradient on tagged patches, empty elsewhere).
+    List<volScalarField*> W(Model::n_dof_q);
+    List<volVectorField*> gradW(Model::n_dof_q);
+    forAll(W, i)
+    {
+        W[i] = new volScalarField
+        (
+            IOobject
+            (
+                "W" + std::to_string(i),
+                runTime.name(), mesh,
+                IOobject::NO_READ, IOobject::NO_WRITE
+            ),
+            *Q[i]
+        );
+        gradW[i] = new volVectorField
+        (
+            IOobject
+            (
+                "gradW" + std::to_string(i),
+                runTime.name(), mesh,
+                IOobject::NO_READ, IOobject::NO_WRITE
+            ),
+            mesh,
+            dimensionedVector(
+                "zero", dimless/dimLength, vector::zero
+            )
+        );
+    }
+
+    // Qold and L (RHS) storage for explicit time integration.
+    List<scalarField> Qold(Model::n_dof_q);
+    List<scalarField> L   (Model::n_dof_q);
+    forAll(Q, i)
+    {
+        Qold[i] = scalarField(mesh.nCells(), 0.0);
+        L[i]    = scalarField(mesh.nCells(), 0.0);
+    }
+
+    // Parameter vector p.
     const List<scalar> p = Model::default_parameters();
 
     // Geometric helper for CFL.
@@ -93,35 +135,91 @@ int main(int argc, char *argv[])
         numerics::computeFaceMinInradius(mesh, runTime);
 
     const scalar Co = readScalar(runTime.controlDict().lookup("maxCo"));
+    const label reconstructionOrder =
+        runTime.controlDict().lookupOrDefault<label>("reconstructionOrder", 1);
+    Info<< "reconstructionOrder = " << reconstructionOrder << endl;
 
     forAll(Q,    QI)    Q[QI]->write();
     forAll(Qaux, QauxI) Qaux[QauxI]->write();
     numerics::update_aux_variables(Q, Qaux, mesh);
     numerics::correct_boundary_q(Q, Qaux, p, runTime.value());
 
+    // Cell volume field for normalising the divergence operator.
+    const scalarField& cellV = mesh.V();
+
+    // Build L = Src − ∇·F_num  (per unit volume, in [Q]/[time]).
+    // This is the explicit RHS of dQ/dt = L(Q).
+    auto compute_rhs = [&]()
+    {
+        numerics::update_aux_variables(Q, Qaux, mesh);
+        numerics::update_source(Src, Q, Qaux, p);
+        if (reconstructionOrder >= 2)
+        {
+            numerics::update_W_fields(W, Q, Qaux, p);
+            numerics::update_W_gradients(gradW, W);
+            // WB protocol: don't reconstruct non-evolving "bed" slot
+            // (state[0] in SWE+bed).
+            gradW[0]->primitiveFieldRef() = Foam::vector::zero;
+            numerics::update_numerical_flux_o2
+                (Dp, Dm, Q, Qaux, W, gradW, p);
+        }
+        else
+        {
+            numerics::update_numerical_flux(Dp, Dm, Q, Qaux, p);
+        }
+        forAll(Q, i)
+        {
+            tmp<volScalarField> tDiv =
+                numerics::quasilinear_operator(*Dp[i], *Dm[i]);
+            L[i] = Src[i]->primitiveField() - tDiv().primitiveField();
+        }
+    };
+
     while (runTime.loop())
     {
         Info<< nl << "Time = " << runTime.userTimeName() << nl << endl;
 
+        // CFL — computed once from start-of-step state so both RK2 stages
+        // share the same dt.
         numerics::update_aux_variables(Q, Qaux, mesh);
-
         const scalar dt = numerics::compute_dt(Q, Qaux, p, minInradius, Co);
         runTime.setDeltaT(dt);
 
-        numerics::update_source(Src, Q, Qaux, p);
-        numerics::update_numerical_flux(Dp, Dm, Q, Qaux, p);
-
-        forAll(Q, QI)
+        if (reconstructionOrder >= 2)
         {
-            fvScalarMatrix
-            (
-                fvm::ddt(*Q[QI])
-                + numerics::quasilinear_operator(*Dp[QI], *Dm[QI])
-                - *Src[QI]
-            ).solve();
+            // SSP-RK2 (Shu-Osher form):
+            //   Q* = Q^n + dt · L(Q^n)
+            //   Q^{n+1} = 0.5 · (Q^n + Q* + dt · L(Q*))
+            forAll(Q, i) Qold[i] = Q[i]->primitiveField();
+
+            // Stage 1
+            compute_rhs();
+            forAll(Q, i)
+            {
+                Q[i]->primitiveFieldRef() = Qold[i] + dt * L[i];
+            }
+            numerics::correct_boundary_q(Q, Qaux, p, runTime.value());
+
+            // Stage 2 — L evaluated at Q*
+            compute_rhs();
+            forAll(Q, i)
+            {
+                Q[i]->primitiveFieldRef() =
+                    0.5 * (Qold[i] + Q[i]->primitiveField() + dt * L[i]);
+            }
+            numerics::correct_boundary_q(Q, Qaux, p, runTime.value());
+        }
+        else
+        {
+            // Forward Euler
+            compute_rhs();
+            forAll(Q, i)
+            {
+                Q[i]->primitiveFieldRef() += dt * L[i];
+            }
+            numerics::correct_boundary_q(Q, Qaux, p, runTime.value());
         }
 
-        numerics::correct_boundary_q(Q, Qaux, p, runTime.value());
         runTime.write();
     }
 

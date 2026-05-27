@@ -20,3 +20,6 @@ timeFormat      general;
 runTimeModifiable true;
 adjustTimeStep  no;
 maxCo           0.4;
+
+// Phase 5: 1 = forward Euler + 1st-order space, 2 = SSP-RK2 + W-reconstruction
+reconstructionOrder    2;

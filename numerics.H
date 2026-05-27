@@ -335,6 +335,196 @@ inline void correct_boundary_q
     }
 }
 
+// ── Phase 5: 2nd-order reconstruction helpers ────────────────────────────
+//
+// W = Model::reconstruction_variables(Q, Qaux, p) — primitive variables
+// the limiter should see (for SWE+bed: typically [b, η = h+b, u = hu/h])
+// so that a steady state in W is preserved by the gradient/limiter chain.
+//
+// gradW = fvc::grad(W) using whatever scheme is in fvSchemes (the user
+// chooses cellLimited Gauss linear 1, Venkatakrishnan, etc.).
+//
+// At each face we Taylor-extrapolate W to the face from each side, then
+// invert via Model::state_from_reconstruction to recover Q_L, Q_R.  The
+// existing 1st-order Numerics::numerical_flux + numerical_fluctuations
+// machinery consumes the reconstructed states unchanged.
+inline void update_W_fields
+(
+    Foam::List<Foam::volScalarField*>& W,
+    const Foam::List<Foam::volScalarField*>& Q,
+    const Foam::List<Foam::volScalarField*>& Qaux,
+    const Foam::List<Foam::scalar>& p
+)
+{
+    const Foam::label nC = Q[0]->size();
+    Foam::List<Foam::scalar> q(Model::n_dof_q);
+    Foam::List<Foam::scalar> qa(Model::n_dof_qaux);
+
+    // Internal cells.
+    for (Foam::label cellI = 0; cellI < nC; ++cellI)
+    {
+        forAll(Q, i)    q[i]  = (*Q[i])[cellI];
+        forAll(Qaux, i) qa[i] = (*Qaux[i])[cellI];
+        const auto Wcell = Model::reconstruction_variables(q, qa, p);
+        forAll(W, i)
+        {
+            W[i]->primitiveFieldRef()[cellI] = Wcell[i];
+        }
+    }
+
+    // Boundary patches: copy the owner cell's reconstruction-variable
+    // value (zero-gradient-style).  Without this, fvc::grad picks up
+    // a spurious contribution at boundary cells from the
+    // default-initialised (= 0) boundary field, biasing gradW even
+    // when the cell-centre W is uniform.  Skip empty patches (0-size
+    // boundary field — write would segfault).
+    const Foam::fvMesh& mesh = Q[0]->mesh();
+    forAll(mesh.boundaryMesh(), patchI)
+    {
+        if (W[0]->boundaryField()[patchI].size() == 0) continue;
+        const Foam::polyPatch& pp = mesh.boundaryMesh()[patchI];
+        const Foam::labelList& fc = pp.faceCells();
+        forAll(fc, fi)
+        {
+            const Foam::label cellI = fc[fi];
+            forAll(Q, i)    q[i]  = (*Q[i])[cellI];
+            forAll(Qaux, i) qa[i] = (*Qaux[i])[cellI];
+            const auto Wcell = Model::reconstruction_variables(q, qa, p);
+            forAll(W, i)
+            {
+                W[i]->boundaryFieldRef()[patchI][fi] = Wcell[i];
+            }
+        }
+    }
+}
+
+inline void update_W_gradients
+(
+    Foam::List<Foam::volVectorField*>& gradW,
+    const Foam::List<Foam::volScalarField*>& W
+)
+{
+    forAll(W, i)
+    {
+        // Primitive-field assignment to bypass the dim check
+        // (gradW is [1/length] vs W dimless).
+        const Foam::tmp<Foam::volVectorField> tgrad =
+            Foam::fvc::grad(*W[i]);
+        gradW[i]->primitiveFieldRef() = tgrad().primitiveField();
+    }
+}
+
+inline void update_numerical_flux_o2
+(
+    Foam::List<Foam::surfaceScalarField*>& Dp,
+    Foam::List<Foam::surfaceScalarField*>& Dm,
+    const Foam::List<Foam::volScalarField*>& Q,
+    const Foam::List<Foam::volScalarField*>& Qaux,
+    const Foam::List<Foam::volScalarField*>& W,
+    const Foam::List<Foam::volVectorField*>& gradW,
+    const Foam::List<Foam::scalar>& p
+)
+{
+    const Foam::fvMesh& mesh = Q[0]->mesh();
+    // Positivity guard floor (free-surface depth).
+    const Foam::scalar h_min = 1e-6;
+
+    Foam::List<Foam::scalar> W_L(Model::n_dof_q), W_R(Model::n_dof_q);
+    Foam::List<Foam::scalar> Q_L(Model::n_dof_q), Q_R(Model::n_dof_q);
+    Foam::List<Foam::scalar> Qaux_L(Model::n_dof_qaux);
+    Foam::List<Foam::scalar> Qaux_R(Model::n_dof_qaux);
+
+    for (int faceI = 0; faceI < mesh.nInternalFaces(); ++faceI)
+    {
+        const Foam::vector n = mesh.Sf()[faceI] / mesh.magSf()[faceI];
+        const Foam::label& own = mesh.faceOwner()[faceI];
+        const Foam::label& nei = mesh.faceNeighbour()[faceI];
+        const Foam::vector& xF  = mesh.Cf()[faceI];
+        const Foam::vector  rL  = xF - mesh.C()[own];
+        const Foam::vector  rR  = xF - mesh.C()[nei];
+
+        // Taylor reconstruction in W on each side.
+        forAll(W, i)
+        {
+            W_L[i] = (*W[i])[own] + ((*gradW[i])[own] & rL);
+            W_R[i] = (*W[i])[nei] + ((*gradW[i])[nei] & rR);
+        }
+        forAll(Qaux, i)
+        {
+            Qaux_L[i] = (*Qaux[i])[own];
+            Qaux_R[i] = (*Qaux[i])[nei];
+        }
+
+        // Invert W → Q on each side.
+        Q_L = Model::state_from_reconstruction(W_L, Qaux_L, p);
+        Q_R = Model::state_from_reconstruction(W_R, Qaux_R, p);
+
+        // Positivity fallback — if either side dropped below the floor,
+        // revert to 1st-order (W_side = W_cellcentre, equiv. Q_side =
+        // Q_cellcentre).  Index 1 = h for the SWE+bed state layout;
+        // TODO: emit h_index from the printer for generality.
+        if (Q_L[1] < h_min || Q_R[1] < h_min)
+        {
+            forAll(Q, i)
+            {
+                Q_L[i] = (*Q[i])[own];
+                Q_R[i] = (*Q[i])[nei];
+            }
+        }
+
+        const auto F  = Numerics::numerical_flux
+            (Q_L, Q_R, Qaux_L, Qaux_R, p, n);
+        const auto FL = Numerics::numerical_fluctuations
+            (Q_L, Q_R, Qaux_L, Qaux_R, p, n);
+        const Foam::scalar magS = mesh.magSf()[faceI];
+
+        forAll(Dp, i)
+        {
+            (*Dp[i])[faceI] = (-F[i] + FL[0][i]) * magS;
+            (*Dm[i])[faceI] = ( F[i] + FL[1][i]) * magS;
+        }
+    }
+
+    // Boundary faces — keep 1st-order (matches the no-reconstruction
+    // approach in the 1st-order path so BC dispatch is consistent).
+    auto patchMap = get_map_patchNameToPatchIndex();
+    forAll(mesh.boundaryMesh(), patchI)
+    {
+        const Foam::polyPatch& pp = mesh.boundaryMesh()[patchI];
+        if (!patchMap.found(pp.name())) continue;
+        forAll(pp, localFaceI)
+        {
+            const Foam::label& cellI = pp.faceCells()[localFaceI];
+            const Foam::vector& nb = pp.faceNormals()[localFaceI];
+
+            forAll(Q, i)
+            {
+                Q_L[i] = (*Q[i])[cellI];
+                Q_R[i] = Q[i]->boundaryField()[patchI][localFaceI];
+            }
+            forAll(Qaux, i)
+            {
+                Qaux_L[i] = (*Qaux[i])[cellI];
+                Qaux_R[i] = Qaux[i]->boundaryField()[patchI][localFaceI];
+            }
+            const auto F  = Numerics::numerical_flux
+                (Q_L, Q_R, Qaux_L, Qaux_R, p, nb);
+            const auto FL = Numerics::numerical_fluctuations
+                (Q_L, Q_R, Qaux_L, Qaux_R, p, nb);
+            const Foam::scalar magS =
+                mesh.magSf().boundaryField()[patchI][localFaceI];
+
+            forAll(Dp, i)
+            {
+                Dp[i]->boundaryFieldRef()[patchI][localFaceI] =
+                    (-F[i] + FL[0][i]) * magS;
+                Dm[i]->boundaryFieldRef()[patchI][localFaceI] =
+                    ( F[i] + FL[1][i]) * magS;
+            }
+        }
+    }
+}
+
 // ── Cell-centre source evaluation: writes Model::source per cell ────────
 inline void update_source
 (

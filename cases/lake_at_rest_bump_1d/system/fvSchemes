@@ -6,7 +6,12 @@ FoamFile
 }
 
 ddtSchemes           { default Euler; }
-gradSchemes          { default Gauss linear; }
+gradSchemes
+{
+    // Unlimited Gauss linear for the WB regression — limiter
+    // interactions are tested separately.
+    default          Gauss linear;
+}
 divSchemes           { default Gauss linear; }
 laplacianSchemes     { default Gauss linear corrected; }
 interpolationSchemes { default linear; }

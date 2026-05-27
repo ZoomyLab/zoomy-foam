@@ -1,0 +1,8 @@
+FoamFile
+{ format ascii; class dictionary; object fvSchemes; }
+ddtSchemes           { default Euler; }
+gradSchemes          { default cellLimited Gauss linear 1; }
+divSchemes           { default Gauss linear; }
+laplacianSchemes     { default Gauss linear corrected; }
+interpolationSchemes { default linear; }
+snGradSchemes        { default corrected; }

@@ -94,6 +94,13 @@ class SWEBedFriction1D(StructuredDerivativeModel):
         S[2, 0] = -g * n_m * n_m * hu * Abs(hu) / h ** (7 / 3)
         return ZArray(S)
 
+    def reconstruction_variables(self):
+        """Primitives that the limiter sees — chosen so lake-at-rest
+        (h+b = const, u = 0) maps to W = [b, const, 0] which is
+        preserved by any standard cellLimited scheme."""
+        b, h, hu = self.Q.b, self.Q.h, self.Q.hu
+        return ZArray([b, h + b, hu / h])
+
 
 def build_system_model():
     bcs = BC.BoundaryConditions([

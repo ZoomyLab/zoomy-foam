@@ -45,7 +45,7 @@ inline Foam::List<Foam::List<Foam::scalar>> numerical_fluctuations(
     Foam::scalar t3 = Foam::max(0.0, Q_plus[0] + Q_plus[1] + t1);
     Foam::scalar t4 = Q_minus[2]*t2/Foam::max(1.0e-14, Q_minus[1]);
     Foam::scalar t5 = (1.0 / Foam::pow(Foam::max(1.0e-14, Q_plus[1]), 1));
-    Foam::scalar t6 = 0.5*Foam::max(numerics::max_wavespeed(t0, t2, t4, p[0], p[1], n.x()), numerics::max_wavespeed(t0, t3, Q_plus[2]*t3*t5, p[0], p[1], n.x()));
+    Foam::scalar t6 = 0.5*Foam::max(numerics::max_wavespeed(t0, t2, t4, p[0], n.x()), numerics::max_wavespeed(t0, t3, Q_plus[2]*t3*t5, p[0], n.x()));
     Foam::scalar t7 = t6*(-t2 + t3);
     Foam::scalar t8 = 0.5*p[0];
     Foam::scalar t9 = t6*(Q_plus[2]*t3*t5 - t4);
@@ -67,7 +67,7 @@ inline Foam::List<Foam::scalar> local_max_abs_eigenvalue(
     const Foam::vector& n)
 {
     auto res = Foam::List<Foam::scalar>(1, 0.0);
-    res[0] = numerics::max_wavespeed(Q[0], Q[1], Q[2], p[0], p[1], n.x());
+    res[0] = numerics::max_wavespeed(Q[0], Q[1], Q[2], p[0], n.x());
     return res;
 }
 
