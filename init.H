@@ -21,17 +21,20 @@ void initialize_fields(word runTimeName, const fvMesh& mesh, List<volScalarField
     forAll(Q, QI)
     {
         word name = "Q" + std::to_string(QI);
+        // Read initial field from <case>/0/Qi (MUST_READ).  The case
+        // author supplies the IC and patch types; init.H below
+        // overrides the patch type to zeroGradient on tagged patches
+        // (full BC dispatch lands in Phase 4).
         Q[QI] = new volScalarField (
             IOobject
             (
                 name,
                 runTimeName,
                 mesh,
-                IOobject::NO_READ,
+                IOobject::MUST_READ,
                 IOobject::AUTO_WRITE
             ),
-            mesh,
-            dimensionedScalar(name, dimless, scalar(0.0))
+            mesh
         );
     }
     forAll(Q, QI)
@@ -41,17 +44,18 @@ void initialize_fields(word runTimeName, const fvMesh& mesh, List<volScalarField
             const word& patchName = mesh.boundary()[patchI].name();
             if (findIndex(Model::map_boundary_tag_to_function_index, patchName) != -1)
             {
+                // Default: zeroGradient (transmissive / extrapolation).  The
+                // full BC dispatch via Model::boundary_conditions Piecewise
+                // will replace this in Phase 4.
                 Q[QI]->boundaryFieldRef().set
                 (
                     patchI,
-                    new fixedValueFvPatchScalarField
+                    new zeroGradientFvPatchScalarField
                     (
                         Q[QI]->boundaryField()[patchI].patch(),
                         Q[QI]->internalField()
                     )
                 );
-        
-                Q[QI]->boundaryFieldRef()[patchI] = 1.0;
             }
             else
             {
@@ -71,13 +75,16 @@ void initialize_fields(word runTimeName, const fvMesh& mesh, List<volScalarField
     forAll(Qaux, QauxI)
     {
         word name = "Qaux" + std::to_string(QauxI);
+        // Qaux fields are populated by the solver each step
+        // (update_aux_variables, Phase 3); start from disk if a 0/Qauxi
+        // file exists, otherwise zero.
         Qaux[QauxI] = new volScalarField (
             IOobject
             (
                 name,
                 runTimeName,
                 mesh,
-                IOobject::NO_READ,
+                IOobject::READ_IF_PRESENT,
                 IOobject::AUTO_WRITE
             ),
             mesh,

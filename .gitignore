@@ -6,3 +6,12 @@ Make/win*
 # Python cache (test scripts under tests/)
 __pycache__/
 *.pyc
+
+# OpenFOAM case runtime artifacts (cases/<name>/...)
+cases/*/[0-9]*/
+cases/*/constant/polyMesh/
+cases/*/log.*
+cases/*/postProcessing/
+cases/*/processor*/
+# Keep the case IC source under 0.orig and the system/ dictionaries.
+!cases/*/0.orig/

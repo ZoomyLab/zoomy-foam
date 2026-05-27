@@ -1,0 +1,15 @@
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    object      fvSolution;
+}
+
+solvers
+{
+    // fvm::ddt produces a diagonal-only matrix — any direct solver works.
+    "Q.*"
+    {
+        solver          diagonal;
+    }
+}

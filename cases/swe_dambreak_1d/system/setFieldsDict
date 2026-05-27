@@ -1,0 +1,29 @@
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    object      setFieldsDict;
+}
+
+// Dam-break IC: h = h_L on left half, h_R on right half.
+// Bed b = 0 everywhere (default), momentum hu = 0.
+
+defaultFieldValues
+(
+    volScalarFieldValue Q0 0       // b
+    volScalarFieldValue Q1 0.01    // h_R (downstream depth)
+    volScalarFieldValue Q2 0       // hu
+);
+
+regions
+(
+    boxToCell
+    {
+        box (0 -1 -1) (5 2 2);    // upstream half: x ∈ [0, 5]
+
+        fieldValues
+        (
+            volScalarFieldValue Q1 0.5     // h_L (reservoir depth)
+        );
+    }
+);
