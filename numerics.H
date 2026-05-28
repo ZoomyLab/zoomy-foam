@@ -426,8 +426,6 @@ inline void update_numerical_flux_o2
 )
 {
     const Foam::fvMesh& mesh = Q[0]->mesh();
-    // Positivity guard floor (free-surface depth).
-    const Foam::scalar h_min = 1e-6;
 
     Foam::List<Foam::scalar> W_L(Model::n_dof_q), W_R(Model::n_dof_q);
     Foam::List<Foam::scalar> Q_L(Model::n_dof_q), Q_R(Model::n_dof_q);
@@ -459,18 +457,11 @@ inline void update_numerical_flux_o2
         Q_L = Model::state_from_reconstruction(W_L, Qaux_L, p);
         Q_R = Model::state_from_reconstruction(W_R, Qaux_R, p);
 
-        // Positivity fallback — if either side dropped below the floor,
-        // revert to 1st-order (W_side = W_cellcentre, equiv. Q_side =
-        // Q_cellcentre).  Index 1 = h for the SWE+bed state layout;
-        // TODO: emit h_index from the printer for generality.
-        if (Q_L[1] < h_min || Q_R[1] < h_min)
-        {
-            forAll(Q, i)
-            {
-                Q_L[i] = (*Q[i])[own];
-                Q_R[i] = (*Q[i])[nei];
-            }
-        }
+        // (No hand-crafted positivity guard here — that was a C++
+        // special-case keyed on a hardcoded depth index, and it wrongly
+        // fired across still-water regions for plain SWE.  Wet/dry
+        // positivity belongs in the model-emitted reconstruction /
+        // limiter, not in the solver.)
 
         const auto F  = Numerics::numerical_flux
             (Q_L, Q_R, Qaux_L, Qaux_R, p, n);

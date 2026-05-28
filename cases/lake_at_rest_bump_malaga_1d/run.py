@@ -42,35 +42,7 @@ from zoomy_core.model import boundary_conditions as BC
 from zoomy_core.model import initial_conditions as IC
 from zoomy_core.model.derivative_workflow import StructuredDerivativeModel
 from zoomy_core.model.models.system_model import SystemModel
-from zoomy_core.fvm.riemann_solvers import NonconservativeRusanov
-
-
-class WBNonconservativeRusanov(NonconservativeRusanov):
-    """Equilibrium-variable (well-balanced) Rusanov for the Malaga
-    NCP formulation.
-
-    The base viscosity matrix dissipates the continuity row on Δh.  At
-    lake-at-rest h compensates the bed (Δh = −Δb ≠ 0), so the base
-    scheme injects spurious mass ∝ bed curvature.  We add the bed
-    column to the continuity row so the dissipation acts on
-    Δη = Δh + Δb, which is zero at rest → exact WB.  The stationary
-    jump (Δb, −Δb, 0) then produces zero dissipation in every row.
-    """
-
-    def get_viscosity_identity_fluctuations(self):
-        # For Q = [b, h, hu] this yields the matrix
-        #   [[0, 0, 0],
-        #    [1, 1, 0],     ← continuity dissipates on Δη = Δh + Δb
-        #    [0, 0, 1]]
-        # so the stationary jump (Δb, −Δb, 0) gives zero dissipation in
-        # every row → exact WB.  Verified: max|u| = 2.6e-15 at t=2.0.
-        Id = super().get_viscosity_identity_fluctuations()
-        h = self._field_handles.get("h")
-        b = self._field_handles.get("b")
-        if (h is not None and b is not None
-                and h.container == "q" and b.container == "q"):
-            Id[h.index, b.index] = 1
-        return Id
+from zoomy_core.fvm.riemann_solvers import WellBalancedNonconservativeRusanov
 from zoomy_core.transformation.to_openfoam import (
     FoamNumericsPrinter,
     FoamSystemModelPrinter,
@@ -125,7 +97,7 @@ def build_system_model():
 
 def write_headers():
     sm = build_system_model()
-    numerics = WBNonconservativeRusanov(model=sm)
+    numerics = WellBalancedNonconservativeRusanov(model=sm)
     FoamSystemModelPrinter.write_code(
         sm, FOAM_ROOT / "Model.H", analytical_eigenvalues=True
     )
