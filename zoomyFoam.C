@@ -176,15 +176,29 @@ int main(int argc, char *argv[])
         }
     };
 
-    while (runTime.loop())
-    {
-        Info<< nl << "Time = " << runTime.userTimeName() << nl << endl;
+    const scalar endTime = runTime.endTime().value();
 
-        // CFL — computed once from start-of-step state so both RK2 stages
+    // run() checks t < endTime WITHOUT advancing — so we can size the
+    // step from the current state, set it, then advance by exactly that
+    // dt.  Using while(loop()) instead advances by the *previous* step's
+    // deltaT, desyncing the clock from the dt the RK2 integrator uses and
+    // leaving Q at a time ≠ endTime by ~one dt (an O(dt)=O(dx) error that
+    // caps convergence at 1st order).
+    while (runTime.run())
+    {
+        // CFL — computed from the start-of-step state so both RK2 stages
         // share the same dt.
         numerics::update_aux_variables(Q, Qaux, mesh);
-        const scalar dt = numerics::compute_dt(Q, Qaux, p, minInradius, Co);
+        scalar dt = numerics::compute_dt(Q, Qaux, p, minInradius, Co);
+        // Land exactly on endTime — don't overshoot.
+        dt = Foam::min(dt, endTime - runTime.value());
         runTime.setDeltaT(dt);
+        ++runTime;
+        // Use the clock's actual deltaT (may be write-interval adjusted)
+        // so Q advances by exactly the amount the clock did.
+        const scalar dt_used = runTime.deltaTValue();
+
+        Info<< nl << "Time = " << runTime.userTimeName() << nl << endl;
 
         if (reconstructionOrder >= 2)
         {
@@ -197,7 +211,7 @@ int main(int argc, char *argv[])
             compute_rhs();
             forAll(Q, i)
             {
-                Q[i]->primitiveFieldRef() = Qold[i] + dt * L[i];
+                Q[i]->primitiveFieldRef() = Qold[i] + dt_used * L[i];
             }
             numerics::correct_boundary_q(Q, Qaux, p, runTime.value());
 
@@ -206,7 +220,7 @@ int main(int argc, char *argv[])
             forAll(Q, i)
             {
                 Q[i]->primitiveFieldRef() =
-                    0.5 * (Qold[i] + Q[i]->primitiveField() + dt * L[i]);
+                    0.5 * (Qold[i] + Q[i]->primitiveField() + dt_used * L[i]);
             }
             numerics::correct_boundary_q(Q, Qaux, p, runTime.value());
         }
@@ -216,7 +230,7 @@ int main(int argc, char *argv[])
             compute_rhs();
             forAll(Q, i)
             {
-                Q[i]->primitiveFieldRef() += dt * L[i];
+                Q[i]->primitiveFieldRef() += dt_used * L[i];
             }
             numerics::correct_boundary_q(Q, Qaux, p, runTime.value());
         }
