@@ -1,7 +1,12 @@
+# preCICE 3 needs C++17 (OpenFOAM Foundation defaults to c++14); the later
+# -std flag wins in g++.  preCICE headers live in /usr/include and libprecice
+# in /lib, both standard search paths — no -I/-L needed.
 EXE_INC = \
+    -std=c++17 \
     -I$(LIB_SRC)/finiteVolume/lnInclude \
     -I$(LIB_SRC)/meshTools/lnInclude
 
 EXE_LIBS = \
     -lfiniteVolume \
-    -lmeshTools
+    -lmeshTools \
+    -lprecice

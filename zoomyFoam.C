@@ -37,6 +37,7 @@ Description
 #include "emptyFvPatchFields.H"
 #include "Model.H"
 #include "init.H"
+#include "precice/PreciceManager.H"
 
 using namespace Foam;
 
@@ -139,6 +140,17 @@ int main(int argc, char *argv[])
         runTime.controlDict().lookupOrDefault<label>("reconstructionOrder", 1);
     Info<< "reconstructionOrder = " << reconstructionOrder << endl;
 
+    // preCICE coupling.  An empty participant name (the default for every
+    // uncoupled case) leaves the manager inactive — active() == false makes
+    // every call below a strict no-op, so the solve path is unchanged.
+    const word preciceParticipant =
+        runTime.controlDict().lookupOrDefault<word>
+            ("preciceParticipant", word(""));
+    const fileName preciceConfig =
+        runTime.controlDict().lookupOrDefault<fileName>
+            ("preciceConfig", fileName("precice-config.xml"));
+    numerics::PreciceManager precice(mesh, preciceParticipant, preciceConfig);
+
     forAll(Q,    QI)    Q[QI]->write();
     forAll(Qaux, QauxI) Qaux[QauxI]->write();
     numerics::update_aux_variables(Q, Qaux, mesh);
@@ -178,20 +190,36 @@ int main(int argc, char *argv[])
 
     const scalar endTime = runTime.endTime().value();
 
+    // preCICE handshake.  Returns Foam::GREAT when inactive, so the dt
+    // clamp inside the loop is a no-op for uncoupled runs.
+    scalar preciceDt = precice.initialize();
+
     // run() checks t < endTime WITHOUT advancing — so we can size the
     // step from the current state, set it, then advance by exactly that
     // dt.  Using while(loop()) instead advances by the *previous* step's
     // deltaT, desyncing the clock from the dt the RK2 integrator uses and
     // leaving Q at a time ≠ endTime by ~one dt (an O(dt)=O(dx) error that
     // caps convergence at 1st order).
-    while (runTime.run())
+    //
+    // When coupling is active preCICE owns loop termination (the coupling
+    // window decides when to stop); when inactive the condition is exactly
+    // the original while(runTime.run()).
+    while (precice.active() ? precice.isCouplingOngoing() : runTime.run())
     {
+        // Implicit coupling: snapshot Q before a window we might re-do.
+        // (No-op when inactive.)  TODO(phase7.3): also checkpoint runTime
+        // so a rejected window rolls the clock back, not just the state.
+        if (precice.requiresWritingCheckpoint()) precice.writeCheckpoint(Q);
+
         // CFL — computed from the start-of-step state so both RK2 stages
         // share the same dt.
         numerics::update_aux_variables(Q, Qaux, mesh);
         scalar dt = numerics::compute_dt(Q, Qaux, p, minInradius, Co);
         // Land exactly on endTime — don't overshoot.
         dt = Foam::min(dt, endTime - runTime.value());
+        // Never step past the coupling window (no-op when inactive:
+        // preciceDt == Foam::GREAT).
+        if (precice.active()) dt = Foam::min(dt, preciceDt);
         runTime.setDeltaT(dt);
         ++runTime;
         // Use the clock's actual deltaT (may be write-interval adjusted)
@@ -235,8 +263,26 @@ int main(int argc, char *argv[])
             numerics::correct_boundary_q(Q, Qaux, p, runTime.value());
         }
 
-        runTime.write();
+        // Exchange coupled-patch profiles, advance the coupling, pull the
+        // peer's data back.  All no-ops when inactive.
+        precice.write(Q);
+        preciceDt = precice.advance(dt_used);
+        precice.read(Q);
+
+        // Implicit coupling: if the window must be re-done, roll Q back and
+        // skip output for this (rejected) iteration.  When inactive,
+        // requiresReadingCheckpoint() is false → plain runTime.write().
+        if (precice.requiresReadingCheckpoint())
+        {
+            precice.readCheckpoint(Q);
+        }
+        else
+        {
+            runTime.write();
+        }
     }
+
+    precice.finalize();
 
     Info<< nl
         << "ExecutionTime = " << runTime.elapsedCpuTime() << " s"
