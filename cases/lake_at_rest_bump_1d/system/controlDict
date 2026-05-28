@@ -21,5 +21,8 @@ runTimeModifiable true;
 adjustTimeStep  no;
 maxCo           0.4;
 
-// Phase 5: 1 = forward Euler + 1st-order space, 2 = SSP-RK2 + W-reconstruction
-reconstructionOrder    2;
+// HR (Audusse) formulation is WB at 1st order; at 2nd order it needs the
+// bed held at cell centres (the b_star = max(b_L,b_R) logic), which the
+// solver no longer hand-skips. For 2nd-order WB use the Malaga formulation
+// (cases/lake_at_rest_bump_malaga_1d) — equilibrium viscosity, no skip.
+reconstructionOrder    1;

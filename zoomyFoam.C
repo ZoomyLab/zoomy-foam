@@ -155,11 +155,12 @@ int main(int argc, char *argv[])
         numerics::update_source(Src, Q, Qaux, p);
         if (reconstructionOrder >= 2)
         {
+            // Reconstruct ALL model reconstruction-variables — no
+            // hand-crafted per-slot skipping.  Well-balancing is the
+            // model+numerics' responsibility (via the emitted viscosity
+            // matrix in numerical_fluctuations), not the solver's.
             numerics::update_W_fields(W, Q, Qaux, p);
             numerics::update_W_gradients(gradW, W);
-            // WB protocol: don't reconstruct non-evolving "bed" slot
-            // (state[0] in SWE+bed).
-            gradW[0]->primitiveFieldRef() = Foam::vector::zero;
             numerics::update_numerical_flux_o2
                 (Dp, Dm, Q, Qaux, W, gradW, p);
         }
