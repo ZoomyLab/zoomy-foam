@@ -149,7 +149,23 @@ int main(int argc, char *argv[])
     const fileName preciceConfig =
         runTime.controlDict().lookupOrDefault<fileName>
             ("preciceConfig", fileName("precice-config.xml"));
-    numerics::PreciceManager precice(mesh, preciceParticipant, preciceConfig);
+    const label preciceZSamples =
+        runTime.controlDict().lookupOrDefault<label>("preciceZSamples", 1);
+    const wordList preciceMeshes =
+        runTime.controlDict().lookupOrDefault<wordList>
+            ("preciceMeshes", wordList());
+    // Distinct data names per coupling direction (preCICE forbids reusing the
+    // same (data,mesh) pair): this participant writes preciceWriteData and
+    // reads preciceReadData.  Empty → canonical [b,h,u,v,w,p].
+    const wordList preciceWriteData =
+        runTime.controlDict().lookupOrDefault<wordList>
+            ("preciceWriteData", wordList());
+    const wordList preciceReadData =
+        runTime.controlDict().lookupOrDefault<wordList>
+            ("preciceReadData", wordList());
+    numerics::PreciceManager precice
+        (mesh, preciceParticipant, preciceConfig, p,
+         preciceMeshes, preciceWriteData, preciceReadData, preciceZSamples);
 
     forAll(Q,    QI)    Q[QI]->write();
     forAll(Qaux, QauxI) Qaux[QauxI]->write();
@@ -192,7 +208,7 @@ int main(int argc, char *argv[])
 
     // preCICE handshake.  Returns Foam::GREAT when inactive, so the dt
     // clamp inside the loop is a no-op for uncoupled runs.
-    scalar preciceDt = precice.initialize();
+    scalar preciceDt = precice.initialize(Q, Qaux);
 
     // run() checks t < endTime WITHOUT advancing — so we can size the
     // step from the current state, set it, then advance by exactly that
@@ -215,18 +231,43 @@ int main(int argc, char *argv[])
         // share the same dt.
         numerics::update_aux_variables(Q, Qaux, mesh);
         scalar dt = numerics::compute_dt(Q, Qaux, p, minInradius, Co);
-        // Land exactly on endTime — don't overshoot.
-        dt = Foam::min(dt, endTime - runTime.value());
-        // Never step past the coupling window (no-op when inactive:
-        // preciceDt == Foam::GREAT).
-        if (precice.active()) dt = Foam::min(dt, preciceDt);
-        runTime.setDeltaT(dt);
-        ++runTime;
-        // Use the clock's actual deltaT (may be write-interval adjusted)
-        // so Q advances by exactly the amount the clock did.
-        const scalar dt_used = runTime.deltaTValue();
+        scalar dt_used;
+        if (precice.active())
+        {
+            // preCICE owns termination AND the time window.  Clamp ONLY to the
+            // remaining window — do NOT also clamp to the OF endTime.  Double-
+            // clamping both clocks to the same final time desyncs them: the OF
+            // deltaT ends up O(eps) larger than preCICE's max-dt, so read()'s
+            // relative read-time samples past the window end and preCICE
+            // aborts ("cannot sample data outside of current time window").
+            // Use this clamped dt verbatim for read/solve/advance so the
+            // relative read-time is exactly <= the window.
+            dt = Foam::min(dt, preciceDt);
+            // NoAdjust: do NOT let writeControl shrink dt to align with a
+            // write interval — the OF clock must advance by exactly the dt we
+            // hand preCICE, or the two clocks drift apart over the run.
+            runTime.setDeltaTNoAdjust(dt);
+            ++runTime;
+            dt_used = dt;
+        }
+        else
+        {
+            // Land exactly on endTime — don't overshoot.
+            dt = Foam::min(dt, endTime - runTime.value());
+            runTime.setDeltaT(dt);
+            ++runTime;
+            // Use the clock's actual deltaT (may be write-interval adjusted)
+            // so Q advances by exactly the amount the clock did.
+            dt_used = runTime.deltaTValue();
+        }
 
         Info<< nl << "Time = " << runTime.userTimeName() << nl << endl;
+
+        // Pull the peer's interface state into the coupled-patch boundary
+        // BEFORE the solve, so the interface flux sees it (no-op when
+        // inactive).  correct_boundary_q skips coupled patches, so this
+        // value survives both RK2 stages.
+        precice.read(Q, dt_used);
 
         if (reconstructionOrder >= 2)
         {
@@ -263,11 +304,10 @@ int main(int argc, char *argv[])
             numerics::correct_boundary_q(Q, Qaux, p, runTime.value());
         }
 
-        // Exchange coupled-patch profiles, advance the coupling, pull the
-        // peer's data back.  All no-ops when inactive.
-        precice.write(Q);
+        // Push the post-solve local interface state, then advance the
+        // coupling.  All no-ops when inactive.
+        precice.write(Q, Qaux);
         preciceDt = precice.advance(dt_used);
-        precice.read(Q);
 
         // Implicit coupling: if the window must be re-done, roll Q back and
         // skip output for this (rejected) iteration.  When inactive,
@@ -281,6 +321,11 @@ int main(int argc, char *argv[])
             runTime.write();
         }
     }
+
+    // preCICE drives the clock for coupled runs, so the writeControl interval
+    // may never trigger a final write — force the final evolved state to disk.
+    // Idempotent for uncoupled runs (they already wrote at endTime).
+    runTime.writeNow();
 
     precice.finalize();
 

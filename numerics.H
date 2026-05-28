@@ -124,6 +124,16 @@ get_map_patchNameToPatchIndex()
     return map;
 }
 
+// ── Is this patch preCICE-coupled? (empty list for uncoupled models) ─────
+inline bool is_precice_patch(const Foam::word& name)
+{
+    forAll(Model::precice_patch_names, i)
+    {
+        if (Model::precice_patch_names[i] == name) return true;
+    }
+    return false;
+}
+
 // ── Face-divergence operator: Σ Dp/Dm into cell residuals ───────────────
 inline Foam::tmp<Foam::volScalarField>
 quasilinear_operator
@@ -310,6 +320,11 @@ inline void correct_boundary_q
         {
             continue;
         }
+        // preCICE owns coupled-patch boundary values: PreciceManager::read()
+        // writes the peer's projected state there and it must survive both
+        // RK2 stages.  Re-applying the closed-form fallback here would clobber
+        // it.  precice_patch_names is empty for uncoupled models → no-op.
+        if (is_precice_patch(pp.name())) continue;
         const Foam::label bc_idx = patchMap[pp.name()];
 
         forAll(pp, localFaceI)

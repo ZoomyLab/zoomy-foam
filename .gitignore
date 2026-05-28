@@ -20,5 +20,7 @@ cases/*/postProcessing/
 cases/*/processor*/
 # Convergence/sweep cases generate per-(N, order) run subdirs.
 cases/*/run_*/
+# Coupling driver generates per-(scenario, scheme) work subdirs.
+cases/*/work_*/
 # Keep the case IC source under 0.orig and the system/ dictionaries.
 !cases/*/0.orig/
