@@ -26,6 +26,8 @@
 #include <string>
 #include <vector>
 
+#include <Eigen/Dense>
+
 #include <precice/precice.hpp>
 
 #include "fvMesh.H"
@@ -59,6 +61,24 @@ public:
         // comes from the case's controlDict (the same model + binary runs as
         // both participants).  Fall back to the model-baked default.
         meshNames_ = meshNames.size() ? meshNames : Model::precice_mesh_names;
+
+        // Interface ghost mode (controlDict `preciceGhost`):
+        //   "fullstate"      — full-state Godunov flux exchange (set the whole peer
+        //                      state); conservative, reproduces the monolithic for
+        //                      same-model / implicit coupling.  DEFAULT.
+        //   "characteristic" — impose only the INCOMING Riemann characteristics
+        //                      (eigendecomposition of A = dF/dQ + B): mixed-field
+        //                      invariants, SystemModel-generic (no analytical
+        //                      eigenvectors), well-posed & non-reflecting.
+        //   "froude"         — Froude-switched PRIMITIVE Dirichlet-Neumann
+        //                      (open-channel / Mintgen-Espinosa): same regime switch,
+        //                      but imposes the SWE primitives depth h / discharge hu.
+        const Foam::word gw =
+            mesh.time().controlDict().lookupOrDefault<Foam::word>(
+                "preciceGhost", "fullstate");
+        ghostMode_ = gw == "characteristic" ? GhostMode::characteristic
+                   : gw == "froude"         ? GhostMode::froude
+                   :                          GhostMode::fullstate;
 
         // preCICE forbids a participant using the same (data,mesh) pair twice,
         // so the two coupling directions MUST carry distinct data names.  Each
@@ -147,12 +167,16 @@ public:
 
     //- Pull the peer's profiles into the coupled-patch boundary Q.  Must
     //  run BEFORE the solve so the interface flux sees the peer state.
-    void read(Foam::List<Foam::volScalarField*>& Q, double relReadTime)
+    void read(Foam::List<Foam::volScalarField*>& Q,
+              const Foam::List<Foam::volScalarField*>& Qaux,
+              double relReadTime)
     {
         if (!active_) return;
         if constexpr (Model::n_precice_patches > 0)
         {
             Foam::List<Foam::scalar> profile(NF);
+            Foam::List<Foam::scalar> interior(Model::n_dof_q);
+            Foam::List<Foam::scalar> interiorAux(Model::n_dof_qaux);
             for (const Binding& b : bindings_)
             {
                 std::array<std::vector<double>, NF> buf;
@@ -162,6 +186,15 @@ public:
                     precice_->readData(b.meshName, readFields_[d], b.vertexIDs,
                                        relReadTime, buf[d]);
                 }
+                // Local interior (adjacent-cell) state per coupled face, plus the
+                // outward face-area vectors (their x-sign tells left vs right side).
+                Foam::List<Foam::scalarField> qPif(Q.size());
+                forAll(Q, i)
+                    qPif[i] = Q[i]->boundaryField()[b.patchI].patchInternalField();
+                Foam::List<Foam::scalarField> qaPif(Qaux.size());
+                forAll(Qaux, i)
+                    qaPif[i] = Qaux[i]->boundaryField()[b.patchI].patchInternalField();
+                const Foam::vectorField& Sf = mesh_.boundary()[b.patchI].Sf();
                 for (Foam::label f = 0; f < b.nFaces; ++f)
                 {
                     // Depth-average the nZ_ samples into one representative
@@ -173,9 +206,29 @@ public:
                             acc += buf[d][f * nZ_ + zk];
                         profile[d] = acc / nZ_;
                     }
-                    const auto Qb = Model::project_3d_to_2d(profile, p_);
+                    const auto peer = Model::project_3d_to_2d(profile, p_);
+                    forAll(Q, i)    interior[i]    = qPif[i][f];
+                    forAll(Qaux, i) interiorAux[i] = qaPif[i][f];
+                    // Interface ghost (selected by controlDict `preciceGhost`):
+                    //  - fullstate (default): set the whole peer state, so both
+                    //    sides evaluate the SAME flux F*(Q_A,Q_B) = the monolithic
+                    //    internal-face flux -> CONSERVATIVE (matches the monolithic
+                    //    for same-model coupling, exactly so with serial-implicit).
+                    //  - characteristic: impose only the incoming Riemann
+                    //    characteristics (mixed-field invariants) -> well-posed &
+                    //    non-reflecting; SystemModel-generic; not flux-conservative.
+                    //  - froude: Froude-switched primitive Dirichlet-Neumann (impose
+                    //    depth/discharge by flow regime) -> the open-channel literature
+                    //    coupling; same incoming-count as characteristic.
+                    const Foam::scalar nx = Sf[f].x();
+                    const Foam::List<Foam::scalar> ghost =
+                          ghostMode_ == GhostMode::characteristic
+                              ? characteristicGhost(interior, interiorAux, peer, nx)
+                        : ghostMode_ == GhostMode::froude
+                              ? froudeGhost(interior, interiorAux, peer, nx)
+                        :     peer;
                     forAll(Q, i)
-                        Q[i]->boundaryFieldRef()[b.patchI][f] = Qb[i];
+                        Q[i]->boundaryFieldRef()[b.patchI][f] = ghost[i];
                 }
             }
         }
@@ -234,6 +287,112 @@ public:
     }
 
 private:
+    //- Characteristic (Riemann-invariant) transmission ghost.
+    //  Eigendecompose the local quasilinear system matrix A(Q) = dF/dQ + B
+    //  (the model's emitted `quasilinear_matrix_x`) and take each characteristic
+    //  component from the PEER if it is incoming (lambda*n_x < 0) or from the
+    //  INTERIOR if outgoing; reconstruct the conserved ghost. This is the
+    //  literature-correct transmission condition: generic over ANY SystemModel
+    //  (SWE, shallow-moment, …) with no analytical eigenvectors required, and
+    //  smooth through u=0 (no primitive-variable degeneracy — the eigenstructure
+    //  has 1 incoming / 1 outgoing characteristic regardless). Falls back to the
+    //  full peer state if A is (near-)defective / non-diagonalisable.
+    Foam::List<Foam::scalar> characteristicGhost(
+        const Foam::List<Foam::scalar>& q,
+        const Foam::List<Foam::scalar>& qaux,
+        const Foam::List<Foam::scalar>& peer,
+        const Foam::scalar normalX) const
+    {
+        constexpr int n = Model::n_dof_q;
+        Foam::List<Foam::scalar> ghost(n);
+        const auto Am = Model::quasilinear_matrix_x(q, qaux, p_);
+        Eigen::Matrix<double, n, n> A;
+        for (int i = 0; i < n; ++i)
+            for (int j = 0; j < n; ++j) A(i, j) = Am[i][j];
+
+        Eigen::EigenSolver<Eigen::Matrix<double, n, n>> es(A);
+        const Eigen::Matrix<double, n, n> R = es.eigenvectors().real();
+        const Eigen::Matrix<double, n, 1> lam = es.eigenvalues().real();
+        Eigen::FullPivLU<Eigen::Matrix<double, n, n>> lu(R);
+        if (!lu.isInvertible())                 // defective -> full-state fallback
+        {
+            forAll(ghost, i) ghost[i] = peer[i];
+            return ghost;
+        }
+        const Eigen::Matrix<double, n, n> L = lu.inverse();
+        Eigen::Matrix<double, n, 1> qi, qp;
+        for (int i = 0; i < n; ++i) { qi(i) = q[i]; qp(i) = peer[i]; }
+        const Eigen::Matrix<double, n, 1> wi = L * qi;   // interior characteristics
+        const Eigen::Matrix<double, n, 1> wp = L * qp;   // peer     characteristics
+        Eigen::Matrix<double, n, 1> wg;
+        for (int k = 0; k < n; ++k)
+            wg(k) = (lam(k) * normalX < 0) ? wp(k) : wi(k);   // incoming <- peer
+        const Eigen::Matrix<double, n, 1> qg = R * wg;
+        for (int i = 0; i < n; ++i) ghost[i] = qg(i);
+        return ghost;
+    }
+
+    //- Froude-switched PRIMITIVE Dirichlet-Neumann transmission ghost — the
+    //  open-channel / Mintgen-Espinosa coupling used across the SWE<->3D
+    //  literature.  The wave REGIME and flow direction come from the SAME
+    //  symbolic system matrix as characteristicGhost (eigenvalues of
+    //  A = dF/dQ + B), so the *switch* is SystemModel-generic; but the imposed
+    //  quantities are the depth-averaged PRIMITIVES — depth h (index 1) and
+    //  streamwise discharge hu (index 2) — so this mode assumes the canonical
+    //  SWE conserved layout [b,h,hu].  (For an SME/VAM state with no
+    //  depth/discharge split, use `characteristic`, which needs no such layout.)
+    //
+    //  Per coupled face, n_in = #{incoming characteristics: lambda*n_x < 0},
+    //  n_w = #{genuine (non-stationary) waves}, u*n_x sign from trace(A)*n_x:
+    //    n_in == 0          supercritical OUTflow -> impose nothing (zeroGradient)
+    //    n_in == n_w        supercritical INflow  -> impose all      (peer state)
+    //    0 < n_in < n_w     subcritical:  one primitive by flow direction
+    //        u*n >= 0  OUTflow -> set h   (downstream stage control), hu Neumann
+    //        u*n <  0  INflow  -> set hu  (upstream discharge control), h Neumann
+    //  The u*n>=0 tie-break treats u==0 as outflow, so the depth step transmits
+    //  on both sides at rest instead of dead-locking (h never crossing).  This
+    //  imposes the SAME NUMBER of conditions as `characteristic` and switches on
+    //  the SAME criterion, but the quantity differs (primitive vs invariant), so
+    //  the two coincide ONLY in the supercritical limits (all / nothing).
+    Foam::List<Foam::scalar> froudeGhost(
+        const Foam::List<Foam::scalar>& q,
+        const Foam::List<Foam::scalar>& qaux,
+        const Foam::List<Foam::scalar>& peer,
+        const Foam::scalar normalX) const
+    {
+        constexpr int n = Model::n_dof_q;
+        Foam::List<Foam::scalar> ghost(n);
+        forAll(ghost, i) ghost[i] = q[i];   // default: zeroGradient (interior)
+        ghost[0] = peer[0];                 // bed: shared interface geometry
+
+        const auto Am = Model::quasilinear_matrix_x(q, qaux, p_);
+        Eigen::Matrix<double, n, n> A;
+        for (int i = 0; i < n; ++i)
+            for (int j = 0; j < n; ++j) A(i, j) = Am[i][j];
+        Eigen::EigenSolver<Eigen::Matrix<double, n, n>> es(A);
+        const Eigen::Matrix<double, n, 1> lam = es.eigenvalues().real();
+
+        int nIn = 0, nWave = 0;
+        for (int k = 0; k < n; ++k)
+        {
+            if (lam(k) * normalX < 0) ++nIn;                  // incoming
+            if (Foam::mag(lam(k)) > Foam::SMALL) ++nWave;     // genuine wave
+        }
+        const Foam::scalar un = lam.sum() * normalX;          // sign( u . n_out )
+
+        if (nWave > 0 && nIn >= nWave)        // supercritical inflow: set all
+        {
+            forAll(ghost, i) ghost[i] = peer[i];
+        }
+        else if (nIn > 0)                     // subcritical: one primitive D-N
+        {
+            if (un >= 0) ghost[1] = peer[1];  // OUTflow -> set depth h
+            else         ghost[2] = peer[2];  // INflow  -> set discharge hu
+        }
+        // nIn == 0 (supercritical outflow): pure zeroGradient (interior) -> done
+        return ghost;
+    }
+
     struct Binding
     {
         std::string meshName;
@@ -301,6 +460,9 @@ private:
     Foam::List<Foam::word> meshNames_;
     int nZ_;
     bool active_;
+    //- Interface ghost selected by controlDict `preciceGhost` (default fullstate)
+    enum class GhostMode { fullstate, characteristic, froude };
+    GhostMode ghostMode_ = GhostMode::fullstate;
     std::unique_ptr<precice::Participant> precice_;
     std::vector<Binding> bindings_;
     Foam::List<Foam::scalarField> checkpoint_;

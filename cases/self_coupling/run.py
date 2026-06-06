@@ -7,12 +7,18 @@ solution against a single-domain monolithic ``reference`` run (and, for the
 dam-break, the Stoker analytical).  All three share ONE Model.H + one binary
 emitted from ``model.py`` (SWECoupled1D).
 
-Interface treatment (phase 7.3): FULL-STATE Riemann ghost exchange — each side
-sends its near-interface interior cell as the peer's ghost; the interface
-Rusanov flux does the characteristic upwinding.  This reproduces the monolithic
-split (exactly for implicit coupling, to within one window lag for explicit).
-Froude/flow-direction-aware *selective* coupling is a later step and will be
-codegen'd into the Coupled BC, not hard-wired here.
+Interface treatment: selected at runtime by the controlDict `preciceGhost`
+toggle (read by PreciceManager), threaded here via --ghost:
+  fullstate      full-state Godunov ghost (set the whole peer state); the
+                 interface Rusanov flux does the upwinding -> conservative,
+                 reproduces the monolithic split (exactly for implicit
+                 coupling, to within one window lag for explicit).  DEFAULT.
+  characteristic incoming Riemann invariants (eigendecomposition of A=dF/dQ+B);
+                 mixed-field, SystemModel-generic, well-posed & non-reflecting.
+  froude         Froude-switched primitive Dirichlet-Neumann (impose depth h /
+                 discharge hu by flow regime) -- the open-channel literature
+                 coupling.  Same incoming-count as characteristic; differs in
+                 the quantity imposed (primitive vs invariant).
 
 Usage:
     python run.py                       # lake_at_rest, serial-explicit, N=100
@@ -135,7 +141,7 @@ def _write_initial(case_dir, xmin, xmax, n, scenario, patch_tags):
     _write_field(zero / "Q2", "Q2", hu, patch_tags)
 
 
-def _write_controldict(case_dir, t_end, order, precice=None):
+def _write_controldict(case_dir, t_end, order, precice=None, ghost="fullstate"):
     extra = ""
     if precice is not None:
         extra = (
@@ -144,6 +150,7 @@ def _write_controldict(case_dir, t_end, order, precice=None):
             f"preciceMeshes ( {precice['mesh']} );\n"
             f"preciceWriteData ( {precice['write']} );\n"
             f"preciceReadData ( {precice['read']} );\n"
+            f"preciceGhost {ghost};\n"
             f"preciceZSamples 1;\n"
         )
     (case_dir / "system" / "controlDict").write_text(
@@ -312,17 +319,17 @@ def _last_time(case_dir):
 
 
 def _make_case(case_dir, xmin, xmax, n, scenario, t_end, order,
-               patches, precice):
+               patches, precice, ghost="fullstate"):
     case_dir.mkdir(parents=True)
     (case_dir / "system").mkdir()
     (case_dir / "constant").mkdir()
     _write_blockmesh(case_dir, xmin, xmax, n, patches)
-    _write_controldict(case_dir, t_end, order, precice)
+    _write_controldict(case_dir, t_end, order, precice, ghost)
     _write_fvschemes(case_dir)
     _write_fvsolution(case_dir)
 
 
-def run(scenario, scheme, n=100, order=1):
+def run(scenario, scheme, n=100, order=1, ghost="fullstate"):
     cfg = SCENARIOS[scenario]
     t_end = cfg["t_end"]
     nh = n // 2
@@ -348,7 +355,8 @@ def run(scenario, scheme, n=100, order=1):
     _make_case(da, X_MIN, X_MID, nh, scenario, t_end, order,
                patches={"outer": "(0 4 7 3)", "coupled": "(1 2 6 5)"},
                precice=dict(participant="domainA", mesh="MeshA",
-                            write=" ".join(DATA_A), read=" ".join(DATA_B)))
+                            write=" ".join(DATA_A), read=" ".join(DATA_B)),
+               ghost=ghost)
     _write_initial(da, X_MIN, X_MID, nh, scenario, ["outer", "coupled"])
 
     # domainB: [X_MID, X_MAX], left=coupled, right=outer
@@ -356,7 +364,8 @@ def run(scenario, scheme, n=100, order=1):
     _make_case(db, X_MID, X_MAX, nh, scenario, t_end, order,
                patches={"coupled": "(0 4 7 3)", "outer": "(1 2 6 5)"},
                precice=dict(participant="domainB", mesh="MeshB",
-                            write=" ".join(DATA_B), read=" ".join(DATA_A)))
+                            write=" ".join(DATA_B), read=" ".join(DATA_A)),
+               ghost=ghost)
     _write_initial(db, X_MID, X_MAX, nh, scenario, ["coupled", "outer"])
 
     _write_precice_config(work / "precice-config.xml", scheme, t_end, window)
@@ -430,6 +439,9 @@ def main():
     ap.add_argument("--scheme", default="serial-explicit", choices=SCHEMES)
     ap.add_argument("--n", type=int, default=100)
     ap.add_argument("--order", type=int, default=1)
+    ap.add_argument("--ghost", default="fullstate",
+                    choices=["fullstate", "characteristic", "froude"],
+                    help="interface coupling BC (controlDict preciceGhost)")
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--build", action="store_true",
                     help="emit headers from model.py and wmake first")
@@ -445,7 +457,8 @@ def main():
         for s in SCENARIOS:
             for sch in SCHEMES:
                 try:
-                    results[(s, sch)] = report(run(s, sch, args.n, args.order))
+                    results[(s, sch)] = report(
+                        run(s, sch, args.n, args.order, args.ghost))
                 except Exception as e:
                     print(f"\n=== {s} / {sch} === FAILED: {e}")
                     results[(s, sch)] = None
@@ -455,7 +468,7 @@ def main():
             cell = "  FAILED" if v is None else f"{v[0]:11.3e} {v[1]:11.3e}"
             print(f"  {s:14s} {sch:24s} {cell}")
     else:
-        report(run(args.scenario, args.scheme, args.n, args.order))
+        report(run(args.scenario, args.scheme, args.n, args.order, args.ghost))
 
 
 if __name__ == "__main__":

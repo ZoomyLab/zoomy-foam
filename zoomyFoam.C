@@ -267,7 +267,7 @@ int main(int argc, char *argv[])
         // BEFORE the solve, so the interface flux sees it (no-op when
         // inactive).  correct_boundary_q skips coupled patches, so this
         // value survives both RK2 stages.
-        precice.read(Q, dt_used);
+        precice.read(Q, Qaux, dt_used);
 
         if (reconstructionOrder >= 2)
         {

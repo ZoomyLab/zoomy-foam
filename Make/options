@@ -3,6 +3,7 @@
 # in /lib, both standard search paths — no -I/-L needed.
 EXE_INC = \
     -std=c++17 \
+    -I/usr/include/eigen3 \
     -I$(LIB_SRC)/finiteVolume/lnInclude \
     -I$(LIB_SRC)/meshTools/lnInclude
 
