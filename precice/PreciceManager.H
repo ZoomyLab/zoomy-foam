@@ -267,11 +267,19 @@ public:
         if (!active_) return;
         checkpoint_.resize(Q.size());
         forAll(Q, i) checkpoint_[i] = Q[i]->primitiveField();
+        // also checkpoint the clock (writeCheckpoint is called BEFORE ++runTime,
+        // so this captures the window-start time) — closes the phase-7.3 TODO.
+        ckTime_  = mesh_.time().value();
+        ckIndex_ = mesh_.time().timeIndex();
     }
     void readCheckpoint(Foam::List<Foam::volScalarField*>& Q)
     {
         if (!active_) return;
         forAll(Q, i) Q[i]->primitiveFieldRef() = checkpoint_[i];
+        // retreat the clock to the window start so the re-solved implicit
+        // sub-iteration does not advance time (without this the SWE clock drifts
+        // by one window per rejected iteration and the participants desync).
+        const_cast<Foam::Time&>(mesh_.time()).setTime(ckTime_, ckIndex_);
     }
 
     bool isCouplingOngoing() const
@@ -466,6 +474,8 @@ private:
     std::unique_ptr<precice::Participant> precice_;
     std::vector<Binding> bindings_;
     Foam::List<Foam::scalarField> checkpoint_;
+    Foam::scalar ckTime_ = 0.0;          // clock checkpoint (implicit re-solve)
+    Foam::label  ckIndex_ = 0;
     std::array<std::string, NF> writeFields_;   // data this participant writes
     std::array<std::string, NF> readFields_;    // data it reads from the peer
 };

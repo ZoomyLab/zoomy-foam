@@ -206,6 +206,13 @@ int main(int argc, char *argv[])
 
     const scalar endTime = runTime.endTime().value();
 
+    // Output is driven explicitly on window-complete (below): the implicit
+    // clock-rewind breaks Time's outputTime tracking, so we gate writes by the
+    // writeInterval ourselves.
+    const scalar outInterval =
+        runTime.controlDict().lookupOrDefault<scalar>("writeInterval", 0.05);
+    scalar lastWrite = 0.0;
+
     // preCICE handshake.  Returns Foam::GREAT when inactive, so the dt
     // clamp inside the loop is a no-op for uncoupled runs.
     scalar preciceDt = precice.initialize(Q, Qaux);
@@ -222,9 +229,9 @@ int main(int argc, char *argv[])
     // the original while(runTime.run()).
     while (precice.active() ? precice.isCouplingOngoing() : runTime.run())
     {
-        // Implicit coupling: snapshot Q before a window we might re-do.
-        // (No-op when inactive.)  TODO(phase7.3): also checkpoint runTime
-        // so a rejected window rolls the clock back, not just the state.
+        // Implicit coupling: snapshot Q + the clock before a window we might
+        // re-do (PreciceManager::writeCheckpoint now also stores runTime so a
+        // rejected window rolls the clock back too).  No-op when inactive.
         if (precice.requiresWritingCheckpoint()) precice.writeCheckpoint(Q);
 
         // CFL — computed from the start-of-step state so both RK2 stages
@@ -309,16 +316,18 @@ int main(int argc, char *argv[])
         precice.write(Q, Qaux);
         preciceDt = precice.advance(dt_used);
 
-        // Implicit coupling: if the window must be re-done, roll Q back and
-        // skip output for this (rejected) iteration.  When inactive,
-        // requiresReadingCheckpoint() is false → plain runTime.write().
+        // Implicit coupling: if the window must be re-done, roll Q (and the
+        // clock) back and skip output for this rejected iteration.  Otherwise
+        // gate the write on the output interval (clock-rewind breaks the
+        // built-in outputTime, so drive writeNow ourselves).
         if (precice.requiresReadingCheckpoint())
         {
             precice.readCheckpoint(Q);
         }
-        else
+        else if (runTime.value() + Foam::SMALL >= lastWrite + outInterval)
         {
-            runTime.write();
+            runTime.writeNow();
+            lastWrite = runTime.value();
         }
     }
 
