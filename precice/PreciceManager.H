@@ -174,7 +174,6 @@ public:
         if (!active_) return;
         if constexpr (Model::n_precice_patches > 0)
         {
-            Foam::List<Foam::scalar> profile(NF);
             Foam::List<Foam::scalar> interior(Model::n_dof_q);
             Foam::List<Foam::scalar> interiorAux(Model::n_dof_qaux);
             for (const Binding& b : bindings_)
@@ -197,16 +196,20 @@ public:
                 const Foam::vectorField& Sf = mesh_.boundary()[b.patchI].Sf();
                 for (Foam::label f = 0; f < b.nFaces; ++f)
                 {
-                    // Depth-average the nZ_ samples into one representative
-                    // 3D field vector (z-flat for SWE → exact).
-                    for (int d = 0; d < NF; ++d)
+                    // Gather this coupled face's full vertical COLUMN — one
+                    // canonical field vector per z-sample — plus the z positions,
+                    // and reduce it to the 2D peer state (depth-average for a flat
+                    // SWE profile; moment recovery for profile-carrying models).
+                    Foam::List<Foam::List<Foam::scalar>> column(nZ_);
+                    Foam::List<Foam::scalar> zcol(nZ_);
+                    for (int zk = 0; zk < nZ_; ++zk)
                     {
-                        Foam::scalar acc = 0;
-                        for (int zk = 0; zk < nZ_; ++zk)
-                            acc += buf[d][f * nZ_ + zk];
-                        profile[d] = acc / nZ_;
+                        column[zk].resize(NF);
+                        for (int d = 0; d < NF; ++d)
+                            column[zk][d] = buf[d][f * nZ_ + zk];
+                        zcol[zk] = b.zSamples[f * nZ_ + zk];
                     }
-                    const auto peer = Model::project_from_3d(profile, p_);
+                    const auto peer = Model::project_from_3d(column, zcol, p_);
                     forAll(Q, i)    interior[i]    = qPif[i][f];
                     forAll(Qaux, i) interiorAux[i] = qaPif[i][f];
                     // preCICE "zero sample": before the peer has written valid
@@ -222,12 +225,13 @@ public:
                     // unphysical for the depth-averaged exchange, so this never
                     // shadows a real coupling state.
                     bool zeroSample = true;
-                    for (int d = 0; d < NF; ++d)
-                        if (Foam::mag(profile[d]) > Foam::SMALL)
-                        {
-                            zeroSample = false;
-                            break;
-                        }
+                    for (int zk = 0; zk < nZ_ && zeroSample; ++zk)
+                        for (int d = 0; d < NF; ++d)
+                            if (Foam::mag(column[zk][d]) > Foam::SMALL)
+                            {
+                                zeroSample = false;
+                                break;
+                            }
                     // Interface ghost (selected by controlDict `preciceGhost`):
                     //  - fullstate (default): set the whole peer state, so both
                     //    sides evaluate the SAME flux F*(Q_A,Q_B) = the monolithic
@@ -467,13 +471,15 @@ private:
                 {
                     forAll(Q, i)    q[i]  = qPif[i][f];
                     forAll(Qaux, i) qa[i] = qaPif[i][f];
+                    // lift the interior state to the full vertical COLUMN of
+                    // canonical field vectors at this face's z-samples.
+                    Foam::List<Foam::scalar> zcol(nZ_);
                     for (int zk = 0; zk < nZ_; ++zk)
-                    {
-                        const Foam::scalar z = b.zSamples[f * nZ_ + zk];
-                        const auto prof = Model::interpolate_to_3d(q, qa, p_, z);
+                        zcol[zk] = b.zSamples[f * nZ_ + zk];
+                    const auto column = Model::interpolate_to_3d(q, qa, p_, zcol);
+                    for (int zk = 0; zk < nZ_; ++zk)
                         for (int d = 0; d < NF; ++d)
-                            buf[d][f * nZ_ + zk] = prof[d];
-                    }
+                            buf[d][f * nZ_ + zk] = column[zk][d];
                 }
                 for (int d = 0; d < NF; ++d)
                     precice_->writeData(b.meshName, writeFields_[d],
