@@ -14,8 +14,8 @@ so the emitted Model.H is identical for domainA and domainB.  The preCICE
 mesh name each participant provides (MeshA / MeshB) is supplied at runtime
 via controlDict ``preciceMeshes``, not baked into the model.
 
-The interface always exchanges the canonical interpolate_3d field set
-[b, h, u, v, w, p]; project_3d is the SWE identity.
+The interface always exchanges the canonical interpolate_to_3d field set
+[b, h, u, v, w, p]; project_from_3d is the SWE identity.
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ class SWECoupled1D(StructuredDerivativeModel):
         return ZArray([b, h + b, hu / h])
 
     # ── Phase-7 coupling projections ─────────────────────────────────
-    def interpolate_3d(self):
+    def interpolate_to_3d(self):
         """Lift the depth-averaged state to the canonical 3D field set at
         height z.  v=w=0 (1D, derivative-free demo), p hydrostatic."""
         z = self.position[2]
@@ -84,7 +84,7 @@ class SWECoupled1D(StructuredDerivativeModel):
         u = hu / h
         return ZArray([b, h, u, sp.Integer(0), sp.Integer(0), g * (eta - z)])
 
-    def project_3d(self):
+    def project_from_3d(self):
         """SWE identity: recover [b, h, hu] from a depth-representative
         3D profile [b, h, u, v, w, p]."""
         b, h, u = sp.symbols("P3_b P3_h P3_u", real=True)
@@ -109,7 +109,7 @@ def write_headers():
     FoamSystemModelPrinter.write_code(
         sm, FOAM_ROOT / "Model.H",
         analytical_eigenvalues=True,
-        project_3d=model.project_3d(),
+        project_from_3d=model.project_from_3d(),
     )
     FoamNumericsPrinter.write_code(numerics, FOAM_ROOT / "NumericsKernels.H")
     FoamUpdateAuxPrinter.write_code(sm, FOAM_ROOT / "UpdateAuxVariables.H")
