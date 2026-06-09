@@ -19,92 +19,11 @@
 
 #include "Model.H"
 
-namespace numerics
-{
-
-// ── compute_derivative ─ spatial derivative helper for aux_registry ──────
-//
-// Writes ``D^(dx,dy,dz) source`` into ``result`` over the OpenFOAM mesh.
-// Phase 3 supports total order <= 1 via Gauss-linear cell gradient.
-// Higher orders will land via per-cell LSQ; for now they FatalError.
-inline void compute_derivative
-(
-    Foam::volScalarField& result,
-    const Foam::volScalarField& source,
-    int dx, int dy, int dz,
-    const Foam::fvMesh& /*mesh*/
-)
-{
-    const int total = dx + dy + dz;
-    if (total == 0)
-    {
-        result.primitiveFieldRef() = source.primitiveField();
-        return;
-    }
-    if (total == 1)
-    {
-        // Primitive-field assignment bypasses the dimension check —
-        // our Qaux convention is dimensionless, but ∇field has [1/length].
-        const Foam::tmp<Foam::volVectorField> tgrad = Foam::fvc::grad(source);
-        const int axis = (dx == 1 ? 0 : (dy == 1 ? 1 : 2));
-        result.primitiveFieldRef() =
-            tgrad().primitiveField().component(axis);
-        return;
-    }
-    FatalErrorInFunction
-        << "compute_derivative: total order " << total
-        << " not yet supported (Phase 3 covers order <= 1)."
-        << Foam::exit(Foam::FatalError);
-}
-
-// ── max_wavespeed — opaque helper consumed by generated NumericsKernels.H ─
-//
-// Wraps Model::eigenvalues, returning max|λ| of the normal-projected
-// spectrum at the given state.  The printer emits the symbolic
-// ``max_wavespeed(*Q, *Qaux, *p, *n)`` as a flat variadic call — this
-// helper unpacks back into the per-side Lists using the Model::
-// constants, then dispatches to Model::eigenvalues.  Works uniformly
-// for cell-centre, ±-side, and HR-reconstructed mixed-side invocations.
-template <typename... Ts>
-inline Foam::scalar max_wavespeed(Ts... args)
-{
-    constexpr int NQ = Model::n_dof_q;
-    constexpr int NA = Model::n_dof_qaux;
-    constexpr int NP = Model::n_parameters;
-    constexpr int ND = Model::dimension;
-    static_assert(
-        sizeof...(args) == NQ + NA + NP + ND,
-        "max_wavespeed: arg count must equal n_dof_q + n_dof_qaux + "
-        "n_parameters + dimension."
-    );
-    const Foam::scalar packed[] = { static_cast<Foam::scalar>(args)... };
-
-    Foam::List<Foam::scalar> Q(NQ);
-    Foam::List<Foam::scalar> Qaux(NA);
-    Foam::List<Foam::scalar> p(NP);
-    int i = 0;
-    for (int k = 0; k < NQ; ++k) Q[k] = packed[i++];
-    for (int k = 0; k < NA; ++k) Qaux[k] = packed[i++];
-    for (int k = 0; k < NP; ++k) p[k] = packed[i++];
-    Foam::vector n(0, 0, 0);
-    n.x() = packed[i];
-    if (ND >= 2) n.y() = packed[i + 1];
-    if (ND >= 3) n.z() = packed[i + 2];
-
-    const auto evs = Model::eigenvalues(Q, Qaux, p, n);
-    Foam::scalar mx = 0.0;
-    forAll(evs, j)
-    {
-        const auto& row = evs[j];
-        forAll(row, k)
-        {
-            mx = std::max(mx, std::abs(row[k]));
-        }
-    }
-    return mx;
-}
-
-}  // namespace numerics — generated kernels reference it below
+// Opaque backend primitives (max_wavespeed, compute_derivative) that the
+// generated kernels reference are supplied by the UserFunctions escape hatch —
+// included BEFORE the generated kernels so they are in scope.  (Mirrors the
+// planned layout: generated Numerics.H/Model.H depend on UserFunctions.H.)
+#include "UserFunctions.H"
 
 #include "NumericsKernels.H"
 #include "UpdateAuxVariables.H"
@@ -299,12 +218,28 @@ inline void update_numerical_flux
 }
 
 // ── BC dispatch via Model::boundary_conditions Piecewise ────────────────
+//
+// The GENERAL boundary loop: applies the closed-form Model::boundary_conditions
+// ghost to EVERY tagged boundary patch — wall, extrapolation, AND coupled.
+// There is no special wall-vs-coupled treatment of the ghost: a coupled patch
+// is just a boundary whose ghost CAN be overridden by a live peer state.
+//
+// ``coupling_active`` is the ONLY differentiator and it is narrow: when a
+// preCICE coupling is live, ``PreciceManager::read()`` has already written the
+// projected peer state into the coupled patch (the "exchange + project" step)
+// and that value must survive both RK2 stages — so we yield those patches to
+// the preCICE loop and skip them here.  When the coupling is NOT live
+// (uncoupled run, or before the peer has sent valid data) the coupled patch
+// falls through to its closed-form BC (extrapolation) exactly like any other
+// boundary — this is what keeps an unfed coupled patch well-balanced instead
+// of stranded at a garbage ``h=0`` ghost.
 inline void correct_boundary_q
 (
     const Foam::List<Foam::volScalarField*>& Q,
     const Foam::List<Foam::volScalarField*>& Qaux,
     const Foam::List<Foam::scalar>& p,
-    const Foam::scalar& time
+    const Foam::scalar& time,
+    const bool coupling_active = true
 )
 {
     auto patchMap = get_map_patchNameToPatchIndex();
@@ -320,11 +255,10 @@ inline void correct_boundary_q
         {
             continue;
         }
-        // preCICE owns coupled-patch boundary values: PreciceManager::read()
-        // writes the peer's projected state there and it must survive both
-        // RK2 stages.  Re-applying the closed-form fallback here would clobber
-        // it.  precice_patch_names is empty for uncoupled models → no-op.
-        if (is_precice_patch(pp.name())) continue;
+        // Live coupling: PreciceManager::read() owns the coupled ghost (peer
+        // state, must survive both RK2 stages) — skip so we do not clobber it.
+        // Otherwise the coupled patch is handled here via its closed-form BC.
+        if (coupling_active && is_precice_patch(pp.name())) continue;
         const Foam::label bc_idx = patchMap[pp.name()];
 
         forAll(pp, localFaceI)
@@ -426,6 +360,92 @@ inline void update_W_gradients
         const Foam::tmp<Foam::volVectorField> tgrad =
             Foam::fvc::grad(*W[i]);
         gradW[i]->primitiveFieldRef() = tgrad().primitiveField();
+    }
+}
+
+// ── Cell-interior non-conservative integral (path-conservative, order >= 2) ──
+//
+// Fills NC[i][c] = (1/V_c) Σ_j B(Q_c)[i][j] · ∮_∂cell Q_face[j] n_x dS, the
+// divergence-theorem form of  ∫_cell B(Q)·∂_x Q dx ≈ B(Q_c)·∫_cell ∂_x Q dx,
+// using the cell's OWN reconstructed face states
+// Q_face = state_from_reconstruction(W_c + gradW_c·r_face) (cell-centre value
+// at boundary faces, matching the 1st-order boundary treatment in
+// update_numerical_flux_o2).  The face fluctuations carry the INTER-cell jump
+// of the bed-slope NCP; THIS is the INTRA-cell smooth part that the order-1
+// scheme omits.  At order 1 gradW=0 ⇒ Q_face=Q_c ⇒ ∮Q_c n dS = 0 ⇒ NC ≡ 0, so
+// the term is identically inert below 2nd order (order 1 stays machine-WB).
+// REQUIRED for well-balancing at order >= 2: at lake-at-rest the reconstructed
+// per-side hydrostatic pressure (g/2)h^2 varies across each cell with NO
+// compensating volume term unless this is added; with it, the cell-interior
+// −g·h_c·∂_x b_c cancels the face pressure difference and the momentum
+// residual telescopes to machine zero.  Model-agnostic: only reuses the
+// emitted Model::state_from_reconstruction + Model::nonconservative_matrix_x.
+inline void update_cell_interior_ncp
+(
+    Foam::List<Foam::volScalarField*>& NC,
+    const Foam::List<Foam::volScalarField*>& Q,
+    const Foam::List<Foam::volScalarField*>& Qaux,
+    const Foam::List<Foam::volScalarField*>& W,
+    const Foam::List<Foam::volVectorField*>& gradW,
+    const Foam::List<Foam::scalar>& p
+)
+{
+    const Foam::fvMesh& mesh = Q[0]->mesh();
+    const Foam::label nC = Q[0]->size();
+    const int NQ = Model::n_dof_q;
+
+    Foam::List<Foam::scalar> q(NQ), qa(Model::n_dof_qaux);
+    Foam::List<Foam::scalar> Wc(NQ), Wf(NQ);
+
+    forAll(NC, i) NC[i]->primitiveFieldRef() = 0.0;
+
+    for (Foam::label c = 0; c < nC; ++c)
+    {
+        forAll(Q, i)    q[i]  = (*Q[i])[c];
+        forAll(Qaux, i) qa[i] = (*Qaux[i])[c];
+        forAll(W, i)    Wc[i] = (*W[i])[c];
+
+        // intQ[j] = ∮_∂cell Q_face[j] · n_x dS   (= ∫_cell ∂_x Q[j] dx)
+        Foam::List<Foam::scalar> intQ(NQ, 0.0);
+        const Foam::cell& cc = mesh.cells()[c];
+        forAll(cc, fi)
+        {
+            const Foam::label f = cc[fi];
+            Foam::vector rf, Sf;
+            bool internal = mesh.isInternalFace(f);
+            if (internal)
+            {
+                const Foam::scalar sgn =
+                    (mesh.faceOwner()[f] == c) ? 1.0 : -1.0;
+                rf = mesh.Cf()[f] - mesh.C()[c];
+                Sf = sgn * mesh.Sf()[f];
+            }
+            else
+            {
+                const Foam::label patchI = mesh.boundaryMesh().whichPatch(f);
+                const Foam::polyPatch& pp = mesh.boundaryMesh()[patchI];
+                const Foam::label lf = f - pp.start();
+                rf = pp.faceCentres()[lf] - mesh.C()[c];
+                Sf = pp.faceAreas()[lf];          // outward at a boundary face
+            }
+            // Cell's own reconstructed W at this face (1st order on the
+            // boundary, matching update_numerical_flux_o2).
+            if (internal)
+                forAll(W, i) Wf[i] = Wc[i] + Foam::dot((*gradW[i])[c], rf);
+            else
+                forAll(W, i) Wf[i] = Wc[i];
+            const auto Qf = Model::state_from_reconstruction(Wf, qa, p);
+            forAll(intQ, j) intQ[j] += Qf[j] * Sf.x();
+        }
+
+        const auto B = Model::nonconservative_matrix_x(q, qa, p);
+        const Foam::scalar invV = 1.0 / mesh.V()[c];
+        forAll(NC, i)
+        {
+            Foam::scalar acc = 0;
+            for (int j = 0; j < NQ; ++j) acc += B[i][j] * intQ[j];
+            (*NC[i])[c] = invV * acc;
+        }
     }
 }
 

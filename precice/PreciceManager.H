@@ -209,6 +209,25 @@ public:
                     const auto peer = Model::project_3d_to_2d(profile, p_);
                     forAll(Q, i)    interior[i]    = qPif[i][f];
                     forAll(Qaux, i) interiorAux[i] = qaPif[i][f];
+                    // preCICE "zero sample": before the peer has written valid
+                    // data (the first window of an explicit scheme, or any
+                    // window where the peer hasn't produced output yet),
+                    // readData returns all-zeros.  Imposing that as the ghost
+                    // gives a DRY interface (h=0) -> 0/0 in the flux / a
+                    // degenerate eigensystem -> sigFpe on the first step.  Fall
+                    // back to the closed-form extrapolation BC (ghost =
+                    // interior state) until valid peer data arrives -- the
+                    // mirror of correct_boundary_q's fallback for an unfed
+                    // boundary patch.  A genuine all-zero peer profile is
+                    // unphysical for the depth-averaged exchange, so this never
+                    // shadows a real coupling state.
+                    bool zeroSample = true;
+                    for (int d = 0; d < NF; ++d)
+                        if (Foam::mag(profile[d]) > Foam::SMALL)
+                        {
+                            zeroSample = false;
+                            break;
+                        }
                     // Interface ghost (selected by controlDict `preciceGhost`):
                     //  - fullstate (default): set the whole peer state, so both
                     //    sides evaluate the SAME flux F*(Q_A,Q_B) = the monolithic
@@ -222,7 +241,9 @@ public:
                     //    coupling; same incoming-count as characteristic.
                     const Foam::scalar nx = Sf[f].x();
                     const Foam::List<Foam::scalar> ghost =
-                          ghostMode_ == GhostMode::characteristic
+                          zeroSample
+                              ? interior
+                        : ghostMode_ == GhostMode::characteristic
                               ? characteristicGhost(interior, interiorAux, peer, nx)
                         : ghostMode_ == GhostMode::froude
                               ? froudeGhost(interior, interiorAux, peer, nx)

@@ -72,6 +72,8 @@ int main(int argc, char *argv[])
 
     // Source fields per equation.
     List<volScalarField*> Src(Model::n_dof_q);
+    // Cell-interior non-conservative integral per equation (order >= 2 WB term).
+    List<volScalarField*> NCcell(Model::n_dof_q);
     forAll(Src, i)
     {
         Src[i] = new volScalarField
@@ -79,6 +81,17 @@ int main(int argc, char *argv[])
             IOobject
             (
                 "Src" + std::to_string(i),
+                runTime.name(), mesh,
+                IOobject::NO_READ, IOobject::NO_WRITE
+            ),
+            mesh,
+            dimensionedScalar("zero", dimless/dimTime, scalar(0.0))
+        );
+        NCcell[i] = new volScalarField
+        (
+            IOobject
+            (
+                "NCcell" + std::to_string(i),
                 runTime.name(), mesh,
                 IOobject::NO_READ, IOobject::NO_WRITE
             ),
@@ -170,7 +183,7 @@ int main(int argc, char *argv[])
     forAll(Q,    QI)    Q[QI]->write();
     forAll(Qaux, QauxI) Qaux[QauxI]->write();
     numerics::update_aux_variables(Q, Qaux, mesh);
-    numerics::correct_boundary_q(Q, Qaux, p, runTime.value());
+    numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
 
     // Cell volume field for normalising the divergence operator.
     const scalarField& cellV = mesh.V();
@@ -191,16 +204,23 @@ int main(int argc, char *argv[])
             numerics::update_W_gradients(gradW, W);
             numerics::update_numerical_flux_o2
                 (Dp, Dm, Q, Qaux, W, gradW, p);
+            // Cell-interior non-conservative integral — the intra-cell smooth
+            // part of the bed-slope NCP, REQUIRED for well-balancing at order 2
+            // (the face fluctuations carry only the inter-cell jump).
+            numerics::update_cell_interior_ncp(NCcell, Q, Qaux, W, gradW, p);
         }
         else
         {
             numerics::update_numerical_flux(Dp, Dm, Q, Qaux, p);
+            // Inert at 1st order (zero slope ⇒ zero cell-interior integral).
+            forAll(NCcell, i) NCcell[i]->primitiveFieldRef() = 0.0;
         }
         forAll(Q, i)
         {
             tmp<volScalarField> tDiv =
                 numerics::quasilinear_operator(*Dp[i], *Dm[i]);
-            L[i] = Src[i]->primitiveField() - tDiv().primitiveField();
+            L[i] = Src[i]->primitiveField() - tDiv().primitiveField()
+                 - NCcell[i]->primitiveField();
         }
     };
 
@@ -289,7 +309,7 @@ int main(int argc, char *argv[])
             {
                 Q[i]->primitiveFieldRef() = Qold[i] + dt_used * L[i];
             }
-            numerics::correct_boundary_q(Q, Qaux, p, runTime.value());
+            numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
 
             // Stage 2 — L evaluated at Q*
             compute_rhs();
@@ -298,7 +318,7 @@ int main(int argc, char *argv[])
                 Q[i]->primitiveFieldRef() =
                     0.5 * (Qold[i] + Q[i]->primitiveField() + dt_used * L[i]);
             }
-            numerics::correct_boundary_q(Q, Qaux, p, runTime.value());
+            numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
         }
         else
         {
@@ -308,7 +328,7 @@ int main(int argc, char *argv[])
             {
                 Q[i]->primitiveFieldRef() += dt_used * L[i];
             }
-            numerics::correct_boundary_q(Q, Qaux, p, runTime.value());
+            numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
         }
 
         // Push the post-solve local interface state, then advance the
