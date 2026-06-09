@@ -3,11 +3,11 @@
     PreciceManager — minimal in-tree preCICE 3 wrapper for zoomyFoam.
 
     Couples two zoomyFoam instances face-to-face.  The exchanged interface
-    data is ALWAYS the canonical project_2d_to_3d field set [b,h,u,v,w,p]
+    data is ALWAYS the canonical interpolate_3d field set [b,h,u,v,w,p]
     sampled on a uniform z-grid (no field selection):
 
-      write:  Q on a coupled patch  --Model::project_2d_to_3d(z_k)-->  6 fields
-      read:   6 fields  --depth-average--> Model::project_3d_to_2d -->  Q ghost
+      write:  Q on a coupled patch  --Model::interpolate_3d(z_k)-->  6 fields
+      read:   6 fields  --depth-average--> Model::project_3d -->  Q ghost
 
     The 6 scalars are 6 preCICE data items {b,h,u,v,w,p}.  Per coupled patch
     we register n_faces × nZ vertices (one per z-sample).  Direction, mapping
@@ -206,7 +206,7 @@ public:
                             acc += buf[d][f * nZ_ + zk];
                         profile[d] = acc / nZ_;
                     }
-                    const auto peer = Model::project_3d_to_2d(profile, p_);
+                    const auto peer = Model::project_3d(profile, p_);
                     forAll(Q, i)    interior[i]    = qPif[i][f];
                     forAll(Qaux, i) interiorAux[i] = qaPif[i][f];
                     // preCICE "zero sample": before the peer has written valid
@@ -470,7 +470,7 @@ private:
                     for (int zk = 0; zk < nZ_; ++zk)
                     {
                         const Foam::scalar z = b.zSamples[f * nZ_ + zk];
-                        const auto prof = Model::project_2d_to_3d(q, qa, p_, z);
+                        const auto prof = Model::interpolate_3d(q, qa, p_, z);
                         for (int d = 0; d < NF; ++d)
                             buf[d][f * nZ_ + zk] = prof[d];
                     }
@@ -482,7 +482,7 @@ private:
         }
     }
 
-    static constexpr int NF = 6;   // project_2d_to_3d field count [b,h,u,v,w,p]
+    static constexpr int NF = 6;   // interpolate_3d field count [b,h,u,v,w,p]
 
     const Foam::fvMesh& mesh_;
     Foam::List<Foam::scalar> p_;
