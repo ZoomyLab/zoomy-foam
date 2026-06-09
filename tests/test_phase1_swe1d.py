@@ -26,7 +26,7 @@ from zoomy_core.model.derivative_workflow import StructuredDerivativeModel
 from zoomy_core.misc.misc import ZArray
 from zoomy_core.model import boundary_conditions as BC
 from zoomy_core.model import initial_conditions as IC
-from zoomy_core.model.models.system_model import SystemModel
+from zoomy_core.systemmodel.system_model import SystemModel
 from zoomy_core.transformation.to_openfoam import FoamSystemModelPrinter
 
 
