@@ -144,14 +144,19 @@ public:
                 {
                     for (int zk = 0; zk < nZ_; ++zk)
                     {
-                        // nZ_==1 → sample at the face centre.  Multi-sample
-                        // vertical grids (SME/VAM profiles) are Phase 8;
-                        // for depth-averaged SWE the profile is z-flat.
-                        const double zc = fc[f].z();
+                        // Reduced<->reduced coupling (Path 1) has no higher-dim
+                        // mesh to dictate the column, so CONSTRUCT a UNIT-HEIGHT
+                        // interface column: N_z samples uniform in the normalised
+                        // vertical sigma in [0,1].  Both reduced participants build
+                        // the SAME sigma grid -> compatible nearest-neighbour
+                        // mapping, and different physical h on each side is
+                        // reconciled by the normalisation.  nZ_==1 -> mid-column.
+                        const double sigma =
+                            (nZ_ == 1) ? 0.5 : (zk + 0.5) / double(nZ_);
                         coords.push_back(fc[f].x());
                         coords.push_back(fc[f].y());
-                        coords.push_back(zc);
-                        b.zSamples[f * nZ_ + zk] = zc;
+                        coords.push_back(sigma);
+                        b.zSamples[f * nZ_ + zk] = sigma;
                     }
                 }
                 b.vertexIDs.resize(nF * nZ_);
