@@ -33,6 +33,15 @@ BA = float(os.environ.get("BUMP_A", "0.08"))
 T_END = float(sys.argv[1]) if len(sys.argv) > 1 else 6.0
 WINDOW = float(sys.argv[2]) if len(sys.argv) > 2 else 5e-3
 DT0 = 2e-3
+# FIXED_DT: the bit-reproduction configuration — ONE fixed dt grid for
+# mono and both participants, window = dt (exchange every step).  The
+# coupled boundary face then solves the SAME Riemann problem at the SAME
+# time level as mono's interior face; coupled == mono to FP accumulation.
+# Adaptive dt + window > dt instead gives the O(W dQ/dt) window-lag error.
+FIXED_DT = float(os.environ.get("FIXED_DT", "0") or 0)
+if FIXED_DT > 0:
+    WINDOW = FIXED_DT
+    DT0 = FIXED_DT
 FIELDS = ["b", "h", "u", "v", "w", "p"]
 DATA_1 = [f + "_1" for f in FIELDS]
 DATA_2 = [f + "_2" for f in FIELDS]
@@ -88,7 +97,11 @@ application zoomyFoam;
 startFrom startTime; startTime 0; stopAt endTime; endTime {T_END};
 deltaT {DT0}; writeControl adjustableRunTime; writeInterval 0.1;
 purgeWrite 0; writeFormat ascii; writePrecision 10; timeFormat general;
-runTimeModifiable true; adjustTimeStep yes; maxCo 0.9; reconstructionOrder 1;
+runTimeModifiable true; adjustTimeStep {"no" if FIXED_DT > 0 else "yes"}; maxCo 0.9; reconstructionOrder 1;
+{f"maxDeltaT {FIXED_DT};" if FIXED_DT > 0 else ""}
+// zoomyFoam always CFL-sizes dt (adjustTimeStep/deltaT are not consulted);
+// maxDeltaT is the alignment cap that puts mono and the window-capped
+// participants on ONE dt grid (the bit-reproduction requirement).
 modelParameters {{ h_in {H_IN}; q_in {Q_IN}; }}
 {pc}""")
     w(C / "system/fvSchemes", f"""
