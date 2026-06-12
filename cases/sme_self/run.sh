@@ -9,7 +9,8 @@ DT=${4:-5e-4}
 TEND=${5:-1.0}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SIF=/Users/adam-obbpb5az1dhsjzf/of_build/zoomy_openfoam.sif
-BIN="$HERE/../sme0_sme1/bin/zoomyFoam_L$LEVEL"
+BIN="$HERE/bin/zoomyFoam_L$LEVEL"
+[ -x "$BIN" ] || bash "$HERE/../compile_sme.sh" "$LEVEL" extrapolation "$HERE"
 PY=/Users/adam-obbpb5az1dhsjzf/micromamba/envs/zoomy/bin/python
 
 rm -rf "$HERE"/{part1,part2,mono,precice-run} "$HERE"/precice-*.log

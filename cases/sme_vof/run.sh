@@ -16,7 +16,8 @@ SIF=/Users/adam-obbpb5az1dhsjzf/of_build/zoomy_openfoam.sif
 RUN=$HERE/run${SNAP:+_$SNAP}          # per-snapshot run dir -> parallel batches
 export RUNDIR=$RUN
 SUFFIX=""; [ "$OUTER" = "wall" ] && SUFFIX="w"
-BIN=$HERE/../sme0_sme1/bin/zoomyFoam_L$LEVEL$SUFFIX
+BIN=$HERE/bin/zoomyFoam_L$LEVEL$SUFFIX
+[ -x "$BIN" ] || { echo "missing $BIN — run: bash compile.sh $LEVEL $OUTER"; exit 1; }
 PY=/Users/adam-obbpb5az1dhsjzf/micromamba/envs/zoomy/bin/python
 
 rm -rf "$RUN"

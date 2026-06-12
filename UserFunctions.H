@@ -137,6 +137,23 @@ inline Foam::scalar max_wavespeed(Ts... args)
     if (mx > Foam::scalar(0)) return mx;            // analytical spectrum present
 
     // Numerical fallback: max |Re λ| of A_x = n_x · ∂F/∂Q (1-D Jacobian).
+    // 1-D ONLY: for a multi-dimensional model it would return λ = 0 on
+    // every y/z-face — zero Rusanov dissipation there and a violent
+    // transverse instability on any non-uniform background (measured:
+    // 10%/step growth from ulp seeds on a y-uniform ridge).  Fail loudly
+    // instead: multi-D models must carry an analytical spectrum until the
+    // printer emits the generated local_max_abs_eigenvalue (the
+    // documented transition above).
+    if (ND >= 2)
+    {
+        FatalErrorInFunction
+            << "max_wavespeed: empty analytical spectrum and the "
+            << "numerical fallback is 1-D-only, but Model::dimension = "
+            << ND << ". Emit the model with analytical_eigenvalues=True "
+            << "— a silent zero wavespeed on transverse faces disables "
+            << "the Riemann dissipation there."
+            << Foam::exit(Foam::FatalError);
+    }
     const auto Ax = Model::quasilinear_matrix_x(Q, Qaux, p);
     Eigen::MatrixXd A(NQ, NQ);
     for (int r = 0; r < NQ; ++r)

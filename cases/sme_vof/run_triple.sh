@@ -11,7 +11,8 @@ SIF=/Users/adam-obbpb5az1dhsjzf/of_build/zoomy_openfoam.sif
 RUN=$HERE/run${SNAP:+_$SNAP}
 export RUNDIR=$RUN
 export MODE=triple
-BIN=$HERE/../sme0_sme1/bin/zoomyFoam_L${LEVEL}w   # wall outer (closed system)
+BIN=$HERE/bin/zoomyFoam_L${LEVEL}w   # wall outer (closed system)
+[ -x "$BIN" ] || { echo "missing $BIN — run: bash compile.sh $LEVEL wall"; exit 1; }
 PY=/Users/adam-obbpb5az1dhsjzf/micromamba/envs/zoomy/bin/python
 
 rm -rf "$RUN"

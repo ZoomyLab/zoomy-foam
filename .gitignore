@@ -47,3 +47,7 @@ cases/sme_vof/vof_template/constant/polyMesh/
 cases/*/run/
 # snapshotted run dirs (run.sh/run_triple.sh SNAP arg)
 cases/*/snap_*/
+
+# per-case binaries are build artifacts (compile.sh regenerates)
+cases/*/bin/
+cases/swe2d_bump/run_*/
