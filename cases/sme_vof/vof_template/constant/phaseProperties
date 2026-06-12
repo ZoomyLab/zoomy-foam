@@ -1,3 +1,0 @@
-FoamFile { format ascii; class dictionary; location "constant"; object phaseProperties; }
-phases (water air);
-sigma 0;
