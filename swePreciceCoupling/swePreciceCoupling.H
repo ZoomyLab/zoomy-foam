@@ -64,6 +64,11 @@ class swePreciceCoupling
         vector  nStream = vector(1,0,0); // into-domain streamwise (-Sf)
         vector  gUp     = vector(0,0,1); // vertical up (-g/|g|)
         vector  tHat    = vector(0,1,0); // transverse (gUp ^ nStream)
+        //- exchange (model-world) basis: horizontal e1,e2 + vertical gUp.
+        //  Built from the GLOBAL axes, independent of nStream's sign, so
+        //  every interface of every participant shares one frame.
+        vector  eH1     = vector(1,0,0);
+        vector  eH2     = vector(0,1,0);
         List<Column> columns;
         scalarField        sigmaF;       // per-patch-face sigma = (z-floor)/H in [0,1]
         List<List<scalar>> peerF;        // per-patch-face peer [b,h,u,v,w,p]

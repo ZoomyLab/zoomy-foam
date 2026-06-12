@@ -21,7 +21,7 @@ CFG = RUN / "precice-config.xml"
 # ── geometry / physics ──────────────────────────────────────────────────────
 SWE_XMIN, SWE_XMAX, SWE_N = -0.6, 0.0, 120
 X_DAM, H_L, H_R = -0.4, 0.18, 0.10
-VOF_LX, VOF_LY, VOF_NX, VOF_NY, VOF_NZ = 1.0, 0.4, 100, 40, 1
+VOF_LX, VOF_LY, VOF_NX, VOF_NY, VOF_NZ = 1.5, 0.4, 120, 40, 1   # = vof_template blockMeshDict
 import sys
 SME_LEVEL = int(sys.argv[1]) if len(sys.argv) > 1 else 0   # reduced-model moment level
 T_END = 4.0

@@ -116,6 +116,14 @@ void Foam::functionObjects::swePreciceCoupling::buildColumns(Interface& I)
         mesh_.lookupObject<uniformDimensionedVectorField>("g");
     I.gUp = -g.value()/(mag(g.value())+SMALL);
     I.tHat = (I.gUp ^ I.nStream); I.tHat /= (mag(I.tHat)+SMALL);
+    // exchange basis: world horizontal axes = global x (or y if gravity is
+    // along x) projected onto the horizontal plane; e2 completes the
+    // right-handed triad (e1, e2, gUp).  For the historical y-up 2D meshes
+    // with nStream=+x this reproduces (x, -z, y) — bit-identical exchange.
+    vector a(1,0,0);
+    if (mag(a & I.gUp) > 0.99) a = vector(0,1,0);
+    I.eH1 = a - (a & I.gUp)*I.gUp; I.eH1 /= (mag(I.eH1)+SMALL);
+    I.eH2 = (I.gUp ^ I.eH1);
 
     const scalar tol = 1e-6*Foam::sqrt(gMax(p.magSf())+SMALL);
     DynamicList<scalar> keys; labelList colOf(cf.size(), -1);
@@ -411,10 +419,11 @@ void Foam::functionObjects::swePreciceCoupling::writeBack()
                     (h > SMALL) ? I.sigmaF[f]*col.height/h : -1.0;
                 if (zw >= -SMALL && zw <= 1.0 + SMALL)
                 {
+                    // sampled directly in the EXCHANGE basis (e1, e2, gUp)
                     const vector& uv = UPif[f];
                     zwS[nW] = Foam::min(Foam::max(zw, scalar(0)), scalar(1));
-                    unS[nW] = uv & I.nStream;
-                    utS[nW] = uv & I.tHat;
+                    unS[nW] = uv & I.eH1;
+                    utS[nW] = uv & I.eH2;
                     ugS[nW] = uv & I.gUp;
                     ++nW;
                 }
@@ -422,7 +431,11 @@ void Foam::functionObjects::swePreciceCoupling::writeBack()
             zwS.setSize(nW); unS.setSize(nW); utS.setSize(nW); ugS.setSize(nW);
             sortProfile(zwS, unS, utS, ugS);
 
-            // emit the water profile RESAMPLED at each vertex's unit-grid zeta
+            // emit the water profile RESAMPLED at each vertex's unit-grid
+            // zeta.  The canonical [u,v,w] slots are the EXCHANGE (model-
+            // world) frame: horizontal e1, e2 + vertical — one shared frame
+            // for every interface and participant, independent of which
+            // side of the domain the interface sits on.
             List<List<scalar>> colProf(col.faces.size(), List<scalar>(NF,0.0));
             List<scalar> sig(col.faces.size());
             forAll(col.faces, j)
@@ -457,7 +470,12 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
     {
         const scalarField aPif(alpha.boundaryField()[I.patchID].patchInternalField());
         const vectorField uPif(U.boundaryField()[I.patchID].patchInternalField());
-        const vector nHat(1,0,0);
+        // Riemann normal in MODEL axes: the into-domain direction expressed
+        // in the exchange basis (the reduced model lives in the horizontal
+        // (e1, e2) plane).  Historical +x interfaces: (1,0,0); a right-side
+        // interface: (-1,0,0); a y-aligned interface in 3D: (0,1,0).
+        vector nHat(I.nStream & I.eH1, I.nStream & I.eH2, 0.0);
+        nHat /= (mag(nHat) + SMALL);
 
         vectorField Uin(U.boundaryField()[I.patchID].size(), vector::zero);
         scalarField alphaIn(Uin.size(), 0.0);
@@ -517,15 +535,22 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
             const label nf = col.faces.size();
             const scalar dz = col.height/Foam::max(1, nf);
 
-            // peer profile source points on the unit zeta grid
-            List<scalar> zP(nf), uP(nf), dum1(nf), dum2(nf);
+            // peer profile source points on the unit zeta grid.  The peer
+            // sends [u,v,w] in the EXCHANGE basis; reconstruct the mesh-
+            // frame vector, then split into the impose basis (streamwise
+            // scalar for the mass constraint, transverse/vertical riding
+            // along for the full-vector impose).
+            List<scalar> zP(nf), uP(nf), vP(nf), wP(nf);
             forAll(col.faces, j)
             {
+                const List<scalar>& pf = I.peerF[col.faces[j]];
+                const vector ug = pf[2]*I.eH1 + pf[3]*I.eH2 + pf[4]*I.gUp;
                 zP[j] = I.sigmaF[col.faces[j]];
-                uP[j] = I.peerF[col.faces[j]][2];        // u·nStream at zeta
-                dum1[j] = 0.0; dum2[j] = 0.0;
+                uP[j] = ug & I.nStream;
+                vP[j] = ug & I.tHat;
+                wP[j] = ug & I.gUp;
             }
-            sortProfile(zP, uP, dum1, dum2);
+            sortProfile(zP, uP, vP, wP);
 
             // The cell-wise rule applies to WETTED faces only.  Dry (air)
             // faces above the waterline get the bounded bulk velocity
@@ -534,7 +559,14 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
             // anchors the inlet air column and it accelerates without
             // bound (seen: -0.08 -> -90 m/s within 0.1 s at the L2
             // reflected-bore re-entry, shredding the water column).
-            List<scalar> uMix(nf, scalar(0));
+            // wetted faces carry the FULL velocity vector: outflow = the
+            // interior vector (zero-gradient behaviour in all components),
+            // inflow = the peer's (u,v,w) profile.  Only the streamwise
+            // component enters the mass constraint; transverse/vertical
+            // ride along so the impose is genuinely full-field (a
+            // streamwise-only impose zeroes transverse shear at the inlet).
+            List<scalar> uMix(nf, scalar(0)), vMix(nf, scalar(0)),
+                         wMix(nf, scalar(0));
             boolList wet(nf, false);
             scalar qMix = 0.0, wWet = 0.0;
             forAll(col.faces, j)
@@ -552,9 +584,10 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 if (!wet[j]) continue;
                 const scalar zw =
                     (hFill > SMALL) ? I.sigmaF[f]*col.height/hFill : 0.0;
-                uMix[j] = out
-                    ? sInt
-                    : interpProfile(zP, uP, Foam::min(zw, scalar(1)));
+                const scalar zc = Foam::min(zw, scalar(1));
+                uMix[j] = out ? sInt : interpProfile(zP, uP, zc);
+                vMix[j] = out ? (uPif[f] & I.tHat) : interpProfile(zP, vP, zc);
+                wMix[j] = out ? (uPif[f] & I.gUp)  : interpProfile(zP, wP, zc);
                 qMix += uMix[j]*aFill*dz;
                 wWet += aFill*dz;
             }
@@ -573,7 +606,10 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
             const scalar uAir = (hFill > SMALL) ? qEff/hFill : 0.0;
             forAll(col.faces, j)
             {
-                Uin[col.faces[j]] = (wet[j] ? uMix[j] + dU : uAir)*I.nStream;
+                Uin[col.faces[j]] = wet[j]
+                    ? (uMix[j] + dU)*I.nStream + vMix[j]*I.tHat
+                                               + wMix[j]*I.gUp
+                    : uAir*I.nStream;
             }
         }
         // implicit under-relaxation of the imposed velocity (standard FSI
@@ -586,7 +622,6 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
         }
         U.boundaryFieldRef()[I.patchID] == Uin;
         alpha.boundaryFieldRef()[I.patchID] == alphaIn;
-        winFresh2_ = false;
         // impose the FACE FLUX too: the segregated VoF advects alpha with
         // the PREVIOUS step's phi, so without this the imposed velocity
         // moves water one window late (measured: realized[n] = <alpha[n],
@@ -603,6 +638,10 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
             phiF.boundaryFieldRef()[I.patchID] == phiIn;
         }
     }
+    // Window-freeze applies per WINDOW, not per interface: clearing inside
+    // the interface loop would hand every interface after the first a stale
+    // (zero) frozen target on the window's first substep.
+    winFresh2_ = false;
 }
 
 bool Foam::functionObjects::swePreciceCoupling::execute()
@@ -616,7 +655,13 @@ bool Foam::functionObjects::swePreciceCoupling::execute()
         // whole VOF domain (per unit width): MULES clipping and any other
         // internal sink are then auto-compensated at the inlet, so the
         // COUPLED system conserves regardless of interior alpha handling.
-        // (Single-interface assumption; multi-interface needs flux split.)
+        // Multi-interface/multi-column: each column books its own advected
+        // flux (alphaPhi — attributable), and the GLOBAL defect
+        // dM/dt − Σ_c realized_c (interior clipping, non-attributable) is
+        // split equally across the columns.  Σ_c debt_c then telescopes to
+        // Σ_c q*_c·dt − dM_VOF exactly — the E-invariant is independent of
+        // the split; the split only spreads the repayment.  One interface
+        // with one column reduces to realized = dM/dt identically.
         const volScalarField& alphaG =
             mesh_.lookupObject<volScalarField>("alpha.water");
         const scalar thick =
@@ -639,33 +684,50 @@ bool Foam::functionObjects::swePreciceCoupling::execute()
             mesh_.lookupObject<surfaceScalarField>("phi");
         const volScalarField& alpha =
             mesh_.lookupObject<volScalarField>("alpha.water");
-        for (Interface& I : interfaces_)
+
+        // pass 1: per-column advected intake (attributable)
+        label nCols = 0;
+        scalar sumRealized = 0.0;
+        List<List<scalar>> colRate(interfaces_.size());
+        forAll(interfaces_, ii)
         {
+            Interface& I = interfaces_[ii];
             const scalarField& magSf = mesh_.boundary()[I.patchID].magSf();
             const fvsPatchField<scalar>& phiP = phi.boundaryField()[I.patchID];
             const fvsPatchField<scalar>* aphiP =
                 aphi ? &aphi->boundaryField()[I.patchID] : nullptr;
             const fvPatchField<scalar>& aP = alpha.boundaryField()[I.patchID];
+            colRate[ii].setSize(I.columns.size(), 0.0);
             forAll(I.columns, c)
             {
-                Column& col = I.columns[c];
+                const Column& col = I.columns[c];
                 const scalar dz = col.height/Foam::max(1, col.faces.size());
-                scalar realizedRate = 0.0;
+                scalar r = 0.0;
                 for (const label f : col.faces)
                 {
                     const scalar af = aphiP ? (*aphiP)[f] : aP[f]*phiP[f];
-                    realizedRate -= af*dz/Foam::max(magSf[f], SMALL);
+                    r -= af*dz/Foam::max(magSf[f], SMALL);
                 }
-                // single-column interface: the true domain mass change IS
-                // this column's realized intake (incl. internal sinks)
-                static bool dbg = false;
-                if (!dbg)
-                { Info<< "[ledger] columns=" << I.columns.size()
-                      << " haveM0=" << haveM0 << " -> "
-                      << ((I.columns.size() == 1 && haveM0)
-                          ? "TRUE-MASS booking" : "alphaPhi booking") << nl;
-                  dbg = true; }
-                if (I.columns.size() == 1 && haveM0) realizedRate = dMdt;
+                colRate[ii][c] = r;
+                sumRealized += r;
+                ++nCols;
+            }
+        }
+        // pass 2: split the non-attributable interior defect equally and book
+        const scalar defectShare =
+            (haveM0 && nCols > 0) ? (dMdt - sumRealized)/nCols : 0.0;
+        static bool dbg = false;
+        if (!dbg)
+        { Info<< "[ledger] columns total=" << nCols << " haveM0=" << haveM0
+              << " -> alphaPhi booking + equal defect share" << nl;
+          dbg = true; }
+        forAll(interfaces_, ii)
+        {
+            Interface& I = interfaces_[ii];
+            forAll(I.columns, c)
+            {
+                Column& col = I.columns[c];
+                const scalar realizedRate = colRate[ii][c] + defectShare;
                 col.debt += (col.curTarget - realizedRate)*dtStep;
                 if (ledgerLog_.valid())
                 {
