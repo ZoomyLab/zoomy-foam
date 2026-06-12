@@ -4,7 +4,8 @@ walls around the VOF except the coupled inlet and the top atmosphere, which
 water never reaches).  M(t) = ∫h dx (SME) + ∫α dA (VOF).  Any drift is
 coupling-interface loss, measured to field-output precision.
 
-Usage: total_mass_audit.py RUNDIR [label]
+Usage: total_mass_audit.py RUNDIR [label] [NZ]
+       (NZ>1: 3D VOF, mass per unit width = sum(alpha)*dx*dy/NZ)
 """
 import sys
 from pathlib import Path
@@ -15,6 +16,7 @@ from zoomy_core.postprocessing.column_plots import (
 
 RUN = Path(sys.argv[1])
 LBL = sys.argv[2] if len(sys.argv) > 2 else RUN.name
+NZ = int(sys.argv[3]) if len(sys.argv) > 3 else 1
 SWE_N, dxs = 120, 0.005
 NX, NY, dxv, dyv = 120, 40, 0.0125, 0.01
 
@@ -25,7 +27,8 @@ vf = read_of_frames(RUN / "vof_case", "alpha.water")
 # phantom drift.  Evaluate M_SME at the VOF frame times by interpolation
 # (M(t) is smooth; the interpolation error is O(d2M/dt2 * dT^2) ~ 1e-7).
 tS = np.array([x[0] for x in sw]); MS = np.array([rd(d/"Q1",SWE_N).sum()*dxs for _,d in sw])
-ts = np.array([x[0] for x in vf]); Mv = np.array([rd(d/"alpha.water",NX*NY).sum()*dxv*dyv for _,d in vf])
+ts = np.array([x[0] for x in vf])
+Mv = np.array([rd(d/"alpha.water", NX*NY*NZ).sum()*dxv*dyv/NZ for _, d in vf])
 keep = (ts >= tS[0]) & (ts <= tS[-1])
 ts, Mv = ts[keep], Mv[keep]
 Ms = np.interp(ts, tS, MS)

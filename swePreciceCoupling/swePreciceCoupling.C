@@ -685,10 +685,18 @@ bool Foam::functionObjects::swePreciceCoupling::execute()
         const volScalarField& alpha =
             mesh_.lookupObject<volScalarField>("alpha.water");
 
-        // pass 1: per-column advected intake (attributable)
+        // pass 1: per-column advected intake (attributable).  colRate is
+        // per COLUMN WIDTH [m^2/s]; the domain change dMdt is per unit
+        // width of the WHOLE domain — the two only compare through the
+        // column widths w_c = (sum magSf)/height: total volumetric intake
+        // = sum_c q_c*w_c, so R = sum_c q_c*w_c/thick is the per-width
+        // realized total.  (Comparing dMdt to sum_c q_c directly is wrong
+        // by a factor NZ — measured: debt ramped at 0.75*q* per step and
+        // the repayment boost blew the inlet up at bore arrival.)
         label nCols = 0;
-        scalar sumRealized = 0.0;
+        scalar sumQ = 0.0;            // volumetric realized [m^3/s]
         List<List<scalar>> colRate(interfaces_.size());
+        List<List<scalar>> colWidth(interfaces_.size());
         forAll(interfaces_, ii)
         {
             Interface& I = interfaces_[ii];
@@ -698,28 +706,39 @@ bool Foam::functionObjects::swePreciceCoupling::execute()
                 aphi ? &aphi->boundaryField()[I.patchID] : nullptr;
             const fvPatchField<scalar>& aP = alpha.boundaryField()[I.patchID];
             colRate[ii].setSize(I.columns.size(), 0.0);
+            colWidth[ii].setSize(I.columns.size(), 0.0);
             forAll(I.columns, c)
             {
                 const Column& col = I.columns[c];
                 const scalar dz = col.height/Foam::max(1, col.faces.size());
-                scalar r = 0.0;
+                scalar r = 0.0, area = 0.0;
                 for (const label f : col.faces)
                 {
                     const scalar af = aphiP ? (*aphiP)[f] : aP[f]*phiP[f];
                     r -= af*dz/Foam::max(magSf[f], SMALL);
+                    area += magSf[f];
                 }
                 colRate[ii][c] = r;
-                sumRealized += r;
+                colWidth[ii][c] = area/Foam::max(col.height, SMALL);
+                sumQ += r*colWidth[ii][c];
                 ++nCols;
             }
         }
-        // pass 2: split the non-attributable interior defect equally and book
-        const scalar defectShare =
-            (haveM0 && nCols > 0) ? (dMdt - sumRealized)/nCols : 0.0;
+        // pass 2: the non-attributable interior defect (MULES clipping...)
+        // D = dMdt - sumQ/thick [per width] is split as equal VOLUMETRIC
+        // shares D*thick/nCols, converted to each column's per-width rate
+        // via its own width.  sum_c (q_c + dq_c)*w_c = dMdt*thick exactly,
+        // so E = M_SME + M_VOF + sum_c debt_c stays invariant; 1 interface
+        // x 1 column (w_c = thick) reduces to realized = dMdt identically.
+        const scalar defectVol =
+            (haveM0 && nCols > 0)
+            ? (dMdt - sumQ/Foam::max(thick, SMALL))
+              *thick/nCols
+            : 0.0;
         static bool dbg = false;
         if (!dbg)
         { Info<< "[ledger] columns total=" << nCols << " haveM0=" << haveM0
-              << " -> alphaPhi booking + equal defect share" << nl;
+              << " -> width-weighted alphaPhi booking + defect split" << nl;
           dbg = true; }
         forAll(interfaces_, ii)
         {
@@ -727,7 +746,8 @@ bool Foam::functionObjects::swePreciceCoupling::execute()
             forAll(I.columns, c)
             {
                 Column& col = I.columns[c];
-                const scalar realizedRate = colRate[ii][c] + defectShare;
+                const scalar realizedRate = colRate[ii][c]
+                    + defectVol/Foam::max(colWidth[ii][c], SMALL);
                 col.debt += (col.curTarget - realizedRate)*dtStep;
                 if (ledgerLog_.valid())
                 {

@@ -53,3 +53,23 @@ solver-agnostic by design). Reference snapshots: `*_wfz` family.
 - Open-boundary variant: `OUTER=extrapolation` (binaries without `w`).
 - Cost reference: `analysis/make_mono_vof.py [DT]` (same physics, full
   domain; coupled ≈ mono × removed-cell fraction; coupling overhead ≈ 0).
+
+## WS5/WS6 — 3D interface and multi-interface (2026-06-12)
+The mesh, ICs and BCs are now fully generated (no donor-mesh dependency);
+the FO is multi-column / multi-interface (transverse columns from the
+inlet-face geometry, list of interfaces under one participant).
+
+- `NZ=4 TRANSVERSE=cyclic bash run.sh 0 nz4` — real 3D VOF (120x40x4,
+  inlet = 160 faces = 4 columns x 40): SWE side reproduces the NZ=1 run to
+  max|dh| = 1.4e-5 over all frames; drift +5.1e-6; transverse-uniform to
+  2.6e-5 (alpha) / 2.8e-4 (water Ux) — bounded solver-FP asymmetry, see
+  `analysis/check_uniform3d.py`.
+- `bash run_triple.sh 0 triple` — SME->VOF->SME, three participants,
+  `coupling-scheme:multi` (max-iterations 1 = explicit-equivalent), two
+  interfaces in ONE function object: closed-box drift +2.7e-6 (T=4); the
+  bore transmits into the right SME (max|h-0.10| = 0.024).  Gif:
+  `analysis/make_gif_triple.py`.
+
+Adding an interface = one entry in the FO `interfaces` subdict + one
+participant/mesh block in the precice-config (both emitted by
+`generate.py MODE=triple`) — no solver code.

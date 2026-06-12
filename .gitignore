@@ -45,3 +45,5 @@ cases/sme_vof/vof_template/constant/polyMesh/
 
 # per-tag coupled run dirs (run.sh)
 cases/*/run/
+# snapshotted run dirs (run.sh/run_triple.sh SNAP arg)
+cases/*/snap_*/

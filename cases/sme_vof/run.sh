@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run the two-way SME(level)<->VOF coupled case end-to-end inside the container.
-# Usage: run_twoway.sh LEVEL [SNAP_SUFFIX] [WINDOW] [SCHEME] [GHOST] [OUTER]
+# Usage: run.sh LEVEL [SNAP_SUFFIX] [WINDOW] [SCHEME] [GHOST] [OUTER]
+# Env  : NZ=1 TRANSVERSE=cyclic   (3D VOF: NZ>1, front/back cyclic|wall)
 set -e
 LEVEL=${1:?level}
 SNAP=${2:-}
@@ -28,6 +29,9 @@ set +e; source /opt/openfoam13/etc/bashrc; set -e
 cd $RUN/swe_case
 blockMesh > log.blockMesh 2>&1
 setFields  > log.setFields 2>&1
+cd $RUN/vof_case
+blockMesh > log.blockMesh 2>&1
+setFields  > log.setFields 2>&1
 cd $RUN
 $BIN -case swe_case > log.swe 2>&1 &
 SWE_PID=\$!
@@ -39,12 +43,12 @@ echo \"swe rc=\$SWE_RC vof rc=\$VOF_RC\"
 exit \$((SWE_RC + VOF_RC))
 " || { echo "RUN_FAILED level=$LEVEL"; exit 1; }
 T1=$(date +%s.%N)
-echo "RUN_DONE level=$LEVEL scheme=$SCHEME window=$WINDOW"
+echo "RUN_DONE level=$LEVEL scheme=$SCHEME window=$WINDOW NZ=${NZ:-1}"
 echo "WALL_PAIR  $(echo "$T1 - $T0" | bc) s (both participants, incl. mesh+startup)"
 echo "SWE solver: $(grep ExecutionTime "$RUN/log.swe" | tail -1)"
 echo "VOF solver: $(grep ExecutionTime "$RUN/log.vof" | tail -1)"
 if [ -n "$SNAP" ]; then
-  rm -rf "$HERE/$SNAP"
-  mv "$RUN" "$HERE/$SNAP"
-  echo "snapshotted -> $SNAP"
+  rm -rf "$HERE/snap_$SNAP"
+  mv "$RUN" "$HERE/snap_$SNAP"
+  echo "snapshotted -> snap_$SNAP"
 fi
