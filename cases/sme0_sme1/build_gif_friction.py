@@ -1,83 +1,83 @@
 #!/usr/bin/env python
-"""Animate the FRICTION SME(0)↔SME(1) coupling: top panel h(x,t) — joined L0|L1
-over BOTH monolithic references (SME(0) and SME(1)); bottom panel q_1(x,t) —
-the friction-excited first moment (joined L1 half vs mono SME(1)).
+"""Friction SME(0)↔SME(1) gif — case-specific composer on column_plots tools.
+
+Top: free surface of the joined L0|L1 pair over BOTH monolithic references
+(SME(0) and SME(1)).  Bottom: the friction-excited first moment q_1(x) —
+joined L1 half vs mono SME(1); SME(0) cannot represent it.
 
 Usage: build_gif_friction.py [results_dir] [out.gif]
 """
-import re
 import sys
 from pathlib import Path
-
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import imageio.v2 as imageio
+
+from zoomy_core.model.models import SME
+from zoomy_core.model.boundary_conditions import (
+    BoundaryConditions, Coupled, FromModel)
+from zoomy_core.postprocessing import style
+style.use("screen")
+from zoomy_core.postprocessing.column_plots import (
+    read_zoomyfoam, read_of_states, mark_stations, animate)
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent / "self_coupling"))
-import run as R                      # noqa: E402
-
 SRC = Path(sys.argv[1]) if len(sys.argv) > 1 else HERE
 OUT = Path(sys.argv[2]) if len(sys.argv) > 2 else HERE / "sme0_sme1_friction.gif"
-X_MIN, X_MID, X_MAX, N = 0.0, 25.0, 50.0, 200
+X_MID, N = 25.0, 200
 NH = N // 2
-xc = np.linspace(X_MIN, X_MAX, N + 1)
-xc = 0.5 * (xc[:-1] + xc[1:])
+X1 = np.linspace(0, 25, NH + 1); X1 = 0.5 * (X1[:-1] + X1[1:])
+X2 = X1 + 25.0
+XM = np.linspace(0, 50, N + 1); XM = 0.5 * (XM[:-1] + XM[1:])
+
+bcs = BoundaryConditions([FromModel(tag="outer", definition="wall"),
+                          Coupled(tag="coupled", mesh_name="interface")])
+sm0 = SME(level=0, boundary_conditions=bcs).system_model
+sm1 = SME(level=1, boundary_conditions=bcs).system_model
+
+cf1 = read_zoomyfoam(SRC / "part1",   sm0, NH, X1, label="SME(0) participant")
+cf2 = read_zoomyfoam(SRC / "part2",   sm1, NH, X2, label="SME(1) participant")
+cm0 = read_zoomyfoam(SRC / "mono",    sm0, N,  XM, label="mono SME(0)")
+cm1 = read_zoomyfoam(SRC / "mono_l1", sm1, N,  XM, label="mono SME(1)")
+
+# q_1 is raw state (Q3 of SME(1)) — not part of the canonical column fields
+Tm1, Qm1 = read_of_states(SRC / "mono_l1", 4, N)
+T2,  Q2  = read_of_states(SRC / "part2",   4, NH)
 
 
-def times(case):
-    return {round(float(d.name), 4): d for d in case.iterdir()
-            if d.is_dir() and re.fullmatch(r"\d+(\.\d+)?", d.name)
-            and (d / "Q1").exists()}
+def draw(fig, t):
+    axH, axQ = fig.subplots(2, 1, sharex=True, height_ratios=[2, 1])
+    for cf, gray in ((cm0, "0.65"), (cm1, "0.3")):
+        i = cf.at(t)
+        axH.plot(cf.x, cf.fields["h"][i, :, 0], color=gray, ls="--",
+                 marker="", label=cf.label)
+    for k, cf in enumerate((cf1, cf2)):
+        i = cf.at(t)
+        axH.plot(cf.x, cf.fields["h"][i, :, 0], color=style.CYCLE[k],
+                 marker=style.MARKERS[k], markevery=style.MARKEVERY,
+                 label=cf.label)
+    mark_stations(axH, [X_MID], [style.COLORS["interface"]])
+    axH.set_ylim(0.05, 0.55)
+    axH.set_ylabel("h [m]")
+    axH.set_title("SME(0) ↔ SME(1), bottom friction λ_s=0.5 ν=1e-3   "
+                  f"t = {t:4.2f} s")
+
+    im1 = int(np.argmin(np.abs(Tm1 - t)))
+    i2 = int(np.argmin(np.abs(T2 - t)))
+    axQ.plot(XM, Qm1[im1, 3], color="0.3", ls="--", marker="")
+    axQ.plot(X2, Q2[i2, 3], color=style.CYCLE[1], marker=style.MARKERS[1],
+             markevery=style.MARKEVERY)
+    mark_stations(axQ, [X_MID], [style.COLORS["interface"]])
+    axQ.set_xlim(0, 50)
+    axQ.set_xlabel("x [m]")
+    axQ.set_ylabel(r"$q_1$")
+    axQ.set_title(r"first moment $q_1$ (friction-excited; SME(0) cannot "
+                  "represent it)")
+    style.figure_legend(fig, extra=[
+        ("coupling interface", style.line("interface", ls="--"))],
+        ncol=3, reserve=0.16)
 
 
-m0_t, m1_t = times(SRC / "mono"), times(SRC / "mono_l1")
-a_t, b_t = times(SRC / "part1"), times(SRC / "part2")
-a_keys, b_keys, m1_keys = sorted(a_t), sorted(b_t), sorted(m1_t)
-pairs = []
-for t in sorted(m0_t):
-    ta = min(a_keys, key=lambda k: abs(k - t))
-    tb = min(b_keys, key=lambda k: abs(k - t))
-    tm = min(m1_keys, key=lambda k: abs(k - t))
-    if max(abs(ta - t), abs(tb - t), abs(tm - t)) < 0.02:
-        pairs.append((t, ta, tb, tm))
-print(f"frames: {len(pairs)}")
-
-frames = []
-for t, ta, tb, tm in pairs:
-    h_m0 = R._read_internal(m0_t[t] / "Q1", N)
-    h_m1 = R._read_internal(m1_t[tm] / "Q1", N)
-    q1_m1 = R._read_internal(m1_t[tm] / "Q3", N)
-    h_j = np.concatenate([R._read_internal(a_t[ta] / "Q1", NH),
-                          R._read_internal(b_t[tb] / "Q1", NH)])
-    q1_j2 = R._read_internal(b_t[tb] / "Q3", NH)
-
-    fig, (axH, axQ) = plt.subplots(2, 1, figsize=(9, 5.4), sharex=True,
-                                   height_ratios=[2, 1])
-    axH.plot(xc, h_m0, "-", color="0.6", lw=2.2, label="mono SME(0)")
-    axH.plot(xc, h_m1, "k-", lw=1.3, label="mono SME(1)")
-    axH.plot(xc[:NH], h_j[:NH], "C3o", ms=2.6, mfc="none", label="SME(0) participant")
-    axH.plot(xc[NH:], h_j[NH:], "C0s", ms=2.6, mfc="none", label="SME(1) participant")
-    axH.axvline(X_MID, color="C2", ls=":", lw=1.4)
-    axH.set(ylim=(0.05, 0.55), ylabel="h [m]",
-            title=f"SME(0) ↔ SME(1), bottom friction λ_s=0.5 ν=1e-3   t={t:4.2f}s")
-    axH.legend(fontsize=8, loc="upper right", ncols=2)
-    axH.grid(alpha=.3)
-
-    axQ.plot(xc, q1_m1, "k-", lw=1.3, label="mono SME(1)")
-    axQ.plot(xc[NH:], q1_j2, "C0s", ms=2.6, mfc="none", label="SME(1) participant")
-    axQ.axvline(X_MID, color="C2", ls=":", lw=1.4, label="coupling interface")
-    axQ.set(xlim=(X_MIN, X_MAX), xlabel="x [m]", ylabel="q$_1$",
-            title="first moment q$_1$ (friction-excited; SME(0) cannot represent it)")
-    axQ.legend(fontsize=8, loc="upper right")
-    axQ.grid(alpha=.3)
-
-    fig.tight_layout()
-    fig.canvas.draw()
-    frames.append(np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy())
-    plt.close(fig)
-
-imageio.mimsave(OUT, frames, fps=10, loop=0)
-print(f"GIF: {len(frames)} frames -> {OUT}")
+times = [t for t in cm0.t
+         if min(abs(cf1.t - t).min(), abs(cf2.t - t).min(),
+                abs(Tm1 - t).min()) < 0.02]
+animate(draw, times, OUT, figsize=(10, 6.5), fps=10)
+print(f"GIF: {len(times)} frames -> {OUT}")

@@ -7,8 +7,11 @@ running mass balance:  d(SWE)+d(VOF) vs 0  (closed system: outer=extrapolation
 but the left SWE end sees no wave for t<~3, wall right).
 Usage: twoway_audit.py RUNDIR [label]
 """
-import re, glob, os, sys
+import os, sys
 import numpy as np
+
+from zoomy_core.postprocessing.column_plots import (
+    read_of_field as rf, read_of_frames)
 
 RUN = sys.argv[1]
 LBL = sys.argv[2] if len(sys.argv) > 2 else os.path.basename(RUN)
@@ -17,26 +20,8 @@ NXS = 120; LXS = 0.6; dxs = LXS / NXS
 NX, NY = 120, 40; LXV, LYV = 1.5, 0.4
 dxv, dyv = LXV / NX, LYV / NY
 
-
-def rf(p, n):
-    t = open(p).read()
-    m = re.search(r"internalField\s+nonuniform[^(]*\(\s*(.*?)\)\s*;", t, re.S)
-    if not m:
-        u = re.search(r"internalField\s+uniform\s+([-\d.eE+]+)", t)
-        return np.full(n, float(u.group(1)))
-    return np.array([float(x) for x in m.group(1).split()])[:n]
-
-
-def items(case, field):
-    L = []
-    for d in glob.glob(case + "/[0-9]*"):
-        if os.path.isdir(d) and os.path.exists(d + "/" + field):
-            L.append((float(os.path.basename(d)), d))
-    return sorted(L)
-
-
-sweI = items(SWE, "Q1")
-vofI = items(VOF, "alpha.water")
+sweI = read_of_frames(SWE, "Q1")
+vofI = read_of_frames(VOF, "alpha.water")
 n = min(len(sweI), len(vofI))
 print(f"== {LBL} ==  frames={n}  t:0..{sweI[n-1][0]:.2f}")
 print("   t     h_swe(0-)  u_swe(0-)  q_swe(0-)  VOFinlet   SWEmass    VOFarea    total")
@@ -44,9 +29,9 @@ rows = []
 for i in range(n):
     t, sd = sweI[i]
     _, vd = vofI[i]
-    h = rf(sd + "/Q1", NXS)
-    q = rf(sd + "/Q2", NXS)
-    a = rf(vd + "/alpha.water", NX * NY).reshape(NY, NX)
+    h = rf(sd / "Q1", NXS)
+    q = rf(sd / "Q2", NXS)
+    a = rf(vd / "alpha.water", NX * NY).reshape(NY, NX)
     hb, qb = h[-1], q[-1]
     ub = qb / hb if hb > 1e-12 else 0.0
     vin = a[:, 0].sum() * dyv

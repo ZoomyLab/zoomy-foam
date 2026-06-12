@@ -6,35 +6,20 @@ coupling-interface loss, measured to field-output precision.
 
 Usage: total_mass_audit.py RUNDIR [label]
 """
-import re, sys
+import sys
 from pathlib import Path
 import numpy as np
+
+from zoomy_core.postprocessing.column_plots import (
+    read_of_field as rd, read_of_frames)
 
 RUN = Path(sys.argv[1])
 LBL = sys.argv[2] if len(sys.argv) > 2 else RUN.name
 SWE_N, dxs = 120, 0.005
 NX, NY, dxv, dyv = 120, 40, 0.0125, 0.01
 
-
-def rd(p, n):
-    t = open(p).read()
-    m = re.search(r"internalField\s+nonuniform[^(]*\(\s*(.*?)\)\s*;", t, re.S)
-    if not m:
-        u = re.search(r"internalField\s+uniform\s+([-\d.eE+]+)", t)
-        return np.full(n, float(u.group(1)))
-    return np.fromstring(m.group(1).replace("\n", " "), sep=" ")[:n]
-
-
-def frames(case, field):
-    out = []
-    for d in Path(case).iterdir():
-        if d.is_dir() and re.fullmatch(r"\d+(\.\d+)?", d.name) and (d / field).exists():
-            out.append((float(d.name), d))
-    return sorted(out)
-
-
-sw = frames(RUN / "swe_case", "Q1")
-vf = frames(RUN / "vof_case", "alpha.water")
+sw = read_of_frames(RUN / "swe_case", "Q1")
+vf = read_of_frames(RUN / "vof_case", "alpha.water")
 # MATCHED-TIME evaluation: the two solvers' write times drift by up to half a
 # write interval; index pairing aliases |dM/dt|*dt_offset (~1e-4 here) into a
 # phantom drift.  Evaluate M_SME at the VOF frame times by interpolation

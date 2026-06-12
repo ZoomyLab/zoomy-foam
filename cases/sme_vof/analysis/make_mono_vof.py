@@ -4,14 +4,15 @@ at the same resolution as the coupled twoway runs (dx = dy as twoway VOF).
 Dam at x = -0.4 (0.18 -> 0.10), walls left+right — same physics as the coupled
 SME|VOF pair, but everything resolved by incompressibleVoF.
 
-Usage: make_mono_vof.py [DT]   (DT > 0: fixed; DT = 0: adaptive maxCo 0.45)
+Usage: make_mono_vof.py [DT] [OUTDIR]
+       (DT > 0: fixed; DT = 0: adaptive maxCo 0.45; default OUTDIR=../mono_vof)
 """
 import shutil, sys
 from pathlib import Path
 
-SPIKE = Path("/Users/adam-obbpb5az1dhsjzf/of_build/vof_spike")
-SRC = SPIKE / "twoway_sme2_hstar/vof_case"   # donor: constant/, 0/ field shapes
-C = SPIKE / "mono_vof"
+CASE = Path(__file__).resolve().parent.parent
+SRC = CASE / "vof_template"                  # donor: constant/, 0/ field shapes
+C = Path(sys.argv[2]) if len(sys.argv) > 2 else CASE / "mono_vof"
 DT = float(sys.argv[1]) if len(sys.argv) > 1 else 2e-3
 T_END = 4.0
 XMIN, XMAX, LY = -0.6, 1.5, 0.4
