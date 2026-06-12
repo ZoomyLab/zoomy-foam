@@ -32,7 +32,10 @@
 
 #include "fvMesh.H"
 #include "volFields.H"
+#include "OFstream.H"
+#include "Switch.H"
 #include "Model.H"
+#include "NumericsKernels.H"
 
 namespace numerics
 {
@@ -79,6 +82,19 @@ public:
         ghostMode_ = gw == "characteristic" ? GhostMode::characteristic
                    : gw == "froude"         ? GhostMode::froude
                    :                          GhostMode::fullstate;
+
+        // Conservative coupling (controlDict `preciceFrozenMass`): freeze the
+        // MASS row of the coupled-face flux at its window-start value
+        // F(Q_interior^n, ghost^n) for all substeps of the window.  Both
+        // participants can evaluate this same number from the same exchanged
+        // snapshot pair with the same generated kernel, so what one side
+        // loses the other gains exactly — the interface mass ledger closes
+        // independent of subcycling.  The momentum rows (wave speeds,
+        // dissipation — the stabilizers) stay live.  Intended for explicit
+        // schemes; implicit iteration resolves the window instead.
+        frozenMass_ =
+            mesh.time().controlDict().lookupOrDefault<Foam::Switch>(
+                "preciceFrozenMass", false);
 
         // preCICE forbids a participant using the same (data,mesh) pair twice,
         // so the two coupling directions MUST carry distinct data names.  Each
@@ -181,7 +197,7 @@ public:
         {
             Foam::List<Foam::scalar> interior(Model::n_dof_q);
             Foam::List<Foam::scalar> interiorAux(Model::n_dof_qaux);
-            for (const Binding& b : bindings_)
+            for (Binding& b : bindings_)
             {
                 std::array<std::vector<double>, NF> buf;
                 for (int d = 0; d < NF; ++d)
@@ -259,6 +275,71 @@ public:
                         :     peer;
                     forAll(Q, i)
                         Q[i]->boundaryFieldRef()[b.patchI][f] = ghost[i];
+
+                    // Frozen mass row: evaluate the face kernel ONCE per
+                    // window on the window-start pair (interior, ghost) —
+                    // the same snapshot pair the peer holds, so both sides
+                    // agree on the exchanged mass to machine precision.
+                    if (frozenMass_ && windowFresh_)
+                    {
+                        if (b.fzDp.size() != b.nFaces)
+                        { b.fzDp.setSize(b.nFaces); b.fzDm.setSize(b.nFaces); }
+                        const Foam::vector nUnit =
+                            Sf[f]/(Foam::mag(Sf[f]) + Foam::SMALL);
+                        // evaluate on the ROUND-TRIPPED own state P(I(Q)):
+                        // the peer's copy of our state went through the same
+                        // interpolate->project quadrature on the same zeta
+                        // grid, so both sides' q* are evaluated on identical
+                        // inputs (bit-identical at L0, quadrature-aligned at
+                        // L>=1) — the interface mass ledger closes.
+                        const auto rt = Model::project_from_3d(
+                            Model::interpolate_to_3d(
+                                interior, interiorAux, p_, zcol),
+                            zcol, p_);
+                        const auto Ff = Numerics::numerical_flux
+                            (rt, ghost, interiorAux, interiorAux, p_, nUnit);
+                        const auto FLf = Numerics::numerical_fluctuations
+                            (rt, ghost, interiorAux, interiorAux, p_, nUnit);
+                        const Foam::scalar magS = Foam::mag(Sf[f]);
+                        b.fzDp[f] = (-Ff[1] + FLf[0][1])*magS;
+                        b.fzDm[f] = ( Ff[1] + FLf[1][1])*magS;
+                        if (!fzLog_.valid())
+                        {
+                            fzLog_.reset(new Foam::OFstream(
+                                mesh_.time().globalPath()/"frozen_q.csv"));
+                            fzLog_().precision(17);
+                            fzLog_() << "n,face,fzDm,h_in,q_in,h_gh,q_gh"
+                                     << Foam::nl;
+                        }
+                        fzLog_() << winIdx_ << "," << f << ","
+                            << b.fzDm[f] << "," << rt[1] << "," << rt[2]
+                            << "," << ghost[1] << "," << ghost[2] << Foam::nl;
+                    }
+                }
+            }
+            if (frozenMass_) windowFresh_ = false;
+        }
+    }
+
+    //- Override the MASS row (state slot 1) of the assembled face terms at
+    //  every coupled face with the window-frozen values.  Call after the
+    //  flux assembly, before the divergence.  No-op unless enabled+active.
+    void applyFrozenMassRow
+    (
+        Foam::List<Foam::surfaceScalarField*>& Dp,
+        Foam::List<Foam::surfaceScalarField*>& Dm
+    )
+    {
+        if (!active_ || !frozenMass_) return;
+        if constexpr (Model::n_precice_patches > 0)
+        {
+            for (const Binding& b : bindings_)
+            {
+                if (b.fzDp.size() != b.nFaces) continue;   // not evaluated yet
+                for (Foam::label f = 0; f < b.nFaces; ++f)
+                {
+                    Dp[1]->boundaryFieldRef()[b.patchI][f] = b.fzDp[f];
+                    Dm[1]->boundaryFieldRef()[b.patchI][f] = b.fzDm[f];
                 }
             }
         }
@@ -280,6 +361,11 @@ public:
     {
         if (!active_) return Foam::GREAT;
         precice_->advance(dt);
+        // a completed window (or an implicit re-iteration) brings new peer
+        // data -> the frozen mass row must be re-evaluated on the next read
+        if (precice_->isTimeWindowComplete()
+         || precice_->requiresReadingCheckpoint())
+        { windowFresh_ = true; ++winIdx_; }
         return precice_->getMaxTimeStepSize();
     }
 
@@ -438,6 +524,10 @@ private:
         Foam::label nFaces = 0;
         std::vector<precice::VertexID> vertexIDs;   // n_faces * nZ
         std::vector<double>            zSamples;     // physical z per vertex
+        //- window-frozen MASS-row face contributions (incl. magSf), one per
+        //  face: Dp slot = (-F[1]+FL[0][1])*magSf, Dm slot = (F[1]+FL[1][1])*magSf
+        Foam::List<Foam::scalar> fzDp;
+        Foam::List<Foam::scalar> fzDm;
     };
 
     //- Gather coupled-patch boundary Q/Qaux, lift to 3D, writeData all
@@ -503,6 +593,13 @@ private:
     //- Interface ghost selected by controlDict `preciceGhost` (default fullstate)
     enum class GhostMode { fullstate, characteristic, froude };
     GhostMode ghostMode_ = GhostMode::fullstate;
+    //- Conservative coupling: freeze the coupled-face MASS flux per window
+    bool frozenMass_ = false;
+    //- A new time window (or implicit re-iteration) began: re-evaluate the
+    //  frozen mass row on the next read().  Starts true (first window).
+    bool windowFresh_ = true;
+    Foam::autoPtr<Foam::OFstream> fzLog_;   // frozen-q* diagnostics
+    long winIdx_ = 0;                       // completed-window counter
     std::unique_ptr<precice::Participant> precice_;
     std::vector<Binding> bindings_;
     Foam::List<Foam::scalarField> checkpoint_;

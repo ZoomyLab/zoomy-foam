@@ -141,14 +141,35 @@ int main(int argc, char *argv[])
         L[i]    = scalarField(mesh.nCells(), 0.0);
     }
 
-    // Parameter vector p.
-    const List<scalar> p = Model::default_parameters();
+    // Parameter vector p: model defaults, overridable per case from an optional
+    // controlDict `modelParameters { <name> <value>; }` sub-dict (names from
+    // Model::parameter_names) — vary e.g. friction without re-emitting Model.H.
+    List<scalar> p = Model::default_parameters();
+    if (runTime.controlDict().found("modelParameters"))
+    {
+        const dictionary& md = runTime.controlDict().subDict("modelParameters");
+        forAll(Model::parameter_names, pi)
+        {
+            p[pi] = md.lookupOrDefault<scalar>(Model::parameter_names[pi], p[pi]);
+        }
+        Info<< "modelParameters override: " << Model::parameter_names
+            << " = " << p << endl;
+    }
 
     // Geometric helper for CFL.
     surfaceScalarField minInradius =
         numerics::computeFaceMinInradius(mesh, runTime);
 
     const scalar Co = readScalar(runTime.controlDict().lookup("maxCo"));
+    // Optional hard cap on the time step (OpenFOAM's standard `maxDeltaT`
+    // control, which this explicit solver otherwise ignores — it always sizes
+    // dt from the CFL).  Setting the SAME maxDeltaT on a coupled pair AND on
+    // its monolithic reference forces every run onto an identical dt grid, so a
+    // same-model self-coupling differs from the monolithic ONLY by the
+    // interface coupling — no dt-truncation drift and (with writeInterval an
+    // integer multiple of maxDeltaT) no write-time jitter.  Default GREAT = off.
+    const scalar maxDeltaT =
+        runTime.controlDict().lookupOrDefault<scalar>("maxDeltaT", Foam::GREAT);
     const label reconstructionOrder =
         runTime.controlDict().lookupOrDefault<label>("reconstructionOrder", 1);
     Info<< "reconstructionOrder = " << reconstructionOrder << endl;
@@ -204,6 +225,7 @@ int main(int argc, char *argv[])
             numerics::update_W_gradients(gradW, W);
             numerics::update_numerical_flux_o2
                 (Dp, Dm, Q, Qaux, W, gradW, p);
+            precice.applyFrozenMassRow(Dp, Dm);   // no-op unless enabled
             // Cell-interior non-conservative integral — the intra-cell smooth
             // part of the bed-slope NCP, REQUIRED for well-balancing at order 2
             // (the face fluctuations carry only the inter-cell jump).
@@ -212,6 +234,7 @@ int main(int argc, char *argv[])
         else
         {
             numerics::update_numerical_flux(Dp, Dm, Q, Qaux, p);
+            precice.applyFrozenMassRow(Dp, Dm);   // no-op unless enabled
             // Inert at 1st order (zero slope ⇒ zero cell-interior integral).
             forAll(NCcell, i) NCcell[i]->primitiveFieldRef() = 0.0;
         }
@@ -228,10 +251,15 @@ int main(int argc, char *argv[])
 
     // Output is driven explicitly on window-complete (below): the implicit
     // clock-rewind breaks Time's outputTime tracking, so we gate writes by the
-    // writeInterval ourselves.
+    // writeInterval ourselves.  Gate on ABSOLUTE integer multiples of the
+    // interval (nextWriteIndex*outInterval), NOT an accumulating `lastWrite`:
+    // the latter stores the actual (possibly drifted) write time and so creeps
+    // by one step over hundreds of windows, desyncing the coupled write times
+    // from the monolithic reference (which uses OF's drift-free
+    // adjustableRunTime).  Absolute targets keep every run on {k*writeInterval}.
     const scalar outInterval =
         runTime.controlDict().lookupOrDefault<scalar>("writeInterval", 0.05);
-    scalar lastWrite = 0.0;
+    label nextWriteIndex = 1;
 
     // preCICE handshake.  Returns Foam::GREAT when inactive, so the dt
     // clamp inside the loop is a no-op for uncoupled runs.
@@ -258,6 +286,7 @@ int main(int argc, char *argv[])
         // share the same dt.
         numerics::update_aux_variables(Q, Qaux, mesh);
         scalar dt = numerics::compute_dt(Q, Qaux, p, minInradius, Co);
+        dt = Foam::min(dt, maxDeltaT);   // honor the optional hard dt cap
         scalar dt_used;
         if (precice.active())
         {
@@ -344,10 +373,13 @@ int main(int argc, char *argv[])
         {
             precice.readCheckpoint(Q);
         }
-        else if (runTime.value() + Foam::SMALL >= lastWrite + outInterval)
+        else if (runTime.value() + 0.5*dt_used >= nextWriteIndex*outInterval)
         {
+            // Landed on (within half a step of) the next absolute write
+            // boundary k*writeInterval — write there and advance to the next k.
             runTime.writeNow();
-            lastWrite = runTime.value();
+            nextWriteIndex =
+                Foam::label(runTime.value()/outInterval + 0.5) + 1;
         }
     }
 

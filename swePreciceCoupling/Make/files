@@ -1,0 +1,2 @@
+swePreciceCoupling.C
+LIB = $(FOAM_USER_LIBBIN)/libswePreciceCoupling

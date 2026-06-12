@@ -111,6 +111,19 @@ inline Foam::scalar max_wavespeed(Ts... args)
     if (ND >= 2) n.y() = packed[i + 1];
     if (ND >= 3) n.z() = packed[i + 2];
 
+    // Spectral radius of the normal-projected quasilinear matrix.
+    //
+    // Analytical models (SWE, Roe) carry a closed-form spectrum in
+    // ``Model::eigenvalues`` — use it directly (behaviour unchanged).
+    // Declarative models run in NUMERICAL-eigenvalue mode (the printer
+    // emits ``Model::eigenvalues`` as zeros: no symbolic spectrum) — for
+    // them the spectral radius comes from the Jacobian numerically (Eigen),
+    // mirroring the numpy/jax backend, and is REQUIRED for models with no
+    // closed-form spectrum (SME level ≥ 1).  These declarative models are
+    // spatially 1-D (the moment hierarchy adds STATE, not spatial
+    // directions), so ``quasilinear_matrix_x`` is the full normal-projected
+    // operator on the 1-D mesh; referencing only ``_x`` keeps this compiling
+    // for every emitted Model.H regardless of dimension.
     const auto evs = Model::eigenvalues(Q, Qaux, p, n);
     Foam::scalar mx = 0.0;
     forAll(evs, j)
@@ -120,6 +133,27 @@ inline Foam::scalar max_wavespeed(Ts... args)
         {
             mx = std::max(mx, std::abs(row[k]));
         }
+    }
+    if (mx > Foam::scalar(0)) return mx;            // analytical spectrum present
+
+    // Numerical fallback: max |Re λ| of A_x = n_x · ∂F/∂Q (1-D Jacobian).
+    const auto Ax = Model::quasilinear_matrix_x(Q, Qaux, p);
+    Eigen::MatrixXd A(NQ, NQ);
+    for (int r = 0; r < NQ; ++r)
+    {
+        for (int c = 0; c < NQ; ++c)
+        {
+            const double v =
+                static_cast<double>(n.x()) * static_cast<double>(Ax[r][c]);
+            if (!std::isfinite(v)) return mx;       // dry / degenerate -> ~0
+            A(r, c) = v;
+        }
+    }
+    Eigen::EigenSolver<Eigen::MatrixXd> solver(A, /*computeEigenvectors=*/false);
+    const Eigen::VectorXd w = solver.eigenvalues().real();
+    for (int k = 0; k < w.size(); ++k)
+    {
+        mx = std::max(mx, static_cast<Foam::scalar>(std::abs(w(k))));
     }
     return mx;
 }
