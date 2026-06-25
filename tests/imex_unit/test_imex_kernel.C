@@ -9,6 +9,8 @@
   generated Model.H — pure kernel.  Returns non-zero on any failure.
 \*---------------------------------------------------------------------------*/
 #include <iostream>
+#include <cstdio>
+#include <string>
 #include <cmath>
 #include "List.H"
 #include "scalar.H"
@@ -45,8 +47,40 @@ static Mat col(const Row& v)
     return r;
 }
 
-int main()
+// Sweep mode (argv[1] = csv path): for a stiff linear source S = -K q over a
+// range of K·dt, dump the IMEX cell-Newton result alongside exact backward-Euler
+// and one explicit forward-Euler step — the reproducible data behind the §6.1
+// stability deliverable (deliverable.py).  Explicit diverges for K·dt > 2; the
+// implicit Newton tracks backward-Euler and stays bounded for all K·dt.
+static int sweep(const std::string& path)
 {
+    const scalar dt = 1.0, qstar = 1.0;
+    const Row noaux(0), nop(0);
+    std::FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) { std::cout << "cannot open " << path << "\n"; return 1; }
+    std::fprintf(f, "Kdt,imex,backward_euler,forward_euler\n");
+    for (int i = 0; i <= 80; ++i)
+    {
+        const scalar Kdt = 0.05 * i;                 // 0 … 4
+        const scalar K = Kdt / dt;
+        auto src = [&](const Row& q, const Row&, const Row&)
+        { return col(Row(1, -K * q[0])); };
+        Row out(1, 0.0);
+        numerics::implicit_source_cell
+            (Row(1, qstar), noaux, nop, dt, 50, 1e-12, src, out);
+        const scalar be = qstar / (1.0 + Kdt);       // exact backward Euler
+        const scalar fe = qstar * (1.0 - Kdt);       // one forward-Euler step
+        std::fprintf(f, "%.4f,%.10g,%.10g,%.10g\n", Kdt, out[0], be, fe);
+    }
+    std::fclose(f);
+    std::cout << "wrote sweep -> " << path << "\n";
+    return 0;
+}
+
+int main(int argc, char* argv[])
+{
+    if (argc > 1) return sweep(argv[1]);
+
     const label maxiter = 50;
     const scalar tol = 1e-12;
     const Row noaux(0);
