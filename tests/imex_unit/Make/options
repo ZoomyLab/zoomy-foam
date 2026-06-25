@@ -1,0 +1,7 @@
+# Unit test for ../../imex_kernel.H — needs only OpenFOAM core (List/scalar).
+EXE_INC = \
+    -std=c++17 \
+    -I../..
+
+EXE_LIBS = \
+    -lOpenFOAM

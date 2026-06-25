@@ -27,6 +27,7 @@
 
 #include "NumericsKernels.H"
 #include "UpdateAuxVariables.H"
+#include "imex_kernel.H"
 
 namespace numerics
 {
@@ -572,6 +573,54 @@ inline void update_source
         {
             Src[i]->primitiveFieldRef()[cellI] = S[i][0];
         }
+    }
+}
+
+// ── IMEX implicit source step: cell-local Newton on the (stiff) source ──
+//
+// Lie–Trotter split: after the explicit hyperbolic stage has advanced Q to the
+// predicted state Q*, this solves the implicit source residual per cell
+//
+//     R(Q) = Q − Q* − dt·S(Q, Qaux, p) = 0
+//
+// Each cell is an independent n_dof_q × n_dof_q nonlinear solve handled by the
+// Model-agnostic ``implicit_source_cell`` (imex_kernel.H), wired here to the
+// emitted ``Model::source`` with Qaux FROZEN at its post-flux value (the JAX
+// IMEX "local" source mode).  Embarrassingly local → never touches a coupled
+// (preCICE) boundary patch.  Rows with a zero source (bed b, mass row) get
+// identity Jacobian rows and are left unchanged — no per-slot special-casing.
+// On a singular Jacobian the cell is left at its explicit value Q*.
+inline void implicit_source_step
+(
+    Foam::List<Foam::volScalarField*>& Q,
+    const Foam::List<Foam::volScalarField*>& Qaux,
+    const Foam::List<Foam::scalar>& p,
+    const Foam::scalar dt,
+    const Foam::label maxiter,
+    const Foam::scalar tol
+)
+{
+    const Foam::label nC = Q[0]->size();
+    const int nq = Model::n_dof_q;
+
+    Foam::List<Foam::scalar> qstar(nq), qa(Model::n_dof_qaux), qOut(nq);
+
+    for (Foam::label c = 0; c < nC; ++c)
+    {
+        forAll(Q, i)    qstar[i] = (*Q[i])[c];
+        forAll(Qaux, i) qa[i]    = (*Qaux[i])[c];
+
+        const bool ok = implicit_source_cell
+        (
+            qstar, qa, p, dt, maxiter, tol,
+            [](const Foam::List<Foam::scalar>& q_,
+               const Foam::List<Foam::scalar>& qa_,
+               const Foam::List<Foam::scalar>& p_)
+            { return Model::source(q_, qa_, p_); },
+            qOut
+        );
+
+        if (ok) forAll(Q, i) (*Q[i])[c] = qOut[i];
     }
 }
 

@@ -174,6 +174,27 @@ int main(int argc, char *argv[])
         runTime.controlDict().lookupOrDefault<label>("reconstructionOrder", 1);
     Info<< "reconstructionOrder = " << reconstructionOrder << endl;
 
+    // Time integration scheme.  "explicit" (default) folds the source into the
+    // explicit RHS and integrates everything with forward-Euler / SSP-RK2.
+    // "imex" splits the step Lie–Trotter: the hyperbolic part (flux + bed-slope
+    // NCP) is advanced explicitly exactly as before, then the (stiff) source is
+    // taken IMPLICITLY by a cell-local Newton solve (numerics::implicit_source_step).
+    // The implicit source step is purely cell-local, so preCICE coupling is
+    // unaffected (it never touches a coupled boundary patch).  Mirrors the JAX
+    // IMEXSourceSolverJax "local" source mode.
+    const word timeScheme =
+        runTime.controlDict().lookupOrDefault<word>("timeScheme", word("explicit"));
+    const bool implicitSource = (timeScheme == "imex");
+    const label imexMaxIter =
+        runTime.controlDict().lookupOrDefault<label>("imexMaxIter", 6);
+    const scalar imexTol =
+        runTime.controlDict().lookupOrDefault<scalar>("imexTol", 1e-10);
+    if (implicitSource)
+    {
+        Info<< "timeScheme = imex  (implicit source: cell-local Newton, "
+            << "maxIter " << imexMaxIter << ", tol " << imexTol << ")" << endl;
+    }
+
     // preCICE coupling.  An empty participant name (the default for every
     // uncoupled case) leaves the manager inactive — active() == false makes
     // every call below a strict no-op, so the solve path is unchanged.
@@ -210,11 +231,14 @@ int main(int argc, char *argv[])
     const scalarField& cellV = mesh.V();
 
     // Build L = Src − ∇·F_num  (per unit volume, in [Q]/[time]).
-    // This is the explicit RHS of dQ/dt = L(Q).
-    auto compute_rhs = [&]()
+    // This is the explicit RHS of dQ/dt = L(Q).  Under IMEX the source is handled
+    // implicitly after the hyperbolic stage, so it is excluded here
+    // (includeSource = false) and the explicit RHS carries flux + NCP only.
+    auto compute_rhs = [&](bool includeSource)
     {
         numerics::update_aux_variables(Q, Qaux, mesh);
-        numerics::update_source(Src, Q, Qaux, p);
+        if (includeSource) numerics::update_source(Src, Q, Qaux, p);
+        else forAll(Src, i) Src[i]->primitiveFieldRef() = 0.0;
         if (reconstructionOrder >= 2)
         {
             // Reconstruct ALL model reconstruction-variables — no
@@ -325,6 +349,10 @@ int main(int argc, char *argv[])
         // value survives both RK2 stages.
         precice.read(Q, Qaux, dt_used);
 
+        // Explicit hyperbolic stage.  Under IMEX (implicitSource) the source is
+        // excluded from the RHS and applied implicitly afterwards; otherwise it
+        // is folded in (the original explicit behaviour).
+        const bool srcInRHS = !implicitSource;
         if (reconstructionOrder >= 2)
         {
             // SSP-RK2 (Shu-Osher form):
@@ -333,7 +361,7 @@ int main(int argc, char *argv[])
             forAll(Q, i) Qold[i] = Q[i]->primitiveField();
 
             // Stage 1
-            compute_rhs();
+            compute_rhs(srcInRHS);
             forAll(Q, i)
             {
                 Q[i]->primitiveFieldRef() = Qold[i] + dt_used * L[i];
@@ -341,7 +369,7 @@ int main(int argc, char *argv[])
             numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
 
             // Stage 2 — L evaluated at Q*
-            compute_rhs();
+            compute_rhs(srcInRHS);
             forAll(Q, i)
             {
                 Q[i]->primitiveFieldRef() =
@@ -352,11 +380,22 @@ int main(int argc, char *argv[])
         else
         {
             // Forward Euler
-            compute_rhs();
+            compute_rhs(srcInRHS);
             forAll(Q, i)
             {
                 Q[i]->primitiveFieldRef() += dt_used * L[i];
             }
+            numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
+        }
+
+        // IMEX implicit source sub-step.  The hyperbolic stage above left Q at
+        // the predicted state Q*; solve  Q − Q* − dt·S(Q) = 0  per cell (Newton,
+        // frozen aux).  Cell-local → coupled patches untouched.
+        if (implicitSource)
+        {
+            numerics::update_aux_variables(Q, Qaux, mesh);
+            numerics::implicit_source_step
+                (Q, Qaux, p, dt_used, imexMaxIter, imexTol);
             numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
         }
 
