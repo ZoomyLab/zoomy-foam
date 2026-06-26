@@ -176,23 +176,50 @@ int main(int argc, char *argv[])
 
     // Time integration scheme.  "explicit" (default) folds the source into the
     // explicit RHS and integrates everything with forward-Euler / SSP-RK2.
-    // "imex" splits the step Lie–Trotter: the hyperbolic part (flux + bed-slope
-    // NCP) is advanced explicitly exactly as before, then the (stiff) source is
-    // taken IMPLICITLY by a cell-local Newton solve (numerics::implicit_source_step).
-    // The implicit source step is purely cell-local, so preCICE coupling is
-    // unaffected (it never touches a coupled boundary patch).  Mirrors the JAX
-    // IMEXSourceSolverJax "local" source mode.
+    // "imex" runs a genuine additive IMEX Runge–Kutta (ARS family, see
+    // numerics::IMEXTableau): the hyperbolic part f_E = −∇·F − NCP is explicit
+    // and the stiff source f_I is implicit, COUPLED within each stage of the
+    // tableau (not a Lie–Trotter split).  The per-stage implicit solve is the
+    // cell-local Newton (numerics::implicit_source_step) with effective step
+    // dt·A_I[i,i]; being cell-local it never touches a coupled boundary patch,
+    // so preCICE coupling is unaffected.  C++ analogue of core's imex_ark.py.
+    // reconstructionOrder controls SPATIAL order; the tableau controls TEMPORAL.
     const word timeScheme =
         runTime.controlDict().lookupOrDefault<word>("timeScheme", word("explicit"));
     const bool implicitSource = (timeScheme == "imex");
+    const word imexTableauName =
+        runTime.controlDict().lookupOrDefault<word>("imexTableau", word("ars232"));
+    const numerics::IMEXTableau ark =
+        (imexTableauName == "ars343") ? numerics::ars343() : numerics::ars232();
     const label imexMaxIter =
-        runTime.controlDict().lookupOrDefault<label>("imexMaxIter", 6);
+        runTime.controlDict().lookupOrDefault<label>("imexMaxIter", 20);
     const scalar imexTol =
         runTime.controlDict().lookupOrDefault<scalar>("imexTol", 1e-10);
     if (implicitSource)
     {
-        Info<< "timeScheme = imex  (implicit source: cell-local Newton, "
-            << "maxIter " << imexMaxIter << ", tol " << imexTol << ")" << endl;
+        Info<< "timeScheme = imex  (additive IMEX-ARK " << ark.name
+            << ", order " << ark.order << ", " << ark.s << " stages; "
+            << "per-stage Newton maxIter " << imexMaxIter
+            << ", tol " << imexTol << ")" << endl;
+    }
+
+    // IMEX-ARK stage storage (allocated once; unused under the explicit scheme).
+    List<scalarField> Y0(Model::n_dof_q), RHSx(Model::n_dof_q);
+    List<List<scalarField>> KE(ark.s), KI(ark.s);
+    forAll(Q, i)
+    {
+        Y0[i]   = scalarField(mesh.nCells(), 0.0);
+        RHSx[i] = scalarField(mesh.nCells(), 0.0);
+    }
+    for (label st = 0; st < ark.s; ++st)
+    {
+        KE[st].setSize(Model::n_dof_q);
+        KI[st].setSize(Model::n_dof_q);
+        forAll(Q, i)
+        {
+            KE[st][i] = scalarField(mesh.nCells(), 0.0);
+            KI[st][i] = scalarField(mesh.nCells(), 0.0);
+        }
     }
 
     // preCICE coupling.  An empty participant name (the default for every
@@ -349,19 +376,81 @@ int main(int argc, char *argv[])
         // value survives both RK2 stages.
         precice.read(Q, Qaux, dt_used);
 
-        // Explicit hyperbolic stage.  Under IMEX (implicitSource) the source is
-        // excluded from the RHS and applied implicitly afterwards; otherwise it
-        // is folded in (the original explicit behaviour).
-        const bool srcInRHS = !implicitSource;
-        if (reconstructionOrder >= 2)
+        if (implicitSource)
         {
-            // SSP-RK2 (Shu-Osher form):
+            // ── Additive IMEX-ARK (numerics::IMEXTableau) ──────────────────
+            // f_E = −∇·F − NCP (explicit, via compute_rhs(false) → L);
+            // f_I = source S(Q) (implicit, cell-local).  Stages are COUPLED
+            // through the tableau — a genuine IMEX, not an operator split.
+            forAll(Q, i) Y0[i] = Q[i]->primitiveField();
+
+            // Evaluate the stage RHS pair K_E=f_E(Q), K_I=f_I(Q) at current Q.
+            auto eval_stage = [&](label st)
+            {
+                compute_rhs(false);          // updates aux; L = f_E (no source)
+                numerics::update_source(Src, Q, Qaux, p);  // f_I at same aux
+                forAll(Q, i)
+                {
+                    KE[st][i] = L[i];
+                    KI[st][i] = Src[i]->primitiveField();
+                }
+            };
+
+            // Stage 0 (explicit-only for ARS: A_I[0][0] = 0).
+            numerics::update_aux_variables(Q, Qaux, mesh);
+            numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
+            eval_stage(0);
+
+            for (label i = 1; i < ark.s; ++i)
+            {
+                // rhs_i = Q^n + dt Σ_{j<i}(A_E[i,j] K_E[j] + A_I[i,j] K_I[j])
+                forAll(Q, k)
+                {
+                    scalarField rx = Y0[k];
+                    for (label j = 0; j < i; ++j)
+                    {
+                        if (ark.AE[i][j] != 0.0) rx += dt_used * ark.AE[i][j] * KE[j][k];
+                        if (ark.AI[i][j] != 0.0) rx += dt_used * ark.AI[i][j] * KI[j][k];
+                    }
+                    RHSx[k] = rx;
+                    Q[k]->primitiveFieldRef() = rx;     // Q ← rhs_i (= Newton qstar)
+                }
+                numerics::update_aux_variables(Q, Qaux, mesh);
+                numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
+
+                // Implicit stage: solve  Y − rhs_i − dt·γ_ii·S(Y) = 0  per cell.
+                const scalar gii = ark.AI[i][i];
+                if (gii != 0.0)
+                {
+                    numerics::implicit_source_step
+                        (Q, Qaux, p, dt_used * gii, imexMaxIter, imexTol);
+                    numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
+                }
+                eval_stage(i);
+            }
+
+            // Q^{n+1} = Q^n + dt Σ_i (b_E[i] K_E[i] + b_I[i] K_I[i]).
+            forAll(Q, k)
+            {
+                scalarField yn = Y0[k];
+                for (label i = 0; i < ark.s; ++i)
+                {
+                    if (ark.bE[i] != 0.0) yn += dt_used * ark.bE[i] * KE[i][k];
+                    if (ark.bI[i] != 0.0) yn += dt_used * ark.bI[i] * KI[i][k];
+                }
+                Q[k]->primitiveFieldRef() = yn;
+            }
+            numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
+        }
+        else if (reconstructionOrder >= 2)
+        {
+            // Explicit SSP-RK2 (Shu-Osher form), source folded into the RHS:
             //   Q* = Q^n + dt · L(Q^n)
             //   Q^{n+1} = 0.5 · (Q^n + Q* + dt · L(Q*))
             forAll(Q, i) Qold[i] = Q[i]->primitiveField();
 
             // Stage 1
-            compute_rhs(srcInRHS);
+            compute_rhs(true);
             forAll(Q, i)
             {
                 Q[i]->primitiveFieldRef() = Qold[i] + dt_used * L[i];
@@ -369,7 +458,7 @@ int main(int argc, char *argv[])
             numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
 
             // Stage 2 — L evaluated at Q*
-            compute_rhs(srcInRHS);
+            compute_rhs(true);
             forAll(Q, i)
             {
                 Q[i]->primitiveFieldRef() =
@@ -379,23 +468,12 @@ int main(int argc, char *argv[])
         }
         else
         {
-            // Forward Euler
-            compute_rhs(srcInRHS);
+            // Explicit forward Euler, source folded in.
+            compute_rhs(true);
             forAll(Q, i)
             {
                 Q[i]->primitiveFieldRef() += dt_used * L[i];
             }
-            numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
-        }
-
-        // IMEX implicit source sub-step.  The hyperbolic stage above left Q at
-        // the predicted state Q*; solve  Q − Q* − dt·S(Q) = 0  per cell (Newton,
-        // frozen aux).  Cell-local → coupled patches untouched.
-        if (implicitSource)
-        {
-            numerics::update_aux_variables(Q, Qaux, mesh);
-            numerics::implicit_source_step
-                (Q, Qaux, p, dt_used, imexMaxIter, imexTol);
             numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
         }
 

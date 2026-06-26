@@ -11,6 +11,7 @@
 #include <iostream>
 #include <cstdio>
 #include <string>
+#include <vector>
 #include <cmath>
 #include "List.H"
 #include "scalar.H"
@@ -47,6 +48,9 @@ static Mat col(const Row& v)
     return r;
 }
 
+static scalar ark_scalar(scalar y0, scalar dt, int nsteps, scalar lamE,
+                         scalar lamI, const numerics::IMEXTableau& tab);
+
 // Sweep mode (argv[1] = csv path): for a stiff linear source S = -K q over a
 // range of K·dt, dump the IMEX cell-Newton result alongside exact backward-Euler
 // and one explicit forward-Euler step — the reproducible data behind the §6.1
@@ -74,7 +78,109 @@ static int sweep(const std::string& path)
     }
     std::fclose(f);
     std::cout << "wrote sweep -> " << path << "\n";
+
+    // Companion: IMEX-ARK temporal-convergence sweep on a non-stiff ODE
+    // y' = λE y + λI y (λE=-1, λI=-2), error vs dt — slope ~2 for ARS232,
+    // ~3 for ARS343 (the additive-RK order; a Lie-Trotter split would be 1).
+    const std::string cpath =
+        path.substr(0, path.find_last_of('/') + 1) + "ark_convergence.csv";
+    std::FILE* g = std::fopen(cpath.c_str(), "w");
+    if (g)
+    {
+        const numerics::IMEXTableau t2 = numerics::ars232();
+        const numerics::IMEXTableau t3 = numerics::ars343();
+        const scalar T = 1.0, lamE = -1.0, lamI = -2.0;
+        const scalar exact = std::exp((lamE + lamI) * T);
+        std::fprintf(g, "dt,err_ars232,err_ars343\n");
+        for (int k = 2; k <= 7; ++k)
+        {
+            const int n = 1 << k;                 // 4 … 128 steps
+            const scalar dt = T / n;
+            const scalar e2 = std::abs(ark_scalar(1.0, dt, n, lamE, lamI, t2) - exact);
+            const scalar e3 = std::abs(ark_scalar(1.0, dt, n, lamE, lamI, t3) - exact);
+            std::fprintf(g, "%.6g,%.10g,%.10g\n", dt, e2, e3);
+        }
+        std::fclose(g);
+        std::cout << "wrote ark convergence -> " << cpath << "\n";
+    }
     return 0;
+}
+
+// One IMEX-ARK integration of the scalar test ODE  y' = λE·y + λI·y  over
+// nsteps of size dt, mirroring the field-level driver in zoomyFoam.C exactly
+// (same tableau, same per-stage cell Newton implicit_source_cell).  λE is the
+// explicit part, λI the (stiff) implicit part.  Exact: y(T) = y0·e^{(λE+λI)T}.
+static scalar ark_scalar(scalar y0, scalar dt, int nsteps,
+                         scalar lamE, scalar lamI,
+                         const numerics::IMEXTableau& tab)
+{
+    const Row noaux(0), nop(0);
+    scalar y = y0;
+    std::vector<scalar> KE(tab.s), KI(tab.s);
+    for (int n = 0; n < nsteps; ++n)
+    {
+        KE[0] = lamE * y;
+        KI[0] = lamI * y;
+        for (int i = 1; i < tab.s; ++i)
+        {
+            scalar rhs = y;
+            for (int j = 0; j < i; ++j)
+            {
+                rhs += dt * tab.AE[i][j] * KE[j];
+                rhs += dt * tab.AI[i][j] * KI[j];
+            }
+            const scalar gii = tab.AI[i][i];
+            scalar Yi = rhs;
+            if (gii != 0.0)
+            {
+                auto src = [&](const Row& q, const Row&, const Row&)
+                { return col(Row(1, lamI * q[0])); };
+                Row out(1, 0.0);
+                numerics::implicit_source_cell
+                    (Row(1, rhs), noaux, nop, dt * gii, 50, 1e-13, src, out);
+                Yi = out[0];
+            }
+            KE[i] = lamE * Yi;
+            KI[i] = lamI * Yi;
+        }
+        for (int i = 0; i < tab.s; ++i)
+            y += dt * (tab.bE[i] * KE[i] + tab.bI[i] * KI[i]);
+    }
+    return y;
+}
+
+static void ark_checks()
+{
+    const numerics::IMEXTableau t = numerics::ars232();
+
+    // (a) Stiff stability + accuracy: λI = -1000 (stiff, implicit), λE = -1.
+    {
+        const scalar T = 1.0, exact = std::exp(-1001.0 * T);
+        const scalar y = ark_scalar(1.0, T / 50.0, 50, -1.0, -1000.0, t);
+        check(std::isfinite(y) && std::abs(y) < 1e-3 && std::abs(y - exact) < 1e-3,
+              "IMEX-ARK stiff stable (λI=-1000)", y, exact);
+    }
+
+    // (b) Temporal order 2: halve dt → error drops ~4×  (non-stiff so the
+    //     splitting error, not the implicit solve, dominates).
+    {
+        const scalar T = 1.0, lamE = -1.0, lamI = -2.0;
+        const scalar exact = std::exp((lamE + lamI) * T);
+        const scalar e1 = std::abs(ark_scalar(1.0, T / 20.0, 20, lamE, lamI, t) - exact);
+        const scalar e2 = std::abs(ark_scalar(1.0, T / 40.0, 40, lamE, lamI, t) - exact);
+        const scalar rate = std::log(e1 / e2) / std::log(2.0);
+        check(rate > 1.8 && rate < 2.3, "IMEX-ARK temporal order ~2", rate, 2.0);
+    }
+
+    // (c) Splitting-killer: f_E and f_I exactly cancel (λE = +K, λI = -K).
+    //     A Lie–Trotter split commits O(dt) error here; the coupled ARK keeps
+    //     the steady state y(t)=y0 to high accuracy.  K = 100, one big step.
+    {
+        const scalar K = 100.0;
+        const scalar y = ark_scalar(1.0, 1.0, 1, K, -K, t);
+        check(std::abs(y - 1.0) < 1e-2,
+              "IMEX-ARK coupled (f_E+f_I=0 steady; split would drift)", y, 1.0);
+    }
 }
 
 int main(int argc, char* argv[])
@@ -161,6 +267,9 @@ int main(int argc, char* argv[])
         check(ok && rows23, "mixed: stiff moment rows = backward Euler",
               out[2], qs[2]/d);
     }
+
+    // ── IMEX-ARK (additive Runge–Kutta) checks ──────────────────────────────
+    ark_checks();
 
     std::cout << (failures ? "\nIMEX KERNEL UNIT TEST: FAIL\n"
                            : "\nIMEX KERNEL UNIT TEST: ALL PASS\n");

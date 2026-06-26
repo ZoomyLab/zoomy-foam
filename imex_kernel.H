@@ -17,6 +17,70 @@
 namespace numerics
 {
 
+// ── IMEX additive-Runge–Kutta tableau (ARS family) ──────────────────────
+//
+// A genuine IMEX-ARK splits the semi-discrete system  dQ/dt = f_E(Q) + f_I(Q)
+// into a non-stiff explicit part f_E (hyperbolic flux + bed-slope NCP) and a
+// stiff implicit part f_I (the source).  Unlike a Lie–Trotter operator split
+// (advance f_E, THEN f_I sequentially — only 1st order, decoupled), the ARK
+// combines BOTH within each stage of a coupled Butcher tableau:
+//
+//   rhs_i = Q^n + dt Σ_{j<i} ( A_E[i,j] K_E[j] + A_I[i,j] K_I[j] )
+//   Y_i solves   Y_i − rhs_i − dt·A_I[i,i]·f_I(Y_i) = 0      (per-stage Newton)
+//   K_E[i] = f_E(Y_i),  K_I[i] = f_I(Y_i)
+//   Q^{n+1} = Q^n + dt Σ_i ( b_E[i] K_E[i] + b_I[i] K_I[i] )
+//
+// This is the C++ analogue of core's ``zoomy_core/fvm/imex_ark.py`` (same
+// ARS(2,3,2)/ARS(3,4,3) coefficients).  The per-stage implicit solve is the
+// cell-local Newton ``implicit_source_cell`` below (the source is cell-local),
+// with effective step dt·A_I[i,i].
+struct IMEXTableau
+{
+    const char* name;
+    int order;
+    int s;                                       // number of stages
+    Foam::List<Foam::List<Foam::scalar>> AE, AI; // (s×s)
+    Foam::List<Foam::scalar> bE, bI, cE, cI;     // (s)
+};
+
+// ARS(2,3,2) — 2nd order, stiffly accurate (Ascher–Ruuth–Spiteri 1997, Tab. 1).
+inline IMEXTableau ars232()
+{
+    const Foam::scalar g = 1.0 - 1.0 / Foam::sqrt(2.0);
+    const Foam::scalar d = -2.0 * Foam::sqrt(2.0) / 3.0;
+    IMEXTableau t;
+    t.name = "ARS232"; t.order = 2; t.s = 3;
+    t.AE = { {0,0,0}, {g,0,0}, {d,1.0-d,0} };
+    t.AI = { {0,0,0}, {0,g,0}, {0,1.0-g,g} };
+    t.bE = {0, 1.0-g, g};   t.cE = {0, g, 1.0};
+    t.bI = {0, 1.0-g, g};   t.cI = {0, g, 1.0};
+    return t;
+}
+
+// ARS(3,4,3) — 3rd order, stiffly accurate (Ascher–Ruuth–Spiteri 1997, Tab. 2).
+inline IMEXTableau ars343()
+{
+    IMEXTableau t;
+    t.name = "ARS343"; t.order = 3; t.s = 4;
+    t.AE = {
+        {0,0,0,0},
+        {0.4358665215,0,0,0},
+        {0.3212788860,0.3966543747,0,0},
+        {-0.105858296,0.5529291479,0.5529291479,0}
+    };
+    t.AI = {
+        {0,0,0,0},
+        {0,0.4358665215,0,0},
+        {0,0.2820667392,0.4358665215,0},
+        {0,1.208496649,-0.644363171,0.4358665215}
+    };
+    t.bE = {0,1.208496649,-0.644363171,0.4358665215};
+    t.cE = {0,0.4358665215,0.7179332608,1.0};
+    t.bI = {0,1.208496649,-0.644363171,0.4358665215};
+    t.cI = {0,0.4358665215,0.7179332608,1.0};
+    return t;
+}
+
 // ── Dense n×n solve (Gaussian elimination, partial pivot), in place ──────
 //
 // Solves A·x = b for the small per-cell IMEX Jacobian systems (n = n_dof_q,
