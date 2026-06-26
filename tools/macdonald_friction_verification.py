@@ -69,7 +69,7 @@ def _field(case, name, vals):
         "  frontAndBack { type empty; } topAndBottom { type empty; }\n}\n")
 
 
-def build_case(case, n_cells, scheme):
+def build_case(case, n_cells, scheme, order=1, n_manning=N_MANNING):
     if case.exists():
         shutil.rmtree(case)
     (case / "0").mkdir(parents=True); (case / "system").mkdir(); (case / "constant").mkdir()
@@ -97,13 +97,13 @@ mergePatchPairs ();
 application zoomyFoam;
 startFrom startTime; startTime 0; stopAt endTime; endTime {T_END}; deltaT 0.01;
 writeControl adjustableRunTime; writeInterval {T_END}; purgeWrite 0;
-maxCo 0.4; reconstructionOrder 1; timeScheme {scheme}; imexTableau ars232;
+maxCo 0.4; reconstructionOrder {order}; timeScheme {scheme}; imexTableau ars232;
 imexMaxIter 20; imexTol 1e-12;
-modelParameters {{ g {G}; n {N_MANNING}; }}
+modelParameters {{ g {G}; n {n_manning}; }}
 """)
     x_nodes = np.linspace(0, L, n_cells + 1)
     xc = 0.5 * (x_nodes[1:] + x_nodes[:-1])
-    b, h = analytic(xc, Q_IN, N_MANNING)
+    b, h = analytic(xc, Q_IN, n_manning)
     _field(case, "Q0", b); _field(case, "Q1", h); _field(case, "Q2", np.full_like(xc, Q_IN))
     return xc, h
 
@@ -123,13 +123,22 @@ def run(case):
     return _read(last / "Q1")
 
 
-def solve_at(work, n_cells, scheme, xc_ref=None):
-    case = work / f"mac_{scheme}_{n_cells}"
-    xc, h_an = build_case(case, n_cells, scheme)
+def solve_at(work, n_cells, scheme, order=1, n_manning=N_MANNING):
+    case = work / f"mac_{scheme}_o{order}_n{n_manning:g}_{n_cells}"
+    xc, h_an = build_case(case, n_cells, scheme, order=order, n_manning=n_manning)
     h = run(case)
     if np.isscalar(h):
         h = np.full_like(xc, h)
     return xc, h_an, h
+
+
+def converge(work, scheme, order, n_manning, grids):
+    dxs, l1s = [], []
+    for n in grids:
+        xc, h_an, h = solve_at(work, n, scheme, order=order, n_manning=n_manning)
+        dxs.append(L / n); l1s.append(float(np.mean(np.abs(h - h_an))))
+    rate = float(np.polyfit(np.log(dxs), np.log(l1s), 1)[0])
+    return dxs, l1s, rate
 
 
 def main():
@@ -142,32 +151,43 @@ def main():
 
     work = Path(tempfile.mkdtemp(prefix="macdonald_"))
     grids = [50, 100, 200, 400]
-    dxs, l1s = [], []
+    nofric = 1e-8                       # ~frictionless: isolate the bed-slope part
     print(f"MacDonald SWE+Manning: q={Q_IN}, n={N_MANNING}, L={L}")
-    for n in grids:
-        xc, h_an, h = solve_at(work, n, "imex")
-        l1 = float(np.mean(np.abs(h - h_an)))
-        dxs.append(L / n); l1s.append(l1)
-        print(f"  imex n={n:4d}: L1(h)={l1:.3e}")
-    rate = float(np.polyfit(np.log(dxs), np.log(l1s), 1)[0])
-    print(f"  observed L1 order = {rate:.2f}")
 
-    xc, h_an, h_imex = solve_at(work, 200, "imex")
-    _, _, h_exp = solve_at(work, 200, "explicit")
+    # Three convergence series (all IMEX-ARK time scheme):
+    #   o1 + friction, o2 + friction, o2 frictionless (bed-slope only).
+    series = {
+        "o1 friction":   ("imex", 1, N_MANNING, "crimson", "s"),
+        "o2 friction":   ("imex", 2, N_MANNING, "navy",    "o"),
+        "o2 frictionless (bed only)": ("imex", 2, nofric,  "seagreen", "^"),
+    }
+    conv = {}
+    for label, (scheme, order, nman, col, mk) in series.items():
+        dxs, l1s, rate = converge(work, scheme, order, nman, grids)
+        conv[label] = (dxs, l1s, rate, col, mk)
+        print(f"  {label}: rate={rate:.2f}  L1={[f'{e:.2e}' for e in l1s]}")
+
+    # Profile at the medium grid, order 2 with friction.
+    xc, h_an, h_o2 = solve_at(work, 200, "imex", order=2, n_manning=N_MANNING)
 
     FIG.parent.mkdir(parents=True, exist_ok=True)
-    fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.4))
     axL.plot(xc, h_an, "-", color="0.4", lw=3, label="analytic MacDonald h(x)")
-    axL.plot(xc, h_imex, "o", color="navy", ms=3, label="zoomyFoam IMEX-ARK")
-    axL.plot(xc, h_exp, "+", color="crimson", ms=4, label="zoomyFoam explicit")
+    axL.plot(xc, h_o2, "o", color="navy", ms=3, label="zoomyFoam IMEX-ARK (order 2)")
     axL.set_xlabel("x [m]"); axL.set_ylabel("depth h [m]")
-    axL.set_title(f"(a) steady profile, n=200   L1(h)={np.mean(abs(h_imex-h_an)):.2e}")
+    axL.set_title(f"(a) steady profile, n=200, order 2   L1(h)={np.mean(abs(h_o2-h_an)):.2e}")
     axL.legend(fontsize=8)
-    axR.loglog(dxs, l1s, "o-", color="navy", label="IMEX-ARK L1(h)")
-    axR.loglog(dxs, [l1s[0] * (d / dxs[0]) for d in dxs], ":", color="0.5",
-               label=r"$\propto \Delta x$ (order 1)")
+    for label, (dxs, l1s, rate, col, mk) in conv.items():
+        axR.loglog(dxs, l1s, mk + "-", color=col, label=f"{label}  (rate {rate:.2f})")
+    d = conv["o1 friction"][0]
+    axR.loglog(d, [conv["o1 friction"][1][0]*(x/d[0]) for x in d], ":", color="0.5", lw=1,
+               label=r"$\propto \Delta x$")
+    axR.loglog(d, [conv["o2 frictionless (bed only)"][1][0]*(x/d[0])**2 for x in d], ":",
+               color="seagreen", lw=1, label=r"$\propto \Delta x^2$")
     axR.set_xlabel(r"$\Delta x$ [m]"); axR.set_ylabel("L1 error vs analytic")
-    axR.set_title(f"(b) mesh convergence — order {rate:.2f}"); axR.legend(fontsize=8)
+    axR.set_title("(b) convergence: order 2 holds for flux+bed;\n"
+                  "friction source caps it at 1st order")
+    axR.legend(fontsize=7.5)
     fig.suptitle("zoomyFoam IMEX-ARK vs MacDonald steady SWE + Manning friction "
                  "(analytic source-term verification)", fontsize=11)
     fig.tight_layout()
