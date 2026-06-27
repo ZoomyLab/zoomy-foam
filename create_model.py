@@ -18,7 +18,7 @@ from zoomy_core.model.boundary_conditions import (
     BoundaryConditions, Extrapolation, Coupled, FromModel, Dirichlet)
 from zoomy_core.fvm.riemann_solvers import PositiveNonconservativeRusanov
 from zoomy_core.transformation.to_openfoam import (
-    FoamSystemModelPrinter, FoamNumericsPrinter, FoamUpdateAuxPrinter)
+    FoamSystemModelPrinter, FoamNumericsPrinter)
 
 HERE = Path(__file__).resolve().parent
 
@@ -56,12 +56,13 @@ def emit(level, out=HERE, outer="extrapolation", closure="none", bcs="coupling",
     sm = build_system_model(level, outer=outer, closure=closure, bcs=bcs,
                             q_in=q_in, h_out=h_out)
     num = PositiveNonconservativeRusanov(model=sm)
-    FoamSystemModelPrinter.write_code(
-        sm, out / "Model.H",
-        analytical_eigenvalues=False)   # numerical eigenvalues; projections read
-                                        # from the model-owned slots (>= 1347b56)
+    # Two-printer API (zoomy_core >= 75d8c76): the Model printer emits the full
+    # model INCLUDING update_aux_variables (in `namespace Model`) — there is no
+    # separate UpdateAuxVariables.H any more.  The Numerics printer emits the
+    # Riemann kernels (local_max_abs_eigenvalue now comes from the model
+    # eigenvalues; max_wavespeed was dropped).
+    FoamSystemModelPrinter.write_code(sm, out / "Model.H")
     FoamNumericsPrinter.write_code(num, out / "NumericsKernels.H")
-    FoamUpdateAuxPrinter.write_code(sm, out / "UpdateAuxVariables.H")
     print(f"emitted SME(level={level}, closure={closure}, bcs={bcs}) -> {out}  "
           f"state={[str(s) for s in sm.state]}")
 

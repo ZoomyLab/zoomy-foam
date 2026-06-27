@@ -249,9 +249,15 @@ int main(int argc, char *argv[])
         (mesh, preciceParticipant, preciceConfig, p,
          preciceMeshes, preciceWriteData, preciceReadData, preciceZSamples);
 
+    // Current step size, shared with the emitted update_aux_variables (its
+    // signature gained a `dt` arg in zoomy_core@f875156 for the Chorin
+    // pressure-iter aux; the SME/derivative auxes don't use it, but the call
+    // must pass it).  Set to dt_used each step once the CFL dt is known.
+    scalar dtAux = 0.0;
+
     forAll(Q,    QI)    Q[QI]->write();
     forAll(Qaux, QauxI) Qaux[QauxI]->write();
-    numerics::update_aux_variables(Q, Qaux, mesh);
+    Model::update_aux_variables(Q, Qaux, dtAux, mesh);
     numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
 
     // Cell volume field for normalising the divergence operator.
@@ -263,7 +269,7 @@ int main(int argc, char *argv[])
     // (includeSource = false) and the explicit RHS carries flux + NCP only.
     auto compute_rhs = [&](bool includeSource)
     {
-        numerics::update_aux_variables(Q, Qaux, mesh);
+        Model::update_aux_variables(Q, Qaux, dtAux, mesh);
         if (includeSource) numerics::update_source(Src, Q, Qaux, p);
         else forAll(Src, i) Src[i]->primitiveFieldRef() = 0.0;
         if (reconstructionOrder >= 2)
@@ -335,7 +341,7 @@ int main(int argc, char *argv[])
 
         // CFL — computed from the start-of-step state so both RK2 stages
         // share the same dt.
-        numerics::update_aux_variables(Q, Qaux, mesh);
+        Model::update_aux_variables(Q, Qaux, dtAux, mesh);
         scalar dt = numerics::compute_dt(Q, Qaux, p, minInradius, Co);
         dt = Foam::min(dt, maxDeltaT);   // honor the optional hard dt cap
         scalar dt_used;
@@ -368,6 +374,8 @@ int main(int argc, char *argv[])
             dt_used = runTime.deltaTValue();
         }
 
+        dtAux = dt_used;   // share the actual step with update_aux_variables
+
         Info<< nl << "Time = " << runTime.userTimeName() << nl << endl;
 
         // Pull the peer's interface state into the coupled-patch boundary
@@ -397,7 +405,7 @@ int main(int argc, char *argv[])
             };
 
             // Stage 0 (explicit-only for ARS: A_I[0][0] = 0).
-            numerics::update_aux_variables(Q, Qaux, mesh);
+            Model::update_aux_variables(Q, Qaux, dtAux, mesh);
             numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
             eval_stage(0);
 
@@ -415,7 +423,7 @@ int main(int argc, char *argv[])
                     RHSx[k] = rx;
                     Q[k]->primitiveFieldRef() = rx;     // Q ← rhs_i (= Newton qstar)
                 }
-                numerics::update_aux_variables(Q, Qaux, mesh);
+                Model::update_aux_variables(Q, Qaux, dtAux, mesh);
                 numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
 
                 // Implicit stage: solve  Y − rhs_i − dt·γ_ii·S(Y) = 0  per cell.

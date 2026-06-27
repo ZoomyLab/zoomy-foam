@@ -17,16 +17,17 @@
 #include "fvc.H"
 #include "fvcGrad.H"
 
-#include "Model.H"
-
-// Opaque backend primitives (max_wavespeed, compute_derivative) that the
-// generated kernels reference are supplied by the UserFunctions escape hatch —
-// included BEFORE the generated kernels so they are in scope.  (Mirrors the
-// planned layout: generated Numerics.H/Model.H depend on UserFunctions.H.)
+// Opaque backend primitives (compute_derivative, eigensystem) from the
+// UserFunctions escape hatch.  Included BEFORE the generated Model.H because the
+// new Model.H (zoomy_core >= 75d8c76) emits update_aux_variables, which calls
+// numerics::compute_derivative — it must be declared first.
 #include "UserFunctions.H"
 
+#include "Model.H"
+
+// Model.H now carries update_aux_variables in `namespace Model` (the old
+// separate UpdateAuxVariables.H is gone).
 #include "NumericsKernels.H"
-#include "UpdateAuxVariables.H"
 #include "imex_kernel.H"
 
 namespace numerics

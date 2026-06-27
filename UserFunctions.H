@@ -37,7 +37,12 @@
 #include "fvc.H"
 #include "fvcGrad.H"
 
-#include "Model.H"
+// NOTE: this header is Model-INDEPENDENT and is included BEFORE the generated
+// Model.H — the new Model.H (zoomy_core >= 75d8c76) emits
+// ``update_aux_variables`` which calls ``numerics::compute_derivative`` below,
+// so the helper must be declared first.  (The old ``max_wavespeed`` helper that
+// pulled in Model.H was removed: core dropped it in favour of the generated
+// ``Numerics::local_max_abs_eigenvalue`` built from ``Model::eigenvalues``.)
 
 namespace numerics
 {
@@ -75,104 +80,6 @@ inline void compute_derivative
         << "compute_derivative: total order " << total
         << " not yet supported (Phase 3 covers order <= 1)."
         << Foam::exit(Foam::FatalError);
-}
-
-// ── max_wavespeed — opaque helper consumed by generated Numerics kernels ──
-//
-// Wraps Model::eigenvalues, returning max|λ| of the normal-projected
-// spectrum at the given state.  The printer emits the symbolic
-// ``max_wavespeed(*Q, *Qaux, *p, *n)`` as a flat variadic call — this
-// helper unpacks back into the per-side Lists using the Model::
-// constants, then dispatches to Model::eigenvalues.  Works uniformly
-// for cell-centre, ±-side, and HR-reconstructed mixed-side invocations.
-template <typename... Ts>
-inline Foam::scalar max_wavespeed(Ts... args)
-{
-    constexpr int NQ = Model::n_dof_q;
-    constexpr int NA = Model::n_dof_qaux;
-    constexpr int NP = Model::n_parameters;
-    constexpr int ND = Model::dimension;
-    static_assert(
-        sizeof...(args) == NQ + NA + NP + ND,
-        "max_wavespeed: arg count must equal n_dof_q + n_dof_qaux + "
-        "n_parameters + dimension."
-    );
-    const Foam::scalar packed[] = { static_cast<Foam::scalar>(args)... };
-
-    Foam::List<Foam::scalar> Q(NQ);
-    Foam::List<Foam::scalar> Qaux(NA);
-    Foam::List<Foam::scalar> p(NP);
-    int i = 0;
-    for (int k = 0; k < NQ; ++k) Q[k] = packed[i++];
-    for (int k = 0; k < NA; ++k) Qaux[k] = packed[i++];
-    for (int k = 0; k < NP; ++k) p[k] = packed[i++];
-    Foam::vector n(0, 0, 0);
-    n.x() = packed[i];
-    if (ND >= 2) n.y() = packed[i + 1];
-    if (ND >= 3) n.z() = packed[i + 2];
-
-    // Spectral radius of the normal-projected quasilinear matrix.
-    //
-    // Analytical models (SWE, Roe) carry a closed-form spectrum in
-    // ``Model::eigenvalues`` — use it directly (behaviour unchanged).
-    // Declarative models run in NUMERICAL-eigenvalue mode (the printer
-    // emits ``Model::eigenvalues`` as zeros: no symbolic spectrum) — for
-    // them the spectral radius comes from the Jacobian numerically (Eigen),
-    // mirroring the numpy/jax backend, and is REQUIRED for models with no
-    // closed-form spectrum (SME level ≥ 1).  These declarative models are
-    // spatially 1-D (the moment hierarchy adds STATE, not spatial
-    // directions), so ``quasilinear_matrix_x`` is the full normal-projected
-    // operator on the 1-D mesh; referencing only ``_x`` keeps this compiling
-    // for every emitted Model.H regardless of dimension.
-    const auto evs = Model::eigenvalues(Q, Qaux, p, n);
-    Foam::scalar mx = 0.0;
-    forAll(evs, j)
-    {
-        const auto& row = evs[j];
-        forAll(row, k)
-        {
-            mx = std::max(mx, std::abs(row[k]));
-        }
-    }
-    if (mx > Foam::scalar(0)) return mx;            // analytical spectrum present
-
-    // Numerical fallback: max |Re λ| of A_x = n_x · ∂F/∂Q (1-D Jacobian).
-    // 1-D ONLY: for a multi-dimensional model it would return λ = 0 on
-    // every y/z-face — zero Rusanov dissipation there and a violent
-    // transverse instability on any non-uniform background (measured:
-    // 10%/step growth from ulp seeds on a y-uniform ridge).  Fail loudly
-    // instead: multi-D models must carry an analytical spectrum until the
-    // printer emits the generated local_max_abs_eigenvalue (the
-    // documented transition above).
-    if (ND >= 2)
-    {
-        FatalErrorInFunction
-            << "max_wavespeed: empty analytical spectrum and the "
-            << "numerical fallback is 1-D-only, but Model::dimension = "
-            << ND << ". Emit the model with analytical_eigenvalues=True "
-            << "— a silent zero wavespeed on transverse faces disables "
-            << "the Riemann dissipation there."
-            << Foam::exit(Foam::FatalError);
-    }
-    const auto Ax = Model::quasilinear_matrix_x(Q, Qaux, p);
-    Eigen::MatrixXd A(NQ, NQ);
-    for (int r = 0; r < NQ; ++r)
-    {
-        for (int c = 0; c < NQ; ++c)
-        {
-            const double v =
-                static_cast<double>(n.x()) * static_cast<double>(Ax[r][c]);
-            if (!std::isfinite(v)) return mx;       // dry / degenerate -> ~0
-            A(r, c) = v;
-        }
-    }
-    Eigen::EigenSolver<Eigen::MatrixXd> solver(A, /*computeEigenvectors=*/false);
-    const Eigen::VectorXd w = solver.eigenvalues().real();
-    for (int k = 0; k < w.size(); ++k)
-    {
-        mx = std::max(mx, static_cast<Foam::scalar>(std::abs(w(k))));
-    }
-    return mx;
 }
 
 // ── eigensystem — opaque eigendecomposition leaf for the Roe scheme ───────

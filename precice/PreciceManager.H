@@ -215,6 +215,47 @@ public:
                 forAll(Qaux, i)
                     qaPif[i] = Qaux[i]->boundaryField()[b.patchI].patchInternalField();
                 const Foam::vectorField& Sf = mesh_.boundary()[b.patchI].Sf();
+
+                // Column reduction to the 2D peer state.  New projection contract
+                // (zoomy_core >= 75d8c76): Model::project_from_3d(profile, p, I)
+                // takes the depth-averaged canonical fields `profile` ([b,h,u,v,w,p])
+                // and the ζ-quadrature accumulators `I` (velocity moments,
+                // I[0] = ∫ u dζ so q_0 = h·I[0]).  The driver does the column
+                // quadrature here (trapezoid over the unit-height sigma column).
+                // ⚠ SWE/level-0 exact; a profile-carrying (SME level>=1) peer
+                // needs the model's basis moments I[k]=∫u φ_k dζ — a follow-up.
+                auto reduceColumn =
+                    [&](const Foam::List<Foam::List<Foam::scalar>>& col,
+                        const Foam::List<Foam::scalar>& z)
+                    -> Foam::List<Foam::scalar>
+                {
+                    const int nz = col.size();
+                    Foam::List<Foam::scalar> profile(NF, 0.0);
+                    Foam::List<Foam::scalar> I(1, 0.0);
+                    if (nz == 1)
+                    {
+                        profile = col[0];
+                        I[0] = col[0][2];                 // u (field index 2)
+                    }
+                    else if (nz > 1)
+                    {
+                        for (int k = 0; k + 1 < nz; ++k)
+                        {
+                            const Foam::scalar dz = z[k + 1] - z[k];
+                            for (int d = 0; d < NF; ++d)
+                                profile[d] += 0.5 * (col[k][d] + col[k + 1][d]) * dz;
+                            I[0] += 0.5 * (col[k][2] + col[k + 1][2]) * dz;
+                        }
+                        const Foam::scalar H = z[nz - 1] - z[0];
+                        if (Foam::mag(H) > Foam::SMALL)
+                        {
+                            forAll(profile, d) profile[d] /= H;
+                            I[0] /= H;
+                        }
+                    }
+                    return Model::project_from_3d(profile, p_, I);
+                };
+
                 for (Foam::label f = 0; f < b.nFaces; ++f)
                 {
                     // Gather this coupled face's full vertical COLUMN — one
@@ -230,7 +271,7 @@ public:
                             column[zk][d] = buf[d][f * nZ_ + zk];
                         zcol[zk] = b.zSamples[f * nZ_ + zk];
                     }
-                    const auto peer = Model::project_from_3d(column, zcol, p_);
+                    const auto peer = reduceColumn(column, zcol);
                     forAll(Q, i)    interior[i]    = qPif[i][f];
                     forAll(Qaux, i) interiorAux[i] = qaPif[i][f];
                     // preCICE "zero sample": before the peer has written valid
@@ -292,10 +333,10 @@ public:
                         // grid, so both sides' q* are evaluated on identical
                         // inputs (bit-identical at L0, quadrature-aligned at
                         // L>=1) — the interface mass ledger closes.
-                        const auto rt = Model::project_from_3d(
+                        const auto rt = reduceColumn(
                             Model::interpolate_to_3d(
                                 interior, interiorAux, p_, zcol),
-                            zcol, p_);
+                            zcol);
                         const auto Ff = Numerics::numerical_flux
                             (rt, ghost, interiorAux, interiorAux, p_, nUnit);
                         const auto FLf = Numerics::numerical_fluctuations
