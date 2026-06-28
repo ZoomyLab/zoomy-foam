@@ -12,7 +12,9 @@ level 0 = shallow water [b, h, q_0]; level N adds moments q_1 … q_N.
 import argparse
 from pathlib import Path
 
-from zoomy_core.model.models import SME
+import sympy as sp
+
+from zoomy_core.model.models import SME, VAM
 from zoomy_core.model.models import closures as C
 from zoomy_core.model.boundary_conditions import (
     BoundaryConditions, Extrapolation, Coupled, FromModel, Dirichlet)
@@ -21,6 +23,54 @@ from zoomy_core.transformation.to_openfoam import (
     FoamSystemModelPrinter, FoamNumericsPrinter)
 
 HERE = Path(__file__).resolve().parent
+
+
+def emit_chorin(level=1, dim=2, out=HERE, bcs="open"):
+    """Emit the Chorin pressure-split headers for the non-hydrostatic VAM solver.
+
+    The predictor sub-system is emitted as the MAIN model (``namespace Model`` +
+    a Riemann ``Numerics`` over it) so the explicit FV machinery runs it; the
+    pressure and corrector sub-systems get their own namespaces.  A tiny
+    ``ChorinState.H`` carries the FULL shared-state count (the rectangular
+    sub-systems each expose only their own equation count, not the union).
+
+      Model.H          namespace Model           predictor ops (pressure-zeroed)
+      NumericsKernels.H namespace Numerics       Riemann flux over the predictor
+      Pressure.H       namespace ChorinPressure  elliptic source (P,P_x,P_xx) + e2s
+      Corrector.H      namespace ChorinCorrector update_variables(Q,Qaux,p,dt) + e2s
+      ChorinState.H                              n_state (full 8-slot VAM state)
+    """
+    if bcs == "open":
+        boundary = BoundaryConditions([Extrapolation(tag="left"),
+                                       Extrapolation(tag="right")])
+    else:
+        boundary = BoundaryConditions([Extrapolation(tag="outer"),
+                                       Coupled(tag="coupled", mesh_name="interface")])
+    m = VAM(level=level, dimension=dim, boundary_conditions=boundary)
+    full = m.system_model
+    n_state = len(full.state)
+    dt = sp.Symbol("dt", positive=True)
+    split = m.chorin_split(dt)
+
+    FoamSystemModelPrinter.write_code(split.SM_pred, out / "Model.H",
+                                      namespace_name="Model")
+    FoamNumericsPrinter.write_code(
+        PositiveNonconservativeRusanov(model=split.SM_pred),
+        out / "NumericsKernels.H")
+    FoamSystemModelPrinter.write_code(split.SM_press, out / "Pressure.H",
+                                      namespace_name="ChorinPressure", dt_symbol=dt)
+    FoamSystemModelPrinter.write_code(split.SM_corr, out / "Corrector.H",
+                                      namespace_name="ChorinCorrector")
+    (out / "ChorinState.H").write_text(
+        "#pragma once\n"
+        "// Full shared VAM state count (the rectangular Chorin sub-systems each\n"
+        "// expose only their own equation count). Emitted by create_model.py.\n"
+        f"namespace Model {{ constexpr int n_state = {n_state}; }}\n")
+    print(f"emitted Chorin VAM(level={level},dim={dim}) -> {out}  "
+          f"n_state={n_state}  pred/press/corr e2s="
+          f"{list(split.SM_pred.equation_to_state_index)}/"
+          f"{list(split.SM_press.equation_to_state_index)}/"
+          f"{list(split.SM_corr.equation_to_state_index)}")
 
 
 def build_system_model(level, outer="extrapolation", closure="none", bcs="coupling",
@@ -78,6 +128,12 @@ if __name__ == "__main__":
                     default="coupling")
     ap.add_argument("--q-in", type=float, default=1.0)
     ap.add_argument("--h-out", type=float, default=1.0)
+    ap.add_argument("--scheme", choices=["explicit", "chorin"], default="explicit")
+    ap.add_argument("--dim", type=int, default=2, help="VAM dimension (Chorin)")
     a = ap.parse_args()
-    emit(a.level, a.out, outer=a.outer, closure=a.closure, bcs=a.bcs,
-         q_in=a.q_in, h_out=a.h_out)
+    if a.scheme == "chorin":
+        emit_chorin(level=(a.level or 1), dim=a.dim, out=a.out,
+                    bcs=("open" if a.bcs != "coupling" else "coupling"))
+    else:
+        emit(a.level, a.out, outer=a.outer, closure=a.closure, bcs=a.bcs,
+             q_in=a.q_in, h_out=a.h_out)
