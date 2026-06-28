@@ -140,10 +140,10 @@ inline void update_numerical_flux
 {
     const Foam::fvMesh& mesh = Q[0]->mesh();
 
-    Foam::List<Foam::scalar> Q_minus(Model::n_dof_q);
-    Foam::List<Foam::scalar> Q_plus(Model::n_dof_q);
-    Foam::List<Foam::scalar> Qaux_minus(Model::n_dof_qaux);
-    Foam::List<Foam::scalar> Qaux_plus(Model::n_dof_qaux);
+    Foam::List<Foam::scalar> Q_minus(Q.size());
+    Foam::List<Foam::scalar> Q_plus(Q.size());
+    Foam::List<Foam::scalar> Qaux_minus(Qaux.size());
+    Foam::List<Foam::scalar> Qaux_plus(Qaux.size());
 
     for (int faceI = 0; faceI < mesh.nInternalFaces(); ++faceI)
     {
@@ -247,8 +247,8 @@ inline void correct_boundary_q
     auto patchMap = get_map_patchNameToPatchIndex();
     const Foam::fvMesh& mesh = Q[0]->mesh();
 
-    Foam::List<Foam::scalar> q_inner(Model::n_dof_q);
-    Foam::List<Foam::scalar> qaux_inner(Model::n_dof_qaux);
+    Foam::List<Foam::scalar> q_inner(Q.size());
+    Foam::List<Foam::scalar> qaux_inner(Qaux.size());
 
     forAll(mesh.boundaryMesh(), patchI)
     {
@@ -308,8 +308,8 @@ inline void update_W_fields
 )
 {
     const Foam::label nC = Q[0]->size();
-    Foam::List<Foam::scalar> q(Model::n_dof_q);
-    Foam::List<Foam::scalar> qa(Model::n_dof_qaux);
+    Foam::List<Foam::scalar> q(Q.size());
+    Foam::List<Foam::scalar> qa(Qaux.size());
 
     // Internal cells.
     for (Foam::label cellI = 0; cellI < nC; ++cellI)
@@ -396,7 +396,7 @@ inline void update_cell_interior_ncp
     const Foam::label nC = Q[0]->size();
     const int NQ = Model::n_dof_q;
 
-    Foam::List<Foam::scalar> q(NQ), qa(Model::n_dof_qaux);
+    Foam::List<Foam::scalar> q(NQ), qa(Qaux.size());
     Foam::List<Foam::scalar> Wc(NQ), Wf(NQ);
 
     forAll(NC, i) NC[i]->primitiveFieldRef() = 0.0;
@@ -464,10 +464,10 @@ inline void update_numerical_flux_o2
 {
     const Foam::fvMesh& mesh = Q[0]->mesh();
 
-    Foam::List<Foam::scalar> W_L(Model::n_dof_q), W_R(Model::n_dof_q);
-    Foam::List<Foam::scalar> Q_L(Model::n_dof_q), Q_R(Model::n_dof_q);
-    Foam::List<Foam::scalar> Qaux_L(Model::n_dof_qaux);
-    Foam::List<Foam::scalar> Qaux_R(Model::n_dof_qaux);
+    Foam::List<Foam::scalar> W_L(Model::n_dof_q), W_R(Q.size());
+    Foam::List<Foam::scalar> Q_L(Model::n_dof_q), Q_R(Q.size());
+    Foam::List<Foam::scalar> Qaux_L(Qaux.size());
+    Foam::List<Foam::scalar> Qaux_R(Qaux.size());
 
     for (int faceI = 0; faceI < mesh.nInternalFaces(); ++faceI)
     {
@@ -563,8 +563,8 @@ inline void update_source
 )
 {
     const Foam::label nC = Q[0]->size();
-    Foam::List<Foam::scalar> q(Model::n_dof_q);
-    Foam::List<Foam::scalar> qa(Model::n_dof_qaux);
+    Foam::List<Foam::scalar> q(Q.size());
+    Foam::List<Foam::scalar> qa(Qaux.size());
     for (Foam::label cellI = 0; cellI < nC; ++cellI)
     {
         forAll(Q, i)    q[i]  = (*Q[i])[cellI];
@@ -639,8 +639,8 @@ inline Foam::scalar compute_dt
     const Foam::surfaceVectorField n_face(mesh.Sf() / mesh.magSf());
 
     Foam::scalar dt = Foam::GREAT;
-    Foam::List<Foam::scalar> q(Model::n_dof_q);
-    Foam::List<Foam::scalar> qa(Model::n_dof_qaux);
+    Foam::List<Foam::scalar> q(Q.size());
+    Foam::List<Foam::scalar> qa(Qaux.size());
 
     forAll(mesh.Sf(), faceI)
     {
