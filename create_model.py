@@ -46,7 +46,11 @@ def emit_chorin(level=1, dim=2, out=HERE, bcs="open"):
     else:
         boundary = BoundaryConditions([Extrapolation(tag="outer"),
                                        Coupled(tag="coupled", mesh_name="interface")])
-    m = VAM(level=level, dimension=dim, boundary_conditions=boundary)
+    # Close the bulk/slip/surface stresses so σ̂ doesn't leak as a free aux
+    # (unclosed VAM emits raw `\hat{\sigma}` symbols into the C++ source).
+    m = VAM(level=level, dimension=dim,
+            closures=[C.Newtonian(), C.NavierSlip(), C.StressFree()],
+            boundary_conditions=boundary)
     full = m.system_model
     n_state = len(full.state)
     dt = sp.Symbol("dt", positive=True)

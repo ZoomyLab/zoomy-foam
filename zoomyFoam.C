@@ -32,6 +32,7 @@ Description
 #include "surfaceFields.H"
 #include "List.H"
 #include "numerics.H"
+#include "numerics_o2.H"   // order-2 reconstruction/WB helpers (split out)
 #include "zeroGradientFvPatchFields.H"
 #include "fixedValueFvPatchFields.H"
 #include "emptyFvPatchFields.H"

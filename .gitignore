@@ -17,3 +17,6 @@ __pycache__/
 # wmake artifacts of the function object
 swePreciceCoupling/lnInclude/
 swePreciceCoupling/Make/linux*
+Pressure.H
+Corrector.H
+ChorinState.H
