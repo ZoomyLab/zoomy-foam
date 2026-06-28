@@ -50,8 +50,10 @@ namespace numerics
 // ── compute_derivative ─ spatial derivative helper for aux_registry ──────
 //
 // Writes ``D^(dx,dy,dz) source`` into ``result`` over the OpenFOAM mesh.
-// Phase 3 supports total order <= 1 via Gauss-linear cell gradient.
-// Higher orders will land via per-cell LSQ; for now they FatalError.
+// Order 0 = copy; order 1 = Gauss-linear cell gradient; order 2 = the gradient
+// applied twice (∂_b ∂_a f), the Hessian component (a,b) read off the
+// multi-index.  Order 2 is REQUIRED for the VAM Chorin pressure block, whose
+// emitted aux refresh calls ``compute_derivative(P_xx, P, 2,0,0, mesh)``.
 inline void compute_derivative
 (
     Foam::volScalarField& result,
@@ -76,9 +78,33 @@ inline void compute_derivative
             tgrad().primitiveField().component(axis);
         return;
     }
+    if (total == 2)
+    {
+        // The two differentiation axes (with multiplicity), e.g.
+        // (2,0,0) -> {0,0} = ∂_xx, (1,1,0) -> {0,1} = ∂_xy.
+        int ax[2]; int na = 0;
+        for (int a = 0; a < dx; ++a) ax[na++] = 0;
+        for (int a = 0; a < dy; ++a) ax[na++] = 1;
+        for (int a = 0; a < dz; ++a) ax[na++] = 2;
+
+        // inner = ∂_{ax[0]} source.  Carry it in a field whose boundary patch
+        // types match `source` (copy-construct), then refresh the ghost so the
+        // OUTER Gauss gradient samples a consistent boundary value.
+        Foam::volScalarField inner(source);
+        {
+            const Foam::tmp<Foam::volVectorField> g1 = Foam::fvc::grad(source);
+            inner.primitiveFieldRef() = g1().primitiveField().component(ax[0]);
+        }
+        inner.correctBoundaryConditions();
+
+        const Foam::tmp<Foam::volVectorField> g2 = Foam::fvc::grad(inner);
+        result.primitiveFieldRef() =
+            g2().primitiveField().component(ax[1]);
+        return;
+    }
     FatalErrorInFunction
         << "compute_derivative: total order " << total
-        << " not yet supported (Phase 3 covers order <= 1)."
+        << " not yet supported (orders 0–2 implemented)."
         << Foam::exit(Foam::FatalError);
 }
 

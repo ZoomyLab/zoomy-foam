@@ -1,0 +1,11 @@
+# Mesh-based unit test for ../../UserFunctions.H::compute_derivative.
+EXE_INC = \
+    -std=c++17 \
+    -I../.. \
+    -I/usr/include/eigen3 \
+    -I$(LIB_SRC)/finiteVolume/lnInclude \
+    -I$(LIB_SRC)/meshTools/lnInclude
+
+EXE_LIBS = \
+    -lfiniteVolume \
+    -lmeshTools
