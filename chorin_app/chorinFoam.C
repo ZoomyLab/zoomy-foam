@@ -117,10 +117,23 @@ int main(int argc, char *argv[])
     }
     forAll(Q, i) Qold[i] = scalarField(nc, 0.0);
 
-    // ── parameters ──────────────────────────────────────────────────────────
+    // ── parameters (overridable per case via controlDict modelParameters) ────
     List<scalar> pPred = Model::default_parameters();
     List<scalar> pCorr = ChorinCorrector::default_parameters();
     List<scalar> pPress = ChorinPressure::default_parameters();   // last slot = dt
+    if (runTime.controlDict().found("modelParameters"))
+    {
+        const dictionary& md = runTime.controlDict().subDict("modelParameters");
+        auto override = [&](List<scalar>& p, const List<word>& names)
+        {
+            forAll(names, i)
+                p[i] = md.lookupOrDefault<scalar>(names[i], p[i]);
+        };
+        override(pPred,  Model::parameter_names);
+        override(pCorr,  ChorinCorrector::parameter_names);
+        override(pPress, ChorinPressure::parameter_names);   // leaves dt slot as-is
+        Info << "modelParameters override applied" << endl;
+    }
 
     const scalar Co = readScalar(runTime.controlDict().lookup("maxCo"));
     const scalar maxDeltaT =

@@ -25,7 +25,7 @@ from zoomy_core.transformation.to_openfoam import (
 HERE = Path(__file__).resolve().parent
 
 
-def emit_chorin(level=1, dim=2, out=HERE, bcs="open"):
+def emit_chorin(level=1, dim=2, out=HERE, bcs="open", q_in=1.0, h_out=1.0):
     """Emit the Chorin pressure-split headers for the non-hydrostatic VAM solver.
 
     The predictor sub-system is emitted as the MAIN model (``namespace Model`` +
@@ -40,7 +40,12 @@ def emit_chorin(level=1, dim=2, out=HERE, bcs="open"):
       Corrector.H      namespace ChorinCorrector update_variables(Q,Qaux,p,dt) + e2s
       ChorinState.H                              n_state (full 8-slot VAM state)
     """
-    if bcs == "open":
+    if bcs == "subcritical":
+        # Discharge-in (fix q_0 at left) / depth-out (fix h at right); the other
+        # modes (q_1,r_*,P_*) extrapolate — the well-posed subcritical pair.
+        boundary = BoundaryConditions([Dirichlet(tag="left", on="q_0", value=q_in),
+                                       Dirichlet(tag="right", on="h", value=h_out)])
+    elif bcs == "open":
         boundary = BoundaryConditions([Extrapolation(tag="left"),
                                        Extrapolation(tag="right")])
     else:
@@ -136,8 +141,8 @@ if __name__ == "__main__":
     ap.add_argument("--dim", type=int, default=2, help="VAM dimension (Chorin)")
     a = ap.parse_args()
     if a.scheme == "chorin":
-        emit_chorin(level=(a.level or 1), dim=a.dim, out=a.out,
-                    bcs=("open" if a.bcs != "coupling" else "coupling"))
+        emit_chorin(level=(a.level or 1), dim=a.dim, out=a.out, bcs=a.bcs,
+                    q_in=a.q_in, h_out=a.h_out)
     else:
         emit(a.level, a.out, outer=a.outer, closure=a.closure, bcs=a.bcs,
              q_in=a.q_in, h_out=a.h_out)
