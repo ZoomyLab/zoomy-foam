@@ -213,6 +213,24 @@ int main(int argc, char *argv[])
         }
     };
 
+    // Optional reflective LEFT wall (closed reservoir end): the model VAM Wall
+    // BC is core-blocked (REQ-39 ShapeError), so reflect the horizontal momentum
+    // modes (q_0,q_1) on the left patch by hand — ghost = −interior (zero normal
+    // mass flux); the vertical modes (r_0,r_1), h, b, P keep the zeroGradient
+    // (tangential / extrapolated).  Gated by controlDict `leftWall` (default off).
+    const bool leftWall = runTime.controlDict().lookupOrDefault<bool>("leftWall", false);
+    label leftPatch = -1;
+    forAll(mesh.boundaryMesh(), pI)
+        if (mesh.boundary()[pI].name() == "left") leftPatch = pI;
+    auto applyWall = [&]()
+    {
+        if (!leftWall || leftPatch < 0) return;
+        const labelUList& fc = mesh.boundary()[leftPatch].faceCells();
+        for (int s : {2, 3})           // q_0, q_1 (horizontal momentum modes)
+            forAll(fc, f)
+                Q[s]->boundaryFieldRef()[leftPatch][f] = -(*Q[s])[fc[f]];
+    };
+
     Model::update_aux_variables(Q, QauxPred, 0.0, mesh);
     forAll(Q, i) Q[i]->write();
     const scalar endTime = runTime.endTime().value();
@@ -234,12 +252,16 @@ int main(int argc, char *argv[])
         forAll(Src, i)          // equation i → state slot e2s_pred[i] (= i here)
             Q[Model::equation_to_state_index[i]]->primitiveFieldRef() += dtu * L[i];
         forAll(Q, i) Q[i]->correctBoundaryConditions();
+        numerics::correct_boundary_q(Q, QauxPred, pPred, runTime.value(), false);
+        applyWall();
 
         // 2) pressure — solve the elliptic block for P
         solvePressure(dtu);
 
         // 3) corrector — apply the pressure impulse to the momentum modes
         corrector(dtu);
+        numerics::correct_boundary_q(Q, QauxCorr, pCorr, runTime.value(), false);
+        applyWall();
 
         runTime.write();
     }
