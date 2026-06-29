@@ -213,23 +213,31 @@ int main(int argc, char *argv[])
         }
     };
 
-    // Optional reflective LEFT wall (closed reservoir end): the model VAM Wall
-    // BC is core-blocked (REQ-39 ShapeError), so reflect the horizontal momentum
-    // modes (q_0,q_1) on the left patch by hand — ghost = −interior (zero normal
-    // mass flux); the vertical modes (r_0,r_1), h, b, P keep the zeroGradient
-    // (tangential / extrapolated).  Gated by controlDict `leftWall` (default off).
-    const bool leftWall = runTime.controlDict().lookupOrDefault<bool>("leftWall", false);
-    label leftPatch = -1;
+    // Reflective walls — a CASE-LEVEL boundary condition supplied by the case
+    // author (controlDict `wallPatches (left ...);`), NOT the model.  On each
+    // listed patch the horizontal momentum modes (q_0,q_1) are reflected
+    // (ghost = −interior → zero normal mass flux); the vertical modes (r_0,r_1),
+    // h, b, P keep the transmissive (zeroGradient) ghost.  Patches not listed
+    // stay transmissive.  The BC is the case's responsibility here — the solver
+    // just honours the case's wall list.
+    const wordList wallPatches =
+        runTime.controlDict().lookupOrDefault<wordList>("wallPatches", wordList());
+    labelList wallPatchIds;
     forAll(mesh.boundaryMesh(), pI)
-        if (mesh.boundary()[pI].name() == "left") leftPatch = pI;
+        if (findIndex(wallPatches, mesh.boundary()[pI].name()) != -1)
+            wallPatchIds.append(pI);
     auto applyWall = [&]()
     {
-        if (!leftWall || leftPatch < 0) return;
-        const labelUList& fc = mesh.boundary()[leftPatch].faceCells();
-        for (int s : {2, 3})           // q_0, q_1 (horizontal momentum modes)
-            forAll(fc, f)
-                Q[s]->boundaryFieldRef()[leftPatch][f] = -(*Q[s])[fc[f]];
+        forAll(wallPatchIds, w)
+        {
+            const label pI = wallPatchIds[w];
+            const labelUList& fc = mesh.boundary()[pI].faceCells();
+            for (int s : {2, 3})        // q_0, q_1 (horizontal momentum modes)
+                forAll(fc, f)
+                    Q[s]->boundaryFieldRef()[pI][f] = -(*Q[s])[fc[f]];
+        }
     };
+    applyWall();   // also stamp the wall on the initial state
 
     Model::update_aux_variables(Q, QauxPred, 0.0, mesh);
     forAll(Q, i) Q[i]->write();

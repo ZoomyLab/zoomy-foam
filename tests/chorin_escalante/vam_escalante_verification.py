@@ -14,12 +14,17 @@ Prereq: chorinFoam built for VAM(1,2) with OPEN bcs —
   python3 create_model.py --scheme chorin --level 1 --dim 2 --bcs open
   then wmake chorin_app in the OF13 apptainer; ρ/g set via modelParameters.
 
-⚠ Result: foam VAM-Chorin runs the dam-break STABLY to t≈2.8 s and tracks the
-experiment (η and p_b/g) — core's desingularization (af2d8a9) pushed the old
-REQ-17 blow-up from t≈1.0 to t≈2.8 — but still SIGFPEs at the strong
-transcritical front before the t≈3.0 experiment time (residual REQ-17/REQ-71).
-Comparison shown at t≈2.8 (flow near quasi-steady over the bump); upstream η
-sits ~6% low (open-BC reservoir drainage + order-1 non-WB bias)."""
+BOUNDARY CONDITIONS are the case author's responsibility (set HERE, not by the
+model): the closed reservoir end is a reflective wall via controlDict
+`wallPatches (left)`; the right is transmissive (zeroGradient).
+
+⚠ Result: with the CORRECT case BC (left wall) the reservoir holds (left h~0.339,
+matching the numpy reference), but the run SIGFPEs at t≈0.8-1.0 — the REQ-17/REQ-71
+transcritical instability (core), no longer masked. (An EARLIER run with a wrong
+OPEN left BC reached t≈2.8 only because the spurious drainage weakened the flow
+and delayed the blow-up — that comparison was a BC artifact.) A faithful t≈3.0
+experiment comparison needs the core stability fix (REQ-71 eigenvalue floor +
+structural-Chorin robustness); foam-side the case BC + driver are correct."""
 import re, shutil, subprocess, sys
 from pathlib import Path
 import numpy as np
@@ -61,6 +66,7 @@ boundary ( left {{ type patch; faces ((0 4 7 3)); }} right {{ type patch; faces 
 application chorinFoam; startFrom startTime; startTime 0; stopAt endTime; endTime {tend};
 deltaT 0.001; writeControl adjustableRunTime; writeInterval {dtw}; maxCo {maxco}; purgeWrite 0;
 modelParameters {{ g {G}; rho {RHO}; }}
+wallPatches (left);   // CASE BC (author-supplied): closed reservoir end = reflective wall
 """)
     xn=np.linspace(X0,X1,N+1); xc=0.5*(xn[1:]+xn[:-1])
     field(case,"Q0",bed(xc)); field(case,"Q1",ic_h(xc))
