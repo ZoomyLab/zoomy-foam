@@ -167,8 +167,12 @@ public:
                         // the SAME sigma grid -> compatible nearest-neighbour
                         // mapping, and different physical h on each side is
                         // reconciled by the normalisation.  nZ_==1 -> mid-column.
+                        // ENDPOINT-INCLUSIVE nodes sigma_j = j/(N_z-1): this is the
+                        // exact fixed-node grid the model's project_from_3d kernel
+                        // assumes (zoomy_core SME.project_nz, nodes j/(N_z-1)), so
+                        // the sampled column feeds the Galerkin reduction directly.
                         const double sigma =
-                            (nZ_ == 1) ? 0.5 : (zk + 0.5) / double(nZ_);
+                            (nZ_ == 1) ? 0.5 : zk / double(nZ_ - 1);
                         coords.push_back(fc[f].x());
                         coords.push_back(fc[f].y());
                         coords.push_back(sigma);
@@ -216,44 +220,24 @@ public:
                     qaPif[i] = Qaux[i]->boundaryField()[b.patchI].patchInternalField();
                 const Foam::vectorField& Sf = mesh_.boundary()[b.patchI].Sf();
 
-                // Column reduction to the 2D peer state.  New projection contract
-                // (zoomy_core >= 75d8c76): Model::project_from_3d(profile, p, I)
-                // takes the depth-averaged canonical fields `profile` ([b,h,u,v,w,p])
-                // and the ζ-quadrature accumulators `I` (velocity moments,
-                // I[0] = ∫ u dζ so q_0 = h·I[0]).  The driver does the column
-                // quadrature here (trapezoid over the unit-height sigma column).
-                // ⚠ SWE/level-0 exact; a profile-carrying (SME level>=1) peer
-                // needs the model's basis moments I[k]=∫u φ_k dζ — a follow-up.
+                // Column reduction to the 2D peer state.  Projection contract
+                // (zoomy_core REQ-75, @8d31ada): Model::project_from_3d(column, p)
+                // consumes the FULL sampled interface column — one canonical-field
+                // vector [b,h,u,v,w,p] per vertical node sigma_j = j/(N_z-1),
+                // j=0..N_z-1 — and returns ALL 2D moments via the model's
+                // Integral-free, fixed-node Galerkin reduction (trapezoid weights
+                // baked in the kernel; correct for SWE/level-0 AND profile-carrying
+                // SME level>=1, no driver-side depth-average / I[] accumulator).
+                // CONTRACT: nZ_ (controlDict `preciceZSamples`) MUST equal the
+                // model's emitted `project_nz`, and the column must be sampled on
+                // the SAME uniform sigma_j=j/(N_z-1) grid (built above) the kernel
+                // assumes — a mismatch reads the column at the wrong heights.
                 auto reduceColumn =
                     [&](const Foam::List<Foam::List<Foam::scalar>>& col,
-                        const Foam::List<Foam::scalar>& z)
+                        const Foam::List<Foam::scalar>& /*z (nodes baked in kernel)*/)
                     -> Foam::List<Foam::scalar>
                 {
-                    const int nz = col.size();
-                    Foam::List<Foam::scalar> profile(NF, 0.0);
-                    Foam::List<Foam::scalar> I(1, 0.0);
-                    if (nz == 1)
-                    {
-                        profile = col[0];
-                        I[0] = col[0][2];                 // u (field index 2)
-                    }
-                    else if (nz > 1)
-                    {
-                        for (int k = 0; k + 1 < nz; ++k)
-                        {
-                            const Foam::scalar dz = z[k + 1] - z[k];
-                            for (int d = 0; d < NF; ++d)
-                                profile[d] += 0.5 * (col[k][d] + col[k + 1][d]) * dz;
-                            I[0] += 0.5 * (col[k][2] + col[k + 1][2]) * dz;
-                        }
-                        const Foam::scalar H = z[nz - 1] - z[0];
-                        if (Foam::mag(H) > Foam::SMALL)
-                        {
-                            forAll(profile, d) profile[d] /= H;
-                            I[0] /= H;
-                        }
-                    }
-                    return Model::project_from_3d(profile, p_, I);
+                    return Model::project_from_3d(col, p_);
                 };
 
                 for (Foam::label f = 0; f < b.nFaces; ++f)
