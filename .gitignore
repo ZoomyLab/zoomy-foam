@@ -20,3 +20,6 @@ swePreciceCoupling/Make/linux*
 Pressure.H
 Corrector.H
 ChorinState.H
+.bincache/
+*.egg-info/
+zoomy_foam.egg-info/
