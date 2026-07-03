@@ -66,19 +66,25 @@ public:
         meshNames_ = meshNames.size() ? meshNames : Model::precice_mesh_names;
 
         // Interface ghost mode (controlDict `preciceGhost`):
-        //   "fullstate"      — full-state Godunov flux exchange (set the whole peer
-        //                      state); conservative, reproduces the monolithic for
-        //                      same-model / implicit coupling.  DEFAULT.
         //   "characteristic" — impose only the INCOMING Riemann characteristics
         //                      (eigendecomposition of A = dF/dQ + B): mixed-field
         //                      invariants, SystemModel-generic (no analytical
         //                      eigenvectors), well-posed & non-reflecting.
+        //                      DEFAULT — robust at steep fronts (no fullstate
+        //                      feedback instability) and exactly conservative
+        //                      when paired with the VOF FO's
+        //                      qstarMode=characteristic + debt ledger.
+        //   "fullstate"      — full-state Godunov flux exchange (set the whole peer
+        //                      state); reproduces the monolithic bit-exactly for
+        //                      same-model coupling (benchmarking), but carries an
+        //                      exponential feedback instability at bore fronts in
+        //                      heterogeneous (SME<->VOF) pairs.
         //   "froude"         — Froude-switched PRIMITIVE Dirichlet-Neumann
         //                      (open-channel / Mintgen-Espinosa): same regime switch,
         //                      but imposes the SWE primitives depth h / discharge hu.
         const Foam::word gw =
             mesh.time().controlDict().lookupOrDefault<Foam::word>(
-                "preciceGhost", "fullstate");
+                "preciceGhost", "characteristic");
         ghostMode_ = gw == "characteristic" ? GhostMode::characteristic
                    : gw == "froude"         ? GhostMode::froude
                    :                          GhostMode::fullstate;
@@ -167,12 +173,14 @@ public:
                         // the SAME sigma grid -> compatible nearest-neighbour
                         // mapping, and different physical h on each side is
                         // reconciled by the normalisation.  nZ_==1 -> mid-column.
-                        // ENDPOINT-INCLUSIVE nodes sigma_j = j/(N_z-1): this is the
-                        // exact fixed-node grid the model's project_from_3d kernel
-                        // assumes (zoomy_core SME.project_nz, nodes j/(N_z-1)), so
-                        // the sampled column feeds the Galerkin reduction directly.
+                        // CELL-CENTER nodes sigma_j = (j+1/2)/N_z: the SAME grid
+                        // the VOF registers (its cell centres) AND the model's
+                        // project_from_3d now bakes — so the preCICE map is the
+                        // IDENTITY and project∘interpolate is exact (no grid-to-grid
+                        // interpolation).  (was j/(N_z-1), which mismatched the VOF
+                        // cell centres → lossy map → bore-arrival round-trip drift.)
                         const double sigma =
-                            (nZ_ == 1) ? 0.5 : zk / double(nZ_ - 1);
+                            (nZ_ == 1) ? 0.5 : (double(zk) + 0.5) / double(nZ_);
                         coords.push_back(fc[f].x());
                         coords.push_back(fc[f].y());
                         coords.push_back(sigma);

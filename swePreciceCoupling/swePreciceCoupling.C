@@ -1,6 +1,8 @@
 #include "swePreciceCoupling.H"
 #include "addToRunTimeSelectionTable.H"
 #include "uniformDimensionedFields.H"
+#include "numerics.H"   // runtime numerics:: (compute_derivative) referenced by
+                        // Model.H's update_aux_variables (parsed even if unused)
 #include "Numerics.H"   // generated Model:: + Numerics::
 #include "fvcSurfaceIntegrate.H"
 #include "OSspecific.H"   // Foam::mkDir
@@ -44,6 +46,8 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
 {
     fvMeshFunctionObject::read(dict);
     dict.readIfPresent("relax", relax_);
+    dict.readIfPresent("imposeMode", imposeMode_);
+    dict.readIfPresent("qstarMode", qstarMode_);
     dict.readIfPresent("outputInterval", outInterval_);
     dict.readIfPresent("maxCo", maxCo_);
     dict.readIfPresent("maxAlphaCo", maxAlphaCo_);
@@ -451,12 +455,59 @@ void Foam::functionObjects::swePreciceCoupling::writeBack()
                 for (int d=0; d<NF; ++d) colProf[j][d] = out[d][f];
                 sig[j] = zeta;
             }
-            col.qFrozen = Model::project_from_3d(colProf, sig, param);
+            // colProf is sampled on the interface cell centres, which now == the
+            // model's baked projection grid, so project_from_3d is exact here.
+            col.qFrozen = Model::project_from_3d(colProf, param);
         }
         if (writeColumns_) I.lastOut = out;   // keep for writeColumnsFile()
         for (int d=0; d<NF; ++d)
             precice_->writeData(std::string(I.meshName), writeFields_[d], I.vertexIDs, out[d]);
     }
+}
+
+namespace
+{
+// Duplicate of PreciceManager::characteristicGhost (kept in sync by hand —
+// the SME side is the reference implementation).  Needed here so the VOF can
+// evaluate the SAME characteristic-consistent interface mass flux the SME's
+// frozen mass row uses (qstarMode=characteristic): both sides then compute
+// the window target from the identical exchanged snapshot pair with the
+// identical kernel -> bit-identical -> the debt ledger closes the interface
+// mass budget exactly.
+Foam::List<Foam::scalar> charGhostLocal(
+    const Foam::List<Foam::scalar>& q,
+    const Foam::List<Foam::scalar>& qaux,
+    const Foam::List<Foam::scalar>& peer,
+    const Foam::scalar normalX,
+    const Foam::List<Foam::scalar>& p)
+{
+    constexpr int n = Model::n_dof_q;
+    Foam::List<Foam::scalar> ghost(n);
+    const auto Am = Model::quasilinear_matrix_x(q, qaux, p);
+    Eigen::Matrix<double, n, n> A;
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j) A(i, j) = Am[i][j];
+    Eigen::EigenSolver<Eigen::Matrix<double, n, n>> es(A);
+    const Eigen::Matrix<double, n, n> R = es.eigenvectors().real();
+    const Eigen::Matrix<double, n, 1> lam = es.eigenvalues().real();
+    Eigen::FullPivLU<Eigen::Matrix<double, n, n>> lu(R);
+    if (!lu.isInvertible())                 // defective -> full-state fallback
+    {
+        forAll(ghost, i) ghost[i] = peer[i];
+        return ghost;
+    }
+    const Eigen::Matrix<double, n, n> L = lu.inverse();
+    Eigen::Matrix<double, n, 1> qi, qp;
+    for (int i = 0; i < n; ++i) { qi(i) = q[i]; qp(i) = peer[i]; }
+    const Eigen::Matrix<double, n, 1> wi = L * qi;
+    const Eigen::Matrix<double, n, 1> wp = L * qp;
+    Eigen::Matrix<double, n, 1> wg;
+    for (int k = 0; k < n; ++k)
+        wg(k) = (lam(k) * normalX < 0) ? wp(k) : wi(k);   // incoming <- peer
+    const Eigen::Matrix<double, n, 1> qg = R * wg;
+    for (int i = 0; i < n; ++i) ghost[i] = qg(i);
+    return ghost;
+}
 }
 
 void Foam::functionObjects::swePreciceCoupling::imposeInflow()
@@ -486,7 +537,10 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
             List<List<scalar>> colPeer(col.faces.size(), List<scalar>(NF,0.0));
             List<scalar> sig(col.faces.size());
             forAll(col.faces, j){ colPeer[j]=I.peerF[col.faces[j]]; sig[j]=I.sigmaF[col.faces[j]]; }
-            const List<scalar> qSwe = Model::project_from_3d(colPeer, sig, param);
+            // colPeer sits on the interface cell centres == the baked projection
+            // grid, so project_from_3d is exact (peer profile arrives via the
+            // now-identity preCICE map).
+            const List<scalar> qSwe = Model::project_from_3d(colPeer, param);
             const List<scalar> qVof = col.qFrozen;
             const scalar hVof = columnDepth(I, col);
 
@@ -504,8 +558,32 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
             }
             else if (qSwe[1] > SMALL && qVof[1] > SMALL)
             {
-                const auto Fc = Numerics::numerical_flux       (qSwe, qVof, qaux, qaux, param, nHat);
-                const auto Fl = Numerics::numerical_fluctuations(qSwe, qVof, qaux, qaux, param, nHat);
+                // qstarMode=characteristic: evaluate the mass flux against the
+                // SAME characteristic ghost the SME's frozen mass row uses (see
+                // charGhostLocal above) instead of the raw VOF state — the VOF
+                // then takes in EXACTLY the mass the SME's incoming
+                // characteristics describe (conservative characteristic pair).
+                // Restore the aux state from the snapshot (user fix, break 1):
+                // the RP kernels are aux-free and quasilinear_matrix_x uses ONLY
+                // the algebraic desingularized hinv (last aux entry) — replicate
+                // Model::update_aux_variables' algebraic row pointwise from the
+                // snapshot h, so the ghost sees the SAME matrix the SME builds.
+                // (Gradient aux entries are unused by the interface RP.)
+                List<scalar> qauxRP(Model::n_dof_qaux, 0.0);
+                if (Model::n_dof_qaux > 0)
+                {
+                    const scalar hS = qSwe[1];
+                    qauxRP[Model::n_dof_qaux - 1] =
+                        Foam::sqrt(scalar(2))*Foam::max(scalar(0), hS)
+                      / Foam::sqrt(Foam::pow(hS, 4)
+                                 + Foam::pow(Foam::max(scalar(1e-8), hS), 4));
+                }
+                const List<scalar> qR =
+                    (qstarMode_ == "characteristic")
+                        ? charGhostLocal(qSwe, qauxRP, qVof, nHat.x(), param)
+                        : qVof;
+                const auto Fc = Numerics::numerical_flux       (qSwe, qR, qaux, qaux, param, nHat);
+                const auto Fl = Numerics::numerical_fluctuations(qSwe, qR, qaux, qaux, param, nHat);
                 qStar = Fc[1] + Fl[1][1];
                 // half-Riemann star depth (two-rarefaction approximation,
                 // level-0 slots; L = peer, R = this column): the alpha fill
@@ -514,13 +592,46 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 // partially-closed gate during bore arrival (measured u−c
                 // reflection back into the SME domain).
                 const scalar gAcc = param[0];
-                const scalar uL = qSwe[2]/qSwe[1], uR = qVof[2]/qVof[1];
-                const scalar cS = 0.5*(Foam::sqrt(gAcc*qSwe[1])
-                                     + Foam::sqrt(gAcc*qVof[1]))
-                                + 0.25*(uL - uR);
-                if (cS > 0) hFill = cS*cS/gAcc;
+                if (imposeMode_ == "qstar")
+                {
+                    // CONSISTENT Rusanov star state Q* = 1/2(qL+qR)
+                    //                                  - 1/2 (F(qR)-F(qL))/amax.
+                    // For SME(0)=SWE there is NO non-conservative product, so the
+                    // physical flux flux_x is exact.  (NCP-inclusive Q* for
+                    // level>=1 needs the path-conservative intermediate state, a
+                    // separate treatment.)  h* and q0* from ONE solve → u=q0*/h*
+                    // consistent with the imposed height h*.
+                    const auto FL = Model::flux_x(qSwe, qaux, param);
+                    const auto FR = Model::flux_x(qVof, qaux, param);
+                    const scalar aL = Numerics::local_max_abs_eigenvalue(qSwe, qaux, param, nHat)[0];
+                    const scalar aR = Numerics::local_max_abs_eigenvalue(qVof, qaux, param, nHat)[0];
+                    const scalar amax = Foam::max(Foam::max(aL, aR), SMALL);
+                    List<scalar> qs(Model::n_dof_q);
+                    for (int i = 0; i < Model::n_dof_q; ++i)
+                        qs[i] = 0.5*(qSwe[i] + qVof[i]) - 0.5*(FR[i][0] - FL[i][0])/amax;
+                    // GUARD: only adopt Q* if h*>0 (a dry/negative star depth
+                    // would give u=q0*/h* -> FPE); else leave winQStar empty so
+                    // the column falls back to the peer profile + cS fill.
+                    if (qs[1] > SMALL) { hFill = qs[1]; col.winQStar = qs; }
+                }
+                else
+                {
+                    const scalar uL = qSwe[2]/qSwe[1], uR = qVof[2]/qVof[1];
+                    const scalar cS = 0.5*(Foam::sqrt(gAcc*qSwe[1])
+                                         + Foam::sqrt(gAcc*qVof[1]))
+                                    + 0.25*(uL - uR);
+                    if (cS > 0) hFill = cS*cS/gAcc;
+                }
             }
             if (winFresh2_) { col.winTarget = qStar; col.winHFill = hFill; }
+            if (winFresh2_ && ledgerLog_.valid())
+            {
+                static Foam::OFstream ilog(mesh_.time().globalPath()/"impose_dbg.csv");
+                ilog.precision(17);
+                ilog << mesh_.time().value() << "," << qSwe[1] << "," << qSwe[2]
+                     << "," << qVof[1] << "," << qVof[2] << "," << qStar << ","
+                     << hFill << Foam::endl;
+            }
             // ζ-column contract impose, cell-wise direction switch
             // (inletOutlet pattern): a face whose INTERIOR streamwise
             // velocity points out of the VOF domain is an outflow face —
@@ -540,10 +651,23 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
             // frame vector, then split into the impose basis (streamwise
             // scalar for the mass constraint, transverse/vertical riding
             // along for the full-vector impose).
+            // qstar: reconstruct the inflow profile from the CONSISTENT star
+            // state Q* (interpolate_to_3d), so the imposed velocity u = q0*/h*
+            // is consistent with the imposed height h* = winHFill.  Otherwise
+            // use the raw peer profile.
+            const bool useQStar =
+                (imposeMode_ == "qstar" && col.winQStar.size() == Model::n_dof_q);
+            List<List<scalar>> profStar;
+            if (useQStar)
+            {
+                List<scalar> zList(nf);
+                forAll(col.faces, j) zList[j] = I.sigmaF[col.faces[j]];
+                profStar = Model::interpolate_to_3d(col.winQStar, qaux, param, zList);
+            }
             List<scalar> zP(nf), uP(nf), vP(nf), wP(nf);
             forAll(col.faces, j)
             {
-                const List<scalar>& pf = I.peerF[col.faces[j]];
+                const List<scalar>& pf = useQStar ? profStar[j] : I.peerF[col.faces[j]];
                 const vector ug = pf[2]*I.eH1 + pf[3]*I.eH2 + pf[4]*I.gUp;
                 zP[j] = I.sigmaF[col.faces[j]];
                 uP[j] = ug & I.nStream;
@@ -602,7 +726,25 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
             col.curRate = qEff;      // the repayment-boosted imposed rate —
                                      // else the debt never decays and the
                                      // boost pumps spurious mass forever.
-            const scalar dU = (wWet > SMALL) ? (qEff - qMix)/wWet : 0.0;
+            // qstar: NO additive rescale — the Q* profile already carries
+            // q0* over the h* column (u=q0*/h* consistent).  statebc: shift to
+            // hit qEff over the wetted column.
+            const scalar dU = useQStar ? 0.0
+                            : ((wWet > SMALL) ? (qEff - qMix)/wWet : 0.0);
+            if (ledgerLog_.valid())
+            {
+                // correction-shift log: one row per imposeInflow call
+                // (t, q* target, qEff incl. ledger repay, raw-profile qMix,
+                //  wetted measure, the applied shift dU, ledger debt)
+                static Foam::OFstream dulog(
+                    mesh_.time().globalPath()/"du_dbg.csv");
+                static bool hdr = false;
+                if (!hdr) { dulog << "t,qStar,qEff,qMix,wWet,dU,debt" << Foam::nl;
+                            dulog.precision(12); hdr = true; }
+                dulog << mesh_.time().value() << "," << qStar << "," << qEff
+                      << "," << qMix << "," << wWet << "," << dU << ","
+                      << col.debt << Foam::nl;
+            }
             const scalar uAir = (hFill > SMALL) ? qEff/hFill : 0.0;
             forAll(col.faces, j)
             {

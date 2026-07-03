@@ -53,6 +53,7 @@ class swePreciceCoupling
         scalar curTargetCk = 0;
         scalar winTarget = 0;            // window-frozen target + fill
         scalar winHFill = 0;
+        List<scalar> winQStar;           // window-frozen Riemann star state Q* (imposeMode=qstar)
     };
 
     struct Interface
@@ -80,6 +81,18 @@ class swePreciceCoupling
 
     // shared
     scalar relax_;
+    //- inflow imposition: "statebc" (default, cS-height + qStar-discharge) or
+    //  "qstar" (consistent Rusanov star state Q*: h* and q0* from ONE solve,
+    //  so u = q0*/h* by construction — no separate cS/dU rescale).
+    word imposeMode_ = "statebc";
+    //- window mass-flux target: "characteristic" (DEFAULT — the SAME
+    //  characteristic-ghost flux the SME's frozen mass row uses under
+    //  preciceGhost=characteristic: both sides compute the identical Riemann
+    //  problem from the exchanged snapshot, so the interface exchanges
+    //  bit-identical window mass — exactly conservative) or "riemann"
+    //  (full-state RP flux F(qSwe,qVof); pair with preciceGhost=fullstate
+    //  for benchmarking only).
+    word qstarMode_ = "characteristic";
     fileName configPath_;
     word participantName_;
     std::array<std::string, NF> readFields_;

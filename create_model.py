@@ -83,7 +83,12 @@ def emit_chorin(level=1, dim=2, out=HERE, bcs="open", q_in=1.0, h_out=1.0):
 
 
 def build_system_model(level, outer="extrapolation", closure="none", bcs="coupling",
-                       q_in=1.0, h_out=1.0):
+                       q_in=1.0, h_out=1.0, project_nz=40):
+    # project_nz sets the FIXED vertical node grid the emitted project_from_3d
+    # bakes (sigma_j = j/(project_nz-1)).  It MUST equal the coupling exchange
+    # resolution (controlDict preciceZSamples = the VOF column cell count), or
+    # the interface column is read at the wrong count/heights (default 33 vs a
+    # 40-cell VOF column silently mis-measured the moments -> coupling drift).
     # Boundary set.  "coupling" is the production preCICE pair (outer + coupled);
     # "open" is a plain two-sided extrapolation channel; "subcritical" is the
     # discharge-in / depth-out Dirichlet pair a well-posed steady subcritical
@@ -105,8 +110,14 @@ def build_system_model(level, outer="extrapolation", closure="none", bcs="coupli
     # standard Manning term  −g·n²·q|q|/h^(7/3)  on the momentum row — the stiff
     # source the IMEX scheme treats implicitly (and exactly the SWASHES
     # MacDonald-case friction).  "none" = inviscid (production default).
-    closures = [C.ManningFriction()] if closure == "manning" else []
-    return SME(level=level, closures=closures,
+    # "newtonian" = the full vertical-stress closure set (Newtonian shear +
+    # Navier bed slip + stress-free surface): activates the moment equations
+    # (q_1.. relax toward a sheared equilibrium profile).  nu / lambda_s are
+    # RUNTIME modelParameters — but only if these closures are emitted.
+    closures = ([C.ManningFriction()] if closure == "manning"
+                else [C.Newtonian(), C.NavierSlip(), C.StressFree()]
+                if closure == "newtonian" else [])
+    return SME(level=level, closures=closures, project_nz=project_nz,
                boundary_conditions=boundary).system_model
 
 
@@ -132,7 +143,7 @@ if __name__ == "__main__":
     ap.add_argument("--out", type=Path, default=HERE)
     ap.add_argument("--outer", choices=["extrapolation", "wall"],
                     default="extrapolation")
-    ap.add_argument("--closure", choices=["none", "manning"], default="none")
+    ap.add_argument("--closure", choices=["none", "manning", "newtonian"], default="none")
     ap.add_argument("--bcs", choices=["coupling", "open", "subcritical"],
                     default="coupling")
     ap.add_argument("--q-in", type=float, default=1.0)
