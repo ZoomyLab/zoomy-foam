@@ -578,13 +578,36 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                       / Foam::sqrt(Foam::pow(hS, 4)
                                  + Foam::pow(Foam::max(scalar(1e-8), hS), 4));
                 }
-                const List<scalar> qR =
-                    (qstarMode_ == "characteristic")
-                        ? charGhostLocal(qSwe, qauxRP, qVof, nHat.x(), param)
-                        : qVof;
-                const auto Fc = Numerics::numerical_flux       (qSwe, qR, qaux, qaux, param, nHat);
-                const auto Fl = Numerics::numerical_fluctuations(qSwe, qR, qaux, qaux, param, nHat);
-                qStar = Fc[1] + Fl[1][1];
+                if (qstarMode_ == "shared")
+                {
+                    // SHARED LEVEL-INVARIANT MASS ROW: identical closed-form
+                    // Rusanov on the common (h,q0) subvector of the raw
+                    // exchanged pair — keep in sync with PreciceManager.H
+                    // (frozen mass row).  Bit-equal + antisymmetric on both
+                    // sides => interface mass telescopes exactly.
+                    const scalar gAcc = param[0];
+                    const scalar hL = qSwe[1], qL = qSwe[2];
+                    const scalar hR = qVof[1], qRm = qVof[2];
+                    auto hiv = [](scalar hh) {
+                        return Foam::sqrt(scalar(2))*Foam::max(scalar(0), hh)
+                             / Foam::sqrt(Foam::pow(hh, 4)
+                             + Foam::pow(Foam::max(scalar(1e-8), hh), 4));
+                    };
+                    const scalar sStar = Foam::max(
+                        Foam::mag(qL*hiv(hL)) + Foam::sqrt(gAcc*Foam::max(hL, scalar(0))),
+                        Foam::mag(qRm*hiv(hR)) + Foam::sqrt(gAcc*Foam::max(hR, scalar(0))));
+                    qStar = 0.5*(qL + qRm)*nHat.x() - 0.5*sStar*(hR - hL);
+                }
+                else
+                {
+                    const List<scalar> qR =
+                        (qstarMode_ == "characteristic")
+                            ? charGhostLocal(qSwe, qauxRP, qVof, nHat.x(), param)
+                            : qVof;
+                    const auto Fc = Numerics::numerical_flux       (qSwe, qR, qaux, qaux, param, nHat);
+                    const auto Fl = Numerics::numerical_fluctuations(qSwe, qR, qaux, qaux, param, nHat);
+                    qStar = Fc[1] + Fl[1][1];
+                }
                 // half-Riemann star depth (two-rarefaction approximation,
                 // level-0 slots; L = peer, R = this column): the alpha fill
                 // target must respond to the INCOMING wave — filling to the

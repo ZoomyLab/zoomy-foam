@@ -329,13 +329,40 @@ public:
                             Model::interpolate_to_3d(
                                 interior, interiorAux, p_, zcol),
                             zcol);
-                        const auto Ff = Numerics::numerical_flux
-                            (rt, ghost, interiorAux, interiorAux, p_, nUnit);
-                        const auto FLf = Numerics::numerical_fluctuations
-                            (rt, ghost, interiorAux, interiorAux, p_, nUnit);
+                        // SHARED LEVEL-INVARIANT MASS ROW: one two-point
+                        // Rusanov flux on the common (h, q0) subvector of the
+                        // RAW exchanged pair (rt, peer) — NOT the ghost.  Every
+                        // participant (any SME level, the VOF FO) evaluates the
+                        // IDENTICAL closed-form arithmetic on the identical
+                        // snapshot, so the flux is bit-equal and antisymmetric
+                        // across the interface: interface mass telescopes
+                        // exactly, for ANY level pairing, with no peer kernels.
+                        // (The one-sided characteristic RP stays in charge of
+                        // the imposition and the momentum rows.)  Keep the
+                        // formula in sync with swePreciceCoupling.C
+                        // (qstarMode=shared).
+                        // preCICE zero-sample startup (no valid peer data yet,
+                        // e.g. window 0): fall back to the OWN state — F* then
+                        // equals the interior flux and both sides stay
+                        // consistent (mirrors the ghost fallback above).
+                        const Foam::scalar gAcc = p_[0];
+                        const Foam::scalar hL = rt[1],   qL = rt[2];
+                        const Foam::scalar hR = zeroSample ? rt[1] : peer[1],
+                                           qR = zeroSample ? rt[2] : peer[2];
+                        auto hiv = [](Foam::scalar hh) {
+                            return Foam::sqrt(Foam::scalar(2))
+                                 * Foam::max(Foam::scalar(0), hh)
+                                 / Foam::sqrt(Foam::pow(hh, 4)
+                                 + Foam::pow(Foam::max(Foam::scalar(1e-8), hh), 4));
+                        };
+                        const Foam::scalar sStar = Foam::max(
+                            Foam::mag(qL*hiv(hL)) + Foam::sqrt(gAcc*Foam::max(hL, Foam::scalar(0))),
+                            Foam::mag(qR*hiv(hR)) + Foam::sqrt(gAcc*Foam::max(hR, Foam::scalar(0))));
+                        const Foam::scalar Fstar =
+                            0.5*(qL + qR)*nUnit.x() - 0.5*sStar*(hR - hL);
                         const Foam::scalar magS = Foam::mag(Sf[f]);
-                        b.fzDp[f] = (-Ff[1] + FLf[0][1])*magS;
-                        b.fzDm[f] = ( Ff[1] + FLf[1][1])*magS;
+                        b.fzDp[f] = -Fstar*magS;
+                        b.fzDm[f] =  Fstar*magS;
                         if (!fzLog_.valid())
                         {
                             fzLog_.reset(new Foam::OFstream(

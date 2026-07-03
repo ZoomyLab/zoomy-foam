@@ -85,14 +85,17 @@ class swePreciceCoupling
     //  "qstar" (consistent Rusanov star state Q*: h* and q0* from ONE solve,
     //  so u = q0*/h* by construction — no separate cS/dU rescale).
     word imposeMode_ = "statebc";
-    //- window mass-flux target: "characteristic" (DEFAULT — the SAME
-    //  characteristic-ghost flux the SME's frozen mass row uses under
-    //  preciceGhost=characteristic: both sides compute the identical Riemann
-    //  problem from the exchanged snapshot, so the interface exchanges
-    //  bit-identical window mass — exactly conservative) or "riemann"
-    //  (full-state RP flux F(qSwe,qVof); pair with preciceGhost=fullstate
-    //  for benchmarking only).
-    word qstarMode_ = "characteristic";
+    //- window mass-flux target:
+    //  "shared" (DEFAULT): the level-invariant two-point Rusanov mass flux on
+    //    the common (h,q0) subvector of the raw exchanged pair — identical
+    //    closed-form arithmetic on every participant (any SME level, VOF),
+    //    antisymmetric => interface mass telescopes exactly.  Keep in sync
+    //    with PreciceManager.H's frozen mass row.
+    //  "characteristic": mass row of the SME's one-sided characteristic RP
+    //    (charGhostLocal) — pairs with the SME's pre-shared-row behaviour.
+    //  "riemann": full-state RP flux F(qSwe,qVof) — pair with
+    //    preciceGhost=fullstate for benchmarking only.
+    word qstarMode_ = "shared";
     fileName configPath_;
     word participantName_;
     std::array<std::string, NF> readFields_;
