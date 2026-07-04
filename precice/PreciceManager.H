@@ -101,6 +101,19 @@ public:
         frozenMass_ =
             mesh.time().controlDict().lookupOrDefault<Foam::Switch>(
                 "preciceFrozenMass", false);
+        // frozen-mass-row pricing (controlDict `preciceMassRow`):
+        //   "shared"  — level-invariant barotropic Rusanov on the raw (h,q0)
+        //               pair (bit-pairable with ANY peer; dissipation acts on
+        //               the RAW interface jump — reopens a reflected-signal
+        //               channel at level>=1).
+        //   "central" — level-invariant central flux 1/2(qA+qB)n (bit-pairable,
+        //               jump-free).
+        //   "rp"      — mass row of the model's own RP(rt, ghost) (cleanest
+        //               dynamics; pairable only if the peer mirrors the model
+        //               kernels, e.g. the VOF FO).
+        massRow_ =
+            mesh.time().controlDict().lookupOrDefault<Foam::word>(
+                "preciceMassRow", "shared");
 
         // preCICE forbids a participant using the same (data,mesh) pair twice,
         // so the two coupling directions MUST carry distinct data names.  Each
@@ -349,18 +362,38 @@ public:
                         const Foam::scalar hL = rt[1],   qL = rt[2];
                         const Foam::scalar hR = zeroSample ? rt[1] : peer[1],
                                            qR = zeroSample ? rt[2] : peer[2];
-                        auto hiv = [](Foam::scalar hh) {
-                            return Foam::sqrt(Foam::scalar(2))
-                                 * Foam::max(Foam::scalar(0), hh)
-                                 / Foam::sqrt(Foam::pow(hh, 4)
-                                 + Foam::pow(Foam::max(Foam::scalar(1e-8), hh), 4));
-                        };
-                        const Foam::scalar sStar = Foam::max(
-                            Foam::mag(qL*hiv(hL)) + Foam::sqrt(gAcc*Foam::max(hL, Foam::scalar(0))),
-                            Foam::mag(qR*hiv(hR)) + Foam::sqrt(gAcc*Foam::max(hR, Foam::scalar(0))));
-                        const Foam::scalar Fstar =
-                            0.5*(qL + qR)*nUnit.x() - 0.5*sStar*(hR - hL);
                         const Foam::scalar magS = Foam::mag(Sf[f]);
+                        Foam::scalar Fstar = 0;
+                        if (massRow_ == "rp")
+                        {
+                            // model's own RP mass row on (rt, ghost) — the
+                            // characteristic-filtered pair: no raw-jump
+                            // dissipation channel.  Peer must mirror the
+                            // model kernels to pair (VOF FO does).
+                            const auto Ff = Numerics::numerical_flux
+                                (rt, ghost, interiorAux, interiorAux, p_, nUnit);
+                            const auto FLf = Numerics::numerical_fluctuations
+                                (rt, ghost, interiorAux, interiorAux, p_, nUnit);
+                            Fstar = Ff[1] + FLf[1][1];
+                        }
+                        else if (massRow_ == "central")
+                        {
+                            Fstar = 0.5*(qL + qR)*nUnit.x();
+                        }
+                        else   // "shared"
+                        {
+                            auto hiv = [](Foam::scalar hh) {
+                                return Foam::sqrt(Foam::scalar(2))
+                                     * Foam::max(Foam::scalar(0), hh)
+                                     / Foam::sqrt(Foam::pow(hh, 4)
+                                     + Foam::pow(Foam::max(Foam::scalar(1e-8), hh), 4));
+                            };
+                            const Foam::scalar sStar = Foam::max(
+                                Foam::mag(qL*hiv(hL)) + Foam::sqrt(gAcc*Foam::max(hL, Foam::scalar(0))),
+                                Foam::mag(qR*hiv(hR)) + Foam::sqrt(gAcc*Foam::max(hR, Foam::scalar(0))));
+                            Fstar = 0.5*(qL + qR)*nUnit.x()
+                                  - 0.5*sStar*(hR - hL);
+                        }
                         b.fzDp[f] = -Fstar*magS;
                         b.fzDm[f] =  Fstar*magS;
                         if (!fzLog_.valid())
@@ -655,6 +688,8 @@ private:
     GhostMode ghostMode_ = GhostMode::fullstate;
     //- Conservative coupling: freeze the coupled-face MASS flux per window
     bool frozenMass_ = false;
+    //- frozen-mass-row pricing: shared | central | rp
+    Foam::word massRow_ = "shared";
     //- A new time window (or implicit re-iteration) began: re-evaluate the
     //  frozen mass row on the next read().  Starts true (first window).
     bool windowFresh_ = true;

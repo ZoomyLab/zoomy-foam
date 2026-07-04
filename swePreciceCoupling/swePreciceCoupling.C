@@ -578,7 +578,13 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                       / Foam::sqrt(Foam::pow(hS, 4)
                                  + Foam::pow(Foam::max(scalar(1e-8), hS), 4));
                 }
-                if (qstarMode_ == "shared")
+                if (qstarMode_ == "central")
+                {
+                    // level-invariant central mass flux (jump-free): pairs
+                    // with preciceMassRow=central on the SME side.
+                    qStar = 0.5*(qSwe[2] + qVof[2])*nHat.x();
+                }
+                else if (qstarMode_ == "shared")
                 {
                     // SHARED LEVEL-INVARIANT MASS ROW: identical closed-form
                     // Rusanov on the common (h,q0) subvector of the raw

@@ -95,7 +95,7 @@ class swePreciceCoupling
     //    (charGhostLocal) — pairs with the SME's pre-shared-row behaviour.
     //  "riemann": full-state RP flux F(qSwe,qVof) — pair with
     //    preciceGhost=fullstate for benchmarking only.
-    word qstarMode_ = "shared";
+    word qstarMode_ = "characteristic";
     fileName configPath_;
     word participantName_;
     std::array<std::string, NF> readFields_;
