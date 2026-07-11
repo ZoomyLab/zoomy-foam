@@ -120,14 +120,12 @@ public:
         // participant writes one set and reads the peer's set; the names come
         // from controlDict (preciceWriteData / preciceReadData).  Fall back to
         // the canonical [b,h,u,v,w,p] for an uncoupled / single participant.
-        const std::array<std::string, NF> canon{
-            {"b", "h", "u", "v", "w", "p"}};
-        writeFields_ = canon;
-        readFields_  = canon;
-        for (int d = 0; d < NF && d < writeData.size(); ++d)
-            writeFields_[d] = std::string(writeData[d]);
-        for (int d = 0; d < NF && d < readData.size(); ++d)
-            readFields_[d] = std::string(readData[d]);
+        // Multi-interface participants (e.g. a junction coupled to three
+        // arms) list nPatches*NF names — binding k consumes slice
+        // [k*NF, (k+1)*NF).  A single NF-sized list serves every binding
+        // (the legacy two-participant layout).
+        writeRaw_ = writeData;
+        readRaw_  = readData;
 
         if (!active_) return;
         precice_ = std::make_unique<precice::Participant>(
@@ -153,20 +151,45 @@ public:
             for (int k = 0; k < Model::n_precice_patches; ++k)
             {
                 const Foam::word pname = Model::precice_patch_names[k];
-                const std::string mname = std::string(meshNames_[k]);
                 const Foam::label patchI =
                     mesh_.boundaryMesh().findIndex(pname);   // OF13 API
                 if (patchI < 0)
                 {
-                    FatalErrorInFunction
-                        << "[precice] coupled patch '" << pname
-                        << "' not found in mesh." << Foam::exit(Foam::FatalError);
+                    // UNION-binary participant: the model declares every
+                    // coupled tag of the whole decomposition; each part's
+                    // mesh carries only its own — skip the absent ones.
+                    Foam::Info<< "[precice] coupled patch '" << pname
+                        << "' not in this mesh — skipped." << Foam::endl;
+                    continue;
                 }
                 const Foam::polyPatch& pp = mesh_.boundaryMesh()[patchI];
                 const Foam::label nF = pp.size();
                 if (nF == 0) continue;   // empty patch (1D y/z extent)
 
+                // controlDict lists (preciceMeshes / write / read names) are
+                // consumed in FOUND-patch order, model-declaration ordered.
+                const Foam::label bi = bindings_.size();
+                if (bi >= meshNames_.size())
+                {
+                    FatalErrorInFunction
+                        << "[precice] " << bindings_.size() + 1
+                        << " coupled patches found but only "
+                        << meshNames_.size() << " preciceMeshes given."
+                        << Foam::exit(Foam::FatalError);
+                }
+                const std::string mname = std::string(meshNames_[bi]);
+                const std::array<std::string, NF> canon{
+                    {"b", "h", "u", "v", "w", "p"}};
                 Binding b;
+                for (int d = 0; d < NF; ++d)
+                {
+                    const int wOff = (writeRaw_.size() >= NF*(bi+1)) ? bi*NF : 0;
+                    const int rOff = (readRaw_.size()  >= NF*(bi+1)) ? bi*NF : 0;
+                    b.write[d] = (writeRaw_.size() >= wOff + NF)
+                        ? std::string(writeRaw_[wOff + d]) : canon[d];
+                    b.read[d]  = (readRaw_.size()  >= rOff + NF)
+                        ? std::string(readRaw_[rOff + d])  : canon[d];
+                }
                 b.meshName = mname;
                 b.patchI   = patchI;
                 b.nFaces   = nF;
@@ -228,7 +251,7 @@ public:
                 for (int d = 0; d < NF; ++d)
                 {
                     buf[d].resize(b.vertexIDs.size());
-                    precice_->readData(b.meshName, readFields_[d], b.vertexIDs,
+                    precice_->readData(b.meshName, b.read[d], b.vertexIDs,
                                        relReadTime, buf[d]);
                 }
                 // Local interior (adjacent-cell) state per coupled face, plus the
@@ -310,14 +333,15 @@ public:
                     //  - froude: Froude-switched primitive Dirichlet-Neumann (impose
                     //    depth/discharge by flow regime) -> the open-channel literature
                     //    coupling; same incoming-count as characteristic.
-                    const Foam::scalar nx = Sf[f].x();
+                    const Foam::vector nOut =
+                        Sf[f]/(Foam::mag(Sf[f]) + Foam::SMALL);
                     const Foam::List<Foam::scalar> ghost =
                           zeroSample
                               ? interior
                         : ghostMode_ == GhostMode::characteristic
-                              ? characteristicGhost(interior, interiorAux, peer, nx)
+                              ? characteristicGhost(interior, interiorAux, peer, nOut)
                         : ghostMode_ == GhostMode::froude
-                              ? froudeGhost(interior, interiorAux, peer, nx)
+                              ? froudeGhost(interior, interiorAux, peer, nOut.x())
                         :     peer;
                     forAll(Q, i)
                         Q[i]->boundaryFieldRef()[b.patchI][f] = ghost[i];
@@ -362,6 +386,15 @@ public:
                         const Foam::scalar hL = rt[1],   qL = rt[2];
                         const Foam::scalar hR = zeroSample ? rt[1] : peer[1],
                                            qR = zeroSample ? rt[2] : peer[2];
+                        // 2-D states carry a momentum PAIR: the level-invariant
+                        // rows price the NORMAL discharge q·n.  1-D keeps the
+                        // legacy scalar arithmetic bit-exactly.
+                        const bool twoD = (Model::dimension == 2);
+                        const Foam::scalar qLn = twoD
+                            ? rt[2]*nUnit.x() + rt[3]*nUnit.y() : qL;
+                        const Foam::scalar qRn = twoD
+                            ? (zeroSample ? qLn
+                               : peer[2]*nUnit.x() + peer[3]*nUnit.y()) : qR;
                         const Foam::scalar magS = Foam::mag(Sf[f]);
                         Foam::scalar Fstar = 0;
                         if (massRow_ == "rp")
@@ -378,7 +411,8 @@ public:
                         }
                         else if (massRow_ == "central")
                         {
-                            Fstar = 0.5*(qL + qR)*nUnit.x();
+                            Fstar = twoD ? 0.5*(qLn + qRn)
+                                         : 0.5*(qL + qR)*nUnit.x();
                         }
                         else   // "shared"
                         {
@@ -388,11 +422,16 @@ public:
                                      / Foam::sqrt(Foam::pow(hh, 4)
                                      + Foam::pow(Foam::max(Foam::scalar(1e-8), hh), 4));
                             };
-                            const Foam::scalar sStar = Foam::max(
-                                Foam::mag(qL*hiv(hL)) + Foam::sqrt(gAcc*Foam::max(hL, Foam::scalar(0))),
-                                Foam::mag(qR*hiv(hR)) + Foam::sqrt(gAcc*Foam::max(hR, Foam::scalar(0))));
-                            Fstar = 0.5*(qL + qR)*nUnit.x()
-                                  - 0.5*sStar*(hR - hL);
+                            const Foam::scalar sStar = twoD
+                                ? Foam::max(
+                                    Foam::mag(qLn*hiv(hL)) + Foam::sqrt(gAcc*Foam::max(hL, Foam::scalar(0))),
+                                    Foam::mag(qRn*hiv(hR)) + Foam::sqrt(gAcc*Foam::max(hR, Foam::scalar(0))))
+                                : Foam::max(
+                                    Foam::mag(qL*hiv(hL)) + Foam::sqrt(gAcc*Foam::max(hL, Foam::scalar(0))),
+                                    Foam::mag(qR*hiv(hR)) + Foam::sqrt(gAcc*Foam::max(hR, Foam::scalar(0))));
+                            Fstar = twoD
+                                ? 0.5*(qLn + qRn) - 0.5*sStar*(hR - hL)
+                                : 0.5*(qL + qR)*nUnit.x() - 0.5*sStar*(hR - hL);
                         }
                         b.fzDp[f] = -Fstar*magS;
                         b.fzDm[f] =  Fstar*magS;
@@ -514,7 +553,50 @@ private:
     //  smooth through u=0 (no primitive-variable degeneracy — the eigenstructure
     //  has 1 incoming / 1 outgoing characteristic regardless). Falls back to the
     //  full peer state if A is (near-)defective / non-diagonalisable.
+    //- Oblique coupled faces (unit outward normal with a genuine y
+    //  component): exploit ROTATION INVARIANCE — rotate the momentum pair
+    //  into the face frame (q_n, q_t), where the x-quasilinear operator of
+    //  the rotated state IS A·n and the outward normal maps to +x, run the
+    //  x-aligned characteristic filter, rotate the ghost back.  Implemented
+    //  for the canonical 2-D SWE layout [b,h,hu,hv] (the confluence
+    //  decomposition); higher 2-D moment states need a per-moment-pair
+    //  rotation — not wired yet, so fail loudly instead of silently using
+    //  the wrong operator.  x-normal faces take the legacy path unchanged
+    //  (bit-compatible with every validated 1-D coupling case).
     Foam::List<Foam::scalar> characteristicGhost(
+        const Foam::List<Foam::scalar>& q,
+        const Foam::List<Foam::scalar>& qaux,
+        const Foam::List<Foam::scalar>& peer,
+        const Foam::vector& nOut) const
+    {
+        if (Foam::mag(nOut.y()) > 1e-12)
+        {
+            if (Model::dimension != 2 || Model::n_dof_q != 4)
+            {
+                FatalErrorInFunction
+                    << "[precice] oblique coupled face (n=" << nOut
+                    << ") is only supported for the 2-D SWE state "
+                    << "[b,h,hu,hv]." << Foam::exit(Foam::FatalError);
+            }
+            const Foam::scalar cx = nOut.x(), cy = nOut.y();
+            auto rot = [&](const Foam::List<Foam::scalar>& v)
+            {
+                Foam::List<Foam::scalar> r(v);
+                r[2] =  v[2]*cx + v[3]*cy;    // q_n
+                r[3] = -v[2]*cy + v[3]*cx;    // q_t
+                return r;
+            };
+            Foam::List<Foam::scalar> gh =
+                characteristicGhostX(rot(q), qaux, rot(peer), 1.0);
+            const Foam::scalar gn = gh[2], gt = gh[3];
+            gh[2] = gn*cx - gt*cy;
+            gh[3] = gn*cy + gt*cx;
+            return gh;
+        }
+        return characteristicGhostX(q, qaux, peer, nOut.x());
+    }
+
+    Foam::List<Foam::scalar> characteristicGhostX(
         const Foam::List<Foam::scalar>& q,
         const Foam::List<Foam::scalar>& qaux,
         const Foam::List<Foam::scalar>& peer,
@@ -617,6 +699,8 @@ private:
         Foam::label nFaces = 0;
         std::vector<precice::VertexID> vertexIDs;   // n_faces * nZ
         std::vector<double>            zSamples;     // physical z per vertex
+        std::array<std::string, 6> write;   // data names this binding writes (NF)
+        std::array<std::string, 6> read;    // data names this binding reads (NF)
         //- window-frozen MASS-row face contributions (incl. magSf), one per
         //  face: Dp slot = (-F[1]+FL[0][1])*magSf, Dm slot = (F[1]+FL[1][1])*magSf
         Foam::List<Foam::scalar> fzDp;
@@ -670,7 +754,7 @@ private:
                             buf[d][f * nZ_ + zk] = column[zk][d];
                 }
                 for (int d = 0; d < NF; ++d)
-                    precice_->writeData(b.meshName, writeFields_[d],
+                    precice_->writeData(b.meshName, b.write[d],
                                         b.vertexIDs, buf[d]);
             }
         }
@@ -700,8 +784,8 @@ private:
     Foam::List<Foam::scalarField> checkpoint_;
     Foam::scalar ckTime_ = 0.0;          // clock checkpoint (implicit re-solve)
     Foam::label  ckIndex_ = 0;
-    std::array<std::string, NF> writeFields_;   // data this participant writes
-    std::array<std::string, NF> readFields_;    // data it reads from the peer
+    Foam::List<Foam::word> writeRaw_;   // controlDict data names (per-binding slices)
+    Foam::List<Foam::word> readRaw_;    // controlDict data names (per-binding slices)
 };
 
 }  // namespace numerics
