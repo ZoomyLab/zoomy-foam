@@ -409,14 +409,17 @@ public:
                         const Foam::scalar hR = zeroSample ? rt[1] : peer[1],
                                            qR = zeroSample ? rt[2] : peer[2];
                         // 2-D states carry a momentum PAIR: the level-invariant
-                        // rows price the NORMAL discharge q·n.  1-D keeps the
+                        // rows price the NORMAL discharge q·n.  Grouped layout
+                        // [b,h,qx_0..qx_L,qy_0..qy_L] → q_y_0 sits at
+                        // 2+(n_dof_q-2)/2 (SWE: index 3).  1-D keeps the
                         // legacy scalar arithmetic bit-exactly.
                         const bool twoD = (Model::dimension == 2);
+                        const int iy0 = 2 + (Model::n_dof_q - 2) / 2;
                         const Foam::scalar qLn = twoD
-                            ? rt[2]*nUnit.x() + rt[3]*nUnit.y() : qL;
+                            ? rt[2]*nUnit.x() + rt[iy0]*nUnit.y() : qL;
                         const Foam::scalar qRn = twoD
                             ? (zeroSample ? qLn
-                               : peer[2]*nUnit.x() + peer[3]*nUnit.y()) : qR;
+                               : peer[2]*nUnit.x() + peer[iy0]*nUnit.y()) : qR;
                         const Foam::scalar magS = Foam::mag(Sf[f]);
                         Foam::scalar Fstar = 0;
                         if (massRow_ == "rp")
@@ -576,15 +579,16 @@ private:
     //  has 1 incoming / 1 outgoing characteristic regardless). Falls back to the
     //  full peer state if A is (near-)defective / non-diagonalisable.
     //- Oblique coupled faces (unit outward normal with a genuine y
-    //  component): exploit ROTATION INVARIANCE — rotate the momentum pair
-    //  into the face frame (q_n, q_t), where the x-quasilinear operator of
-    //  the rotated state IS A·n and the outward normal maps to +x, run the
-    //  x-aligned characteristic filter, rotate the ghost back.  Implemented
-    //  for the canonical 2-D SWE layout [b,h,hu,hv] (the confluence
-    //  decomposition); higher 2-D moment states need a per-moment-pair
-    //  rotation — not wired yet, so fail loudly instead of silently using
-    //  the wrong operator.  x-normal faces take the legacy path unchanged
-    //  (bit-compatible with every validated 1-D coupling case).
+    //  component): exploit ROTATION INVARIANCE — rotate every horizontal
+    //  moment PAIR into the face frame (q_n, q_t), where the x-quasilinear
+    //  operator of the rotated state IS A·n and the outward normal maps to
+    //  +x, run the x-aligned characteristic filter, rotate the ghost back.
+    //  2-D moment states are GROUPED BY DIRECTION
+    //  [b, h, q_x_0..q_x_L, q_y_0..q_y_L] (SWE = L=0 = [b,h,hu,hv]); each
+    //  moment pair (q_x_k, q_y_k) transforms as a plane vector, so ONE
+    //  rotation per pair covers the whole hierarchy.  x-normal faces take
+    //  the legacy path unchanged (bit-compatible with every validated 1-D
+    //  coupling case).
     Foam::List<Foam::scalar> characteristicGhost(
         const Foam::List<Foam::scalar>& q,
         const Foam::List<Foam::scalar>& qaux,
@@ -593,26 +597,34 @@ private:
     {
         if (Foam::mag(nOut.y()) > 1e-12)
         {
-            if (Model::dimension != 2 || Model::n_dof_q != 4)
+            if (Model::dimension != 2 || (Model::n_dof_q - 2) % 2 != 0)
             {
                 FatalErrorInFunction
                     << "[precice] oblique coupled face (n=" << nOut
-                    << ") is only supported for the 2-D SWE state "
-                    << "[b,h,hu,hv]." << Foam::exit(Foam::FatalError);
+                    << ") needs the grouped 2-D layout [b,h,qx_k...,qy_k...]."
+                    << Foam::exit(Foam::FatalError);
             }
+            const int nm = (Model::n_dof_q - 2) / 2;   // moment pairs
             const Foam::scalar cx = nOut.x(), cy = nOut.y();
             auto rot = [&](const Foam::List<Foam::scalar>& v)
             {
                 Foam::List<Foam::scalar> r(v);
-                r[2] =  v[2]*cx + v[3]*cy;    // q_n
-                r[3] = -v[2]*cy + v[3]*cx;    // q_t
+                for (int k = 0; k < nm; ++k)
+                {
+                    const Foam::scalar qx = v[2 + k], qy = v[2 + nm + k];
+                    r[2 + k]      =  qx*cx + qy*cy;    // q_n
+                    r[2 + nm + k] = -qx*cy + qy*cx;    // q_t
+                }
                 return r;
             };
             Foam::List<Foam::scalar> gh =
                 characteristicGhostX(rot(q), qaux, rot(peer), 1.0);
-            const Foam::scalar gn = gh[2], gt = gh[3];
-            gh[2] = gn*cx - gt*cy;
-            gh[3] = gn*cy + gt*cx;
+            for (int k = 0; k < nm; ++k)
+            {
+                const Foam::scalar gn = gh[2 + k], gt = gh[2 + nm + k];
+                gh[2 + k]      = gn*cx - gt*cy;
+                gh[2 + nm + k] = gn*cy + gt*cx;
+            }
             return gh;
         }
         return characteristicGhostX(q, qaux, peer, nOut.x());
