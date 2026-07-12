@@ -127,6 +127,17 @@ public:
         writeRaw_ = writeData;
         readRaw_  = readData;
 
+        // Per-binding EXCHANGE-FRAME rotation (controlDict
+        // `preciceFrameAngles ( deg1 deg2 … )`, found-patch order, default 0):
+        // a dimensionally-reduced participant whose mesh axis is NOT the
+        // global x (the 30° branch arm of the confluence) exchanges its
+        // canonical column in its OWN frame — rotate the horizontal velocity
+        // pair (u,v) by +angle on write (arm → global) and by −angle on read
+        // (global → arm).  Scalars (b,h,w,p) are frame-invariant.
+        frameAngles_ =
+            mesh.time().controlDict().lookupOrDefault<Foam::List<Foam::scalar>>(
+                "preciceFrameAngles", Foam::List<Foam::scalar>());
+
         if (!active_) return;
         precice_ = std::make_unique<precice::Participant>(
             std::string(participantName), std::string(configPath), 0, 1);
@@ -189,6 +200,12 @@ public:
                         ? std::string(writeRaw_[wOff + d]) : canon[d];
                     b.read[d]  = (readRaw_.size()  >= rOff + NF)
                         ? std::string(readRaw_[rOff + d])  : canon[d];
+                }
+                if (bi < frameAngles_.size())
+                {
+                    const Foam::scalar a = frameAngles_[bi]*(M_PI/180.0);
+                    b.cosA = Foam::cos(a);
+                    b.sinA = Foam::sin(a);
                 }
                 b.meshName = mname;
                 b.patchI   = patchI;
@@ -297,6 +314,11 @@ public:
                         column[zk].resize(NF);
                         for (int d = 0; d < NF; ++d)
                             column[zk][d] = buf[d][f * nZ_ + zk];
+                        // incoming global → local frame: (u,v) by R(−a)
+                        const Foam::scalar ug = column[zk][2],
+                                           vg = column[zk][3];
+                        column[zk][2] =  b.cosA*ug + b.sinA*vg;
+                        column[zk][3] = -b.sinA*ug + b.cosA*vg;
                         zcol[zk] = b.zSamples[f * nZ_ + zk];
                     }
                     const auto peer = reduceColumn(column, zcol);
@@ -701,6 +723,9 @@ private:
         std::vector<double>            zSamples;     // physical z per vertex
         std::array<std::string, 6> write;   // data names this binding writes (NF)
         std::array<std::string, 6> read;    // data names this binding reads (NF)
+        //- exchange-frame rotation (preciceFrameAngles): local → global = R(+a)
+        Foam::scalar cosA = 1.0;
+        Foam::scalar sinA = 0.0;
         //- window-frozen MASS-row face contributions (incl. magSf), one per
         //  face: Dp slot = (-F[1]+FL[0][1])*magSf, Dm slot = (F[1]+FL[1][1])*magSf
         Foam::List<Foam::scalar> fzDp;
@@ -748,10 +773,17 @@ private:
                     Foam::List<Foam::scalar> zcol(nZ_);
                     for (int zk = 0; zk < nZ_; ++zk)
                         zcol[zk] = b.zSamples[f * nZ_ + zk];
-                    const auto column = Model::interpolate_to_3d(q, qa, p_, zcol);
+                    auto column = Model::interpolate_to_3d(q, qa, p_, zcol);
                     for (int zk = 0; zk < nZ_; ++zk)
+                    {
+                        // outgoing local → global frame: (u,v) by R(+a)
+                        const Foam::scalar ul = column[zk][2],
+                                           vl = column[zk][3];
+                        column[zk][2] = b.cosA*ul - b.sinA*vl;
+                        column[zk][3] = b.sinA*ul + b.cosA*vl;
                         for (int d = 0; d < NF; ++d)
                             buf[d][f * nZ_ + zk] = column[zk][d];
+                    }
                 }
                 for (int d = 0; d < NF; ++d)
                     precice_->writeData(b.meshName, b.write[d],
@@ -786,6 +818,7 @@ private:
     Foam::label  ckIndex_ = 0;
     Foam::List<Foam::word> writeRaw_;   // controlDict data names (per-binding slices)
     Foam::List<Foam::word> readRaw_;    // controlDict data names (per-binding slices)
+    Foam::List<Foam::scalar> frameAngles_;   // per-binding frame rotation [deg]
 };
 
 }  // namespace numerics
