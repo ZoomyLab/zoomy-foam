@@ -21,3 +21,22 @@ h5 = run_case(model, settings, output_dir, on_progress=None)   # -> HDF5 path
 Needs the OF-13 apptainer image (`ZOOMY_OF_SIF`, default
 `~/of_build/zoomy_openfoam.sif`); binaries are cached by a hash of the emitted
 headers under `.bincache/`.
+
+### GUI solver wrappers — `zoomy_foam.solvers` (REQ-133)
+
+`param.Parameterized` classes the GUI auto-generates widgets from (same shape as
+`zoomy_amrex`/`zoomy_dmplex`):
+
+```python
+from zoomy_foam.solvers import HyperbolicSolver
+solver = HyperbolicSolver(CFL=0.45, order=2)
+solver.solve(model, {"domain": [0, 10], "n_cells": [200]}, settings)  # -> .pvd
+```
+
+`solve(model, mesh, settings)` writes a **VTK series** into
+`settings.output.directory` (the gui converts VTK→h5 via `zoomy_prepost`) and
+returns the `.pvd` path. `settings` is structured
+(`settings.output.{directory,filename,snapshots}`, `settings.time_end`); `mesh`
+is a `{"domain": [x0,x1], "n_cells": [n]}` descriptor (structured 1-D).
+`HyperbolicSolver` is the explicit zoomyFoam march; `SplitSolver` (Chorin) has
+the fixed API with the chorinFoam pipeline wiring as a documented follow-up.

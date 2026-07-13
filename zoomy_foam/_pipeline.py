@@ -308,10 +308,13 @@ def _keep_state_rows(h5_path, n_state, sample_vtk):
             g.create_dataset("Q", data=Q[idx])
 
 
-def _to_hdf5(case, output_dir, n_state):
+def _to_vtk(case, n_state):
+    """Strip to the state fields, `foamToVTK`, and write a `.pvd` collection with
+    physical OF times. Returns ``(source, vtks)`` — ``source`` is the ``.pvd``
+    path (or an ordered frame list on a count mismatch), ``vtks`` the sorted
+    frame files."""
     _strip_nonstate(case, n_state)
     _apptainer(f"cd {case}; foamToVTK > log.foamToVTK 2>&1", binds=[case], check=True)
-    from zoomy_prepost import vtk_to_hdf5
     vtkdir = case / "VTK"
     vtks = sorted(vtkdir.glob("*.vtk"),
                   key=lambda p: int(re.search(r"_(\d+)\.vtk$", p.name).group(1)))
@@ -319,12 +322,15 @@ def _to_hdf5(case, output_dir, n_state):
     if not vtks:
         raise RuntimeError(f"foamToVTK produced no VTK frames in {vtkdir}")
     if len(vtks) == len(times):
-        # physical OF times, correctly ordered, via a .pvd collection
         pvd = vtkdir / "series.pvd"
         _write_pvd(pvd, list(zip(times, vtks)))
-        source = str(pvd)
-    else:  # count mismatch — fall back to numeric-index order (index-times)
-        source = [str(p) for p in vtks]
+        return str(pvd), vtks
+    return [str(p) for p in vtks], vtks   # count mismatch → numeric-index order
+
+
+def _to_hdf5(case, output_dir, n_state):
+    source, vtks = _to_vtk(case, n_state)
+    from zoomy_prepost import vtk_to_hdf5
     out = vtk_to_hdf5(source, str(Path(output_dir) / "simulation.h5"))
     _keep_state_rows(out, n_state, str(vtks[0]))
     return out
@@ -347,6 +353,12 @@ def run_case(model, settings, output_dir, on_progress=None):
         Where the OpenFOAM case + ``simulation.h5`` are written.
     on_progress : callable(iteration, time, dt) | None
     """
+    case, sm = _run_pipeline(model, settings, output_dir, on_progress)
+    return _to_hdf5(case, Path(output_dir), len(sm.state))
+
+
+def _run_pipeline(model, settings, output_dir, on_progress):
+    """Shared codegen → wmake → case → run prefix. Returns ``(case_dir, sm)``."""
     from zoomy_core.mesh.lsq_mesh import LSQMesh
     output_dir = Path(output_dir); output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -360,4 +372,12 @@ def run_case(model, settings, output_dir, on_progress=None):
     case = output_dir / "foam_case"
     _build_case(case, mesh, model, sm, settings, binary)
     _run_stream(case, binary, on_progress)
-    return _to_hdf5(case, output_dir, len(sm.state))
+    return case, sm
+
+
+def run_to_vtk(model, settings, output_dir, on_progress=None):
+    """Same pipeline as :func:`run_case` but stops at the VTK series (no HDF5) —
+    the shape the gui solver wrappers use (gui converts VTK→h5 with
+    ``zoomy_prepost``). Returns the ``.pvd`` collection path."""
+    case, sm = _run_pipeline(model, settings, output_dir, on_progress)
+    return _to_vtk(case, len(sm.state))[0]
