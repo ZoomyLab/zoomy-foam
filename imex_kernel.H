@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cmath>
 #include <utility>
+#include <vector>
+#include <functional>
 
 #include "List.H"
 #include "scalar.H"
@@ -127,6 +129,98 @@ inline bool solveDenseInPlace
         x[i] = s / A[i][i];
     }
     return true;
+}
+
+// ── Matrix-free BiCGStab for the global Chorin pressure Poisson ──────────
+//
+// Replaces the O(N^3) assemble-by-probe + dense Gaussian-elimination pressure
+// solve.  The pressure residual R(P) is AFFINE in the pressure modes P
+// (linear operator + a frozen-predictor source), so the linear operator is
+//
+//     A x = R(x) - R(0)          (one residual eval per matvec, O(N))
+//
+// and the system is  A x = b  with  b = -R(0).  The composed-Gauss discrete
+// Laplacian emitted by the Model printer is NOT symmetric (odd-even/wide
+// stencil, REQ-68), so a symmetric CG is unsafe — BiCGStab handles the
+// nonsymmetric operator.  `matvec(x, y)` must set y = A x.  `x` carries the
+// initial guess in and the solution out.  Returns the iteration count and
+// sets `converged` / `finalRelRes` (residual relative to |b|).
+inline int bicgstabMatrixFree
+(
+    const std::function<void(const std::vector<double>&, std::vector<double>&)>& matvec,
+    const std::vector<double>& b,
+    std::vector<double>& x,
+    double tol,
+    int maxIter,
+    bool& converged,
+    double& finalRelRes
+)
+{
+    const int n = static_cast<int>(b.size());
+    auto dot = [n](const std::vector<double>& a, const std::vector<double>& c)
+    {
+        double d = 0.0;
+        for (int i = 0; i < n; ++i) d += a[i] * c[i];
+        return d;
+    };
+    const double bnorm = std::sqrt(dot(b, b));
+    if (bnorm == 0.0)
+    {
+        std::fill(x.begin(), x.end(), 0.0);
+        converged = true; finalRelRes = 0.0; return 0;
+    }
+
+    std::vector<double> r(n), rhat(n), v(n, 0.0), p(n, 0.0), s(n), t(n), Ax(n);
+    matvec(x, Ax);
+    for (int i = 0; i < n; ++i) { r[i] = b[i] - Ax[i]; rhat[i] = r[i]; }
+
+    double rho = 1.0, alpha = 1.0, omega = 1.0;
+    double rnorm = std::sqrt(dot(r, r));
+    if (rnorm <= tol * bnorm)
+    {
+        converged = true; finalRelRes = rnorm / bnorm; return 0;
+    }
+
+    for (int it = 1; it <= maxIter; ++it)
+    {
+        const double rho_new = dot(rhat, r);
+        if (std::abs(rho_new) < 1e-300)          // breakdown
+        {
+            converged = false; finalRelRes = rnorm / bnorm; return it;
+        }
+        const double beta = (rho_new / rho) * (alpha / omega);
+        for (int i = 0; i < n; ++i) p[i] = r[i] + beta * (p[i] - omega * v[i]);
+        matvec(p, v);
+        const double rhatv = dot(rhat, v);
+        if (std::abs(rhatv) < 1e-300)
+        {
+            converged = false; finalRelRes = rnorm / bnorm; return it;
+        }
+        alpha = rho_new / rhatv;
+        for (int i = 0; i < n; ++i) s[i] = r[i] - alpha * v[i];
+        const double snorm = std::sqrt(dot(s, s));
+        if (snorm <= tol * bnorm)
+        {
+            for (int i = 0; i < n; ++i) x[i] += alpha * p[i];
+            converged = true; finalRelRes = snorm / bnorm; return it;
+        }
+        matvec(s, t);
+        const double tt = dot(t, t);
+        omega = (tt > 0.0) ? dot(t, s) / tt : 0.0;
+        for (int i = 0; i < n; ++i) x[i] += alpha * p[i] + omega * s[i];
+        for (int i = 0; i < n; ++i) r[i] = s[i] - omega * t[i];
+        rnorm = std::sqrt(dot(r, r));
+        if (rnorm <= tol * bnorm)
+        {
+            converged = true; finalRelRes = rnorm / bnorm; return it;
+        }
+        if (std::abs(omega) < 1e-300)
+        {
+            converged = false; finalRelRes = rnorm / bnorm; return it;
+        }
+        rho = rho_new;
+    }
+    converged = false; finalRelRes = rnorm / bnorm; return maxIter;
 }
 
 // ── Cell-local implicit source Newton ───────────────────────────────────

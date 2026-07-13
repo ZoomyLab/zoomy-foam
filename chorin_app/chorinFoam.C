@@ -163,25 +163,66 @@ int main(int argc, char *argv[])
         }
     };
 
-    auto solvePressure = [&](scalar dt)
+    // Pressure-solver selection.  Default = matrix-free BiCGStab (sparse,
+    // O(N) per matvec).  `pressureSolver dense;` restores the legacy
+    // assemble-by-probe + dense Gaussian elimination (O(N^3)) for A/B checks.
+    const word pSolver =
+        runTime.controlDict().lookupOrDefault<word>("pressureSolver", "bicgstab");
+    const scalar pTol =
+        runTime.controlDict().lookupOrDefault<scalar>("pressureTol", 1e-8);
+    const label pMaxIter =
+        runTime.controlDict().lookupOrDefault<label>("pressureMaxIter", 2000);
+    Info << "chorinFoam: pressureSolver=" << pSolver
+         << " tol=" << pTol << " maxIter=" << pMaxIter << endl;
+
+    auto writePressure = [&](const std::vector<double>& x)
     {
-        pPress[pPress.size()-1] = dt;
-        std::vector<double> zero(N, 0.0), R0(N), rj(N), ej(N, 0.0);
-        pressureResidual(zero, R0, dt);                 // R(0)
-        List<List<scalar>> A(N, List<scalar>(N, 0.0));
-        for (int j = 0; j < N; ++j)
-        {
-            ej[j] = 1.0; pressureResidual(ej, rj, dt); ej[j] = 0.0;
-            for (int i = 0; i < N; ++i) A[i][j] = rj[i] - R0[i];   // matvec(e_j)
-        }
-        List<scalar> b(N), x(N);
-        for (int i = 0; i < N; ++i) b[i] = -R0[i];      // A x = -R(0)
-        const bool ok = numerics::solveDenseInPlace(A, b, x);
-        if (!ok) { Info << "  pressure solve: singular, P unchanged" << endl; return; }
         for (label c = 0; c < nc; ++c)
             for (int m = 0; m < nP; ++m)
                 Q[e2sP[m]]->primitiveFieldRef()[c] = x[m*nc + c];
         forAll(e2sP, m) Q[e2sP[m]]->correctBoundaryConditions();
+    };
+
+    auto solvePressure = [&](scalar dt)
+    {
+        pPress[pPress.size()-1] = dt;
+        std::vector<double> zero(N, 0.0), R0(N);
+        pressureResidual(zero, R0, dt);                 // R(0) = -b
+        std::vector<double> b(N);
+        for (int i = 0; i < N; ++i) b[i] = -R0[i];      // A x = -R(0)
+
+        if (pSolver == "dense")
+        {
+            std::vector<double> rj(N), ej(N, 0.0);
+            List<List<scalar>> A(N, List<scalar>(N, 0.0));
+            for (int j = 0; j < N; ++j)
+            {
+                ej[j] = 1.0; pressureResidual(ej, rj, dt); ej[j] = 0.0;
+                for (int i = 0; i < N; ++i) A[i][j] = rj[i] - R0[i]; // matvec(e_j)
+            }
+            List<scalar> bF(N), xF(N);
+            for (int i = 0; i < N; ++i) bF[i] = b[i];
+            const bool ok = numerics::solveDenseInPlace(A, bF, xF);
+            if (!ok) { Info << "  pressure solve: singular, P unchanged" << endl; return; }
+            std::vector<double> x(N);
+            for (int i = 0; i < N; ++i) x[i] = xF[i];
+            writePressure(x);
+            return;
+        }
+
+        // Matrix-free BiCGStab: A x = R(x) - R(0), reusing the linear residual.
+        auto matvec = [&](const std::vector<double>& xv, std::vector<double>& yv)
+        {
+            pressureResidual(xv, yv, dt);
+            for (int i = 0; i < N; ++i) yv[i] -= R0[i];
+        };
+        std::vector<double> x(N, 0.0);
+        bool conv = false; double relres = 0.0;
+        const int its = numerics::bicgstabMatrixFree(
+            matvec, b, x, pTol, pMaxIter, conv, relres);
+        Info << "  pressure BiCGStab: iters=" << its << " relRes=" << relres
+             << (conv ? "" : "  (NOT converged)") << endl;
+        writePressure(x);
     };
 
     // ── corrector: ChorinCorrector::update_variables → momentum slots ───────

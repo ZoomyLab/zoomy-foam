@@ -1,0 +1,7 @@
+# Unit test for ../../imex_kernel.H bicgstabMatrixFree — needs only OpenFOAM core.
+EXE_INC = \
+    -std=c++17 \
+    -I../..
+
+EXE_LIBS = \
+    -lOpenFOAM
