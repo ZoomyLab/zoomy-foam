@@ -87,9 +87,32 @@ inline void compute_derivative
         for (int a = 0; a < dy; ++a) ax[na++] = 1;
         for (int a = 0; a < dz; ++a) ax[na++] = 2;
 
-        // inner = ∂_{ax[0]} source.  Carry it in a field whose boundary patch
-        // types match `source` (copy-construct), then refresh the ghost so the
-        // OUTER Gauss gradient samples a consistent boundary value.
+        if (ax[0] == ax[1])
+        {
+            // PURE second derivative ∂_aa: COMPACT per-axis Gauss/snGrad
+            // assembly — the single-axis restriction of the compact laplacian,
+            //   ∂_aa f ≈ (1/V) Σ_f |S_f| (n̂_f·ê_a)² snGrad(f)_f,
+            // a 3-point stencil on a structured mesh ((f_{i+1}−2f_i+f_{i−1})/dx²).
+            // The previous composed grad(grad(f)) was 5-point-wide and
+            // ODD-EVEN-DECOUPLED (the REQ-68 caveat) — it checkerboarded the
+            // Chorin pressure forcing (h_xx) at a dam-break front, blowing the
+            // run at t≈0.004 once REQ-147 activated the pressure.
+            const Foam::fvMesh& msh = source.mesh();
+            const Foam::surfaceVectorField nf(msh.Sf()/msh.magSf());
+            const Foam::surfaceScalarField w
+            (
+                msh.magSf()
+              * Foam::sqr(nf.component(ax[0]))
+              * Foam::fvc::snGrad(source)
+            );
+            result.primitiveFieldRef() =
+                Foam::fvc::surfaceIntegrate(w)().primitiveField();
+            return;
+        }
+
+        // MIXED ∂_ab (a≠b): composed Gauss gradients (no compact TPFA form).
+        // inner = ∂_{ax[0]} source, ghost refreshed so the outer gradient
+        // samples a consistent boundary value.
         Foam::volScalarField inner(source);
         {
             const Foam::tmp<Foam::volVectorField> g1 = Foam::fvc::grad(source);
