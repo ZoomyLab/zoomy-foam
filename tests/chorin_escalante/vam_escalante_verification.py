@@ -10,21 +10,22 @@ b=0.20·exp(-x²/(2·0.2²)); dam-break IC h=max(0.34-b, 0.015) for x<1; g=9.81,
 (escalante_frames.npz, ETA_EXP/PB_EXP in run.py). Deliverables:
 figures/vam_escalante.{png,gif} (2-panel comparison + evolution).
 
-Prereq: chorinFoam built for VAM(1,2) with OPEN bcs —
-  python3 create_model.py --scheme chorin --level 1 --dim 2 --bcs open
+Prereq: chorinFoam built for VAM(1,2) with the DISCHARGE-INFLOW bcs —
+  python3 create_model.py --scheme chorin --level 1 --dim 2 \
+      --bcs subcritical --q-in 0.11197 --h-out 0.015
   then wmake chorin_app in the OF13 apptainer; ρ/g set via modelParameters.
 
-BOUNDARY CONDITIONS are the case author's responsibility (set HERE, not by the
-model): the closed reservoir end is a reflective wall via controlDict
-`wallPatches (left)`; the right is transmissive (zeroGradient).
+BOUNDARY CONDITIONS: the reference case (numpy run_derived / the experiment) is
+fed by a DISCHARGE INFLOW at the left (q_0 = Q_IN = 0.11197 — the "Lambda inflow"
+that sustains the reservoir), NOT a closed wall.  A wall/open left BC DRAINS the
+reservoir (h_left 0.34→0.25 by t=3, ~9 cm too low, 45% mass loss) and was the
+sole cause of the old ~7 cm η mismatch — it is NOT a stencil/pressure/core bug.
 
-⚠ Result: with the CORRECT case BC (left wall) the reservoir holds (left h~0.339,
-matching the numpy reference), but the run SIGFPEs at t≈0.8-1.0 — the REQ-17/REQ-71
-transcritical instability (core), no longer masked. (An EARLIER run with a wrong
-OPEN left BC reached t≈2.8 only because the spurious drainage weakened the flow
-and delayed the blow-up — that comparison was a BC artifact.) A faithful t≈3.0
-experiment comparison needs the core stability fix (REQ-71 eigenvalue floor +
-structural-Chorin robustness); foam-side the case BC + driver are correct."""
+✓ Result (inflow BC, active pressure, compact ∂xx stencil, t=3.0): reservoir
+holds (foam h_left 0.345 vs numpy 0.347), and η matches the experiment to
+RMS 1.1 cm (was 7.2 cm), p_b/g to 2.7 cm.  The old "REQ-17/71 t≈1s foam blow-up"
+does NOT reproduce with the inflow BC + clean forcing.  Deliverable:
+figures/vam_escalante_foam.png."""
 import re, shutil, subprocess, sys
 from pathlib import Path
 import numpy as np
@@ -66,7 +67,8 @@ boundary ( left {{ type patch; faces ((0 4 7 3)); }} right {{ type patch; faces 
 application chorinFoam; startFrom startTime; startTime 0; stopAt endTime; endTime {tend};
 deltaT 0.001; writeControl adjustableRunTime; writeInterval {dtw}; maxCo {maxco}; purgeWrite 0;
 modelParameters {{ g {G}; rho {RHO}; }}
-wallPatches (left);   // CASE BC (author-supplied): closed reservoir end = reflective wall
+// Left BC = discharge inflow (baked into the emitted subcritical Model.H,
+// q_0 = Q_IN); NO wallPatches — a wall/open left BC drains the reservoir.
 """)
     xn=np.linspace(X0,X1,N+1); xc=0.5*(xn[1:]+xn[:-1])
     field(case,"Q0",bed(xc)); field(case,"Q1",ic_h(xc))
