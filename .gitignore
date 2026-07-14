@@ -23,3 +23,6 @@ ChorinState.H
 .bincache/
 *.egg-info/
 zoomy_foam.egg-info/
+/chorin_app/Make/linux64GccDPInt32Opt
+/tests/bicgstab_unit/Make/linux64GccDPInt32Opt
+/tests/chorin_bump/figures
