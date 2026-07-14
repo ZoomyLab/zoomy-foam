@@ -186,6 +186,12 @@ int main(int argc, char *argv[])
     auto solvePressure = [&](scalar dt)
     {
         pPress[pPress.size()-1] = dt;
+        // REQ-147: fill the FROZEN predictor-forcing auxes (the q/h/b derivatives
+        // that drive the Poisson RHS) ONCE per step from the current predictor
+        // state in Q[0..5].  They are constant across the Krylov iterations —
+        // update_aux_variables (called per residual eval) only refreshes the
+        // pressure derivatives, so without this the forcing stays 0 and P≡0.
+        ChorinPressure::update_aux_input_variables(Q, QauxPress, mesh);
         std::vector<double> zero(N, 0.0), R0(N);
         pressureResidual(zero, R0, dt);                 // R(0) = -b
         std::vector<double> b(N);
