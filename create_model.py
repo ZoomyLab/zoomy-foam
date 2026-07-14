@@ -19,6 +19,7 @@ from zoomy_core.model.models import closures as C
 from zoomy_core.model.boundary_conditions import (
     BoundaryConditions, Extrapolation, Coupled, FromModel, Dirichlet)
 from zoomy_core.fvm.riemann_solvers import PositiveNonconservativeRusanov
+from zoomy_core.systemmodel import SystemModel
 from zoomy_core.transformation.to_openfoam import (
     FoamSystemModelPrinter, FoamNumericsPrinter)
 
@@ -56,7 +57,7 @@ def emit_chorin(level=1, dim=2, out=HERE, bcs="open", q_in=1.0, h_out=1.0):
     m = VAM(level=level, dimension=dim,
             closures=[C.Newtonian(), C.NavierSlip(), C.StressFree()],
             boundary_conditions=boundary)
-    full = m.system_model
+    full = SystemModel.from_model(m)   # REQ-143: from_model is the one path
     n_state = len(full.state)
     dt = sp.Symbol("dt", positive=True)
     split = m.chorin_split(dt)
@@ -117,8 +118,9 @@ def build_system_model(level, outer="extrapolation", closure="none", bcs="coupli
     closures = ([C.ManningFriction()] if closure == "manning"
                 else [C.Newtonian(), C.NavierSlip(), C.StressFree()]
                 if closure == "newtonian" else [])
-    return SME(level=level, closures=closures, project_nz=project_nz,
-               boundary_conditions=boundary).system_model
+    return SystemModel.from_model(     # REQ-143: from_model is the one path
+        SME(level=level, closures=closures, project_nz=project_nz,
+            boundary_conditions=boundary))
 
 
 def emit(level, out=HERE, outer="extrapolation", closure="none", bcs="coupling",

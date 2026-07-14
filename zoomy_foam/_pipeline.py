@@ -172,21 +172,24 @@ def _field_file(case, name, vals, patches):
 
 
 def _model_parameters(model, sm):
-    """{name: value} for the controlDict modelParameters, from the model."""
+    """{name: value} for the controlDict ``modelParameters`` override.
+
+    Source of truth is ``sm.parameter_values`` (the resolved Zstruct the model
+    baked at derivation — e.g. VAM g=9.81, rho=1); the model-level
+    ``parameter_values`` (user override) wins where present.  NEVER fabricate a
+    0.0 for an unresolved name: the emitted ``Model::default_parameters()``
+    already carries the baked defaults, and a zero override for g/rho SIGFPEs
+    the run (division by rho in every pressure term)."""
     out = {}
-    vals = getattr(model, "parameter_values", None)
-    if vals is not None:
-        for k in getattr(vals, "keys", lambda: [])():
+    for src in (getattr(sm, "parameter_values", None),
+                getattr(model, "parameter_values", None)):
+        if src is None:
+            continue
+        for k in getattr(src, "keys", lambda: [])():
             try:
-                out[str(k)] = float(getattr(vals, k))
+                out[str(k)] = float(getattr(src, k))
             except Exception:
                 pass
-    # fall back / fill from the system model's declared parameter symbols
-    for s in getattr(sm, "parameters", []) or []:
-        nm = str(s)
-        if nm not in out:
-            dv = getattr(s, "default", None)
-            out[nm] = float(dv) if dv is not None else 0.0
     return out
 
 
