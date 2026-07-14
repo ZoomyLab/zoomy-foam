@@ -29,7 +29,7 @@ from pathlib import Path
 
 import param
 
-from ._pipeline import run_to_vtk
+from ._pipeline import run_to_vtk, run_chorin_to_vtk
 
 
 # ── structured-settings access (dict- or attribute-shaped) ──────────────────
@@ -110,27 +110,24 @@ class HyperbolicSolver(_BaseSolver):
 
 class SplitSolver(_BaseSolver):
     """N sequential system models + pressure projection (Chorin
-    pressure-corrector; NOT VAM-specific).  The split structure comes from the
-    MODEL (``model.chorin_split``); this wrapper exposes only the march knobs.
-
-    NOTE (REQ-133 follow-up): foam's Chorin driver is the separate ``chorinFoam``
-    app (predictor/pressure/corrector headers + a matrix-free GMRES pressure
-    solve) and is currently shaped for the VAM 8-state column.  Wiring a generic
-    SplitSolver pipeline (split codegen → wmake chorin_app → run → VTK) on top of
-    the ``HyperbolicSolver`` machinery is the remaining work; the API is fixed
-    here so the GUI card and the amrex/dmplex mirror stay uniform."""
+    pressure-corrector).  The split structure — predictor / pressure / corrector
+    sub-models — comes from the MODEL (``model.chorin_split``, e.g. VAM); this
+    wrapper drives the ``chorinFoam`` app (split codegen → wmake chorin_app →
+    case → run → VTK) and exposes only the march / pressure-solve knobs."""
 
     cfl = param.Number(0.30, bounds=(0.0, 1.0), doc="Courant number")
-    pressure_tol = param.Number(1e-9, bounds=(0.0, None),
-                                doc="Chorin pressure GMRES tolerance")
+    pressure_tol = param.Number(1e-8, bounds=(0.0, None),
+                                doc="Chorin pressure BiCGStab tolerance")
+    pressure_maxit = param.Integer(2000, bounds=(1, None),
+                                   doc="Chorin pressure BiCGStab max iterations")
 
     def solve(self, model, mesh, settings, on_progress=None):
         if not hasattr(model, "chorin_split"):
             raise TypeError(
                 "SplitSolver needs a model with chorin_split (got "
                 f"{type(model).__name__}); use HyperbolicSolver for hyperbolic models")
-        raise NotImplementedError(
-            "zoomy_foam.solvers.SplitSolver: the chorinFoam split pipeline (split "
-            "codegen → wmake chorin_app → run → VTK) is not wired to this wrapper "
-            "yet — see the class docstring / REQ-133 follow-up. HyperbolicSolver is "
-            "fully available.")
+        outdir = self._output_dir(settings)
+        s = self._foam_settings(mesh, settings, outdir)
+        s.update(cfl=self.cfl, pressure_tol=self.pressure_tol,
+                 pressure_maxit=self.pressure_maxit)
+        return run_chorin_to_vtk(model, s, outdir, on_progress=on_progress)

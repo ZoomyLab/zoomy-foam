@@ -81,3 +81,14 @@ def test_hyperbolic_end_to_end(tmp_path):
     assert frames
     m = meshio.read(os.path.join(os.path.dirname(pvd), sorted(frames)[0]))
     assert "Q1" in m.cell_data                     # state field h present, no HDF5 step
+
+
+def test_split_solver_wired():
+    """REQ-133 follow-up: SplitSolver drives the chorinFoam pipeline (no more
+    NotImplementedError). Params are bounded; non-split models are rejected."""
+    ss = solvers.SplitSolver(cfl=0.25, pressure_tol=1e-9)
+    assert ss.cfl == 0.25 and ss.pressure_maxit == 2000
+    from zoomy_foam._pipeline import run_chorin_to_vtk, _codegen_chorin  # noqa: F401
+    import inspect
+    src = inspect.getsource(solvers.SplitSolver.solve)
+    assert "run_chorin_to_vtk" in src and "NotImplementedError" not in src

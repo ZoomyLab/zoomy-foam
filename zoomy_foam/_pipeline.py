@@ -138,6 +138,30 @@ def _mesh_geometry(mesh):
     return float(xc.min() - dx / 2), float(xc.max() + dx / 2), nc, order
 
 
+def _write_grid_system(case, x0, x1, n):
+    """Structured 1-D blockMeshDict + minimal fvSchemes/fvSolution (shared by the
+    explicit and Chorin case builders)."""
+    (case / "system" / "blockMeshDict").write_text(
+        "FoamFile { version 2.0; format ascii; class dictionary; object blockMeshDict; }\n"
+        "convertToMeters 1;\n"
+        f"vertices ( ({x0} 0 0)({x1} 0 0)({x1} 1 0)({x0} 1 0)"
+        f"({x0} 0 1)({x1} 0 1)({x1} 1 1)({x0} 1 1) );\n"
+        f"blocks ( hex (0 1 2 3 4 5 6 7) ({n} 1 1) simpleGrading (1 1 1) );\n"
+        "edges (); boundary (\n"
+        "  left  { type patch; faces ( (0 4 7 3) ); }\n"
+        "  right { type patch; faces ( (1 2 6 5) ); }\n"
+        "  frontAndBack { type empty; faces ( (0 1 5 4) (3 7 6 2) ); }\n"
+        "  topAndBottom { type empty; faces ( (0 3 2 1) (4 5 6 7) ); }\n"
+        "); mergePatchPairs ();\n")
+    (case / "system" / "fvSchemes").write_text(
+        "FoamFile { version 2.0; format ascii; class dictionary; object fvSchemes; }\n"
+        "ddtSchemes { default none; } gradSchemes { default Gauss linear; }\n"
+        "divSchemes { default none; } laplacianSchemes { default none; }\n"
+        "interpolationSchemes { default linear; } snGradSchemes { default corrected; }\n")
+    (case / "system" / "fvSolution").write_text(
+        "FoamFile { version 2.0; format ascii; class dictionary; object fvSolution; }\nsolvers {}\n")
+
+
 def _field_file(case, name, vals, patches):
     body = "\n".join(f"{v:.10g}" for v in np.atleast_1d(vals))
     bf = "\n".join(f"  {p} {{ type {t}; }}" for p, t in patches.items())
@@ -171,26 +195,7 @@ def _build_case(case, mesh, model, sm, settings, binary):
         shutil.rmtree(case)
     (case / "0").mkdir(parents=True); (case / "system").mkdir(); (case / "constant").mkdir()
     x0, x1, n, order = _mesh_geometry(mesh)
-
-    (case / "system" / "blockMeshDict").write_text(
-        "FoamFile { version 2.0; format ascii; class dictionary; object blockMeshDict; }\n"
-        "convertToMeters 1;\n"
-        f"vertices ( ({x0} 0 0)({x1} 0 0)({x1} 1 0)({x0} 1 0)"
-        f"({x0} 0 1)({x1} 0 1)({x1} 1 1)({x0} 1 1) );\n"
-        f"blocks ( hex (0 1 2 3 4 5 6 7) ({n} 1 1) simpleGrading (1 1 1) );\n"
-        "edges (); boundary (\n"
-        "  left  { type patch; faces ( (0 4 7 3) ); }\n"
-        "  right { type patch; faces ( (1 2 6 5) ); }\n"
-        "  frontAndBack { type empty; faces ( (0 1 5 4) (3 7 6 2) ); }\n"
-        "  topAndBottom { type empty; faces ( (0 3 2 1) (4 5 6 7) ); }\n"
-        "); mergePatchPairs ();\n")
-    (case / "system" / "fvSchemes").write_text(
-        "FoamFile { version 2.0; format ascii; class dictionary; object fvSchemes; }\n"
-        "ddtSchemes { default none; } gradSchemes { default Gauss linear; }\n"
-        "divSchemes { default none; } laplacianSchemes { default none; }\n"
-        "interpolationSchemes { default linear; } snGradSchemes { default corrected; }\n")
-    (case / "system" / "fvSolution").write_text(
-        "FoamFile { version 2.0; format ascii; class dictionary; object fvSolution; }\nsolvers {}\n")
+    _write_grid_system(case, x0, x1, n)
 
     t_end = float(settings.get("time_end", 1.0))
     n_snap = int(settings.get("output_snapshots", 20)) or 1
@@ -381,3 +386,112 @@ def run_to_vtk(model, settings, output_dir, on_progress=None):
     ``zoomy_prepost``). Returns the ``.pvd`` collection path."""
     case, sm = _run_pipeline(model, settings, output_dir, on_progress)
     return _to_vtk(case, len(sm.state))[0]
+
+
+# ── Chorin split pipeline (non-hydrostatic VAM — the chorinFoam app) ─────────
+_OF_CHORIN_BIN = "$HOME/OpenFOAM/$(whoami)-13/platforms/linux64GccDPInt32Opt/bin/chorinFoam"
+
+
+def _codegen_chorin(model):
+    """Emit the Chorin split headers from a model with ``chorin_split``:
+    predictor ``Model.H`` + ``NumericsKernels.H`` + ``Pressure.H`` (ChorinPressure)
+    + ``Corrector.H`` (ChorinCorrector) + ``ChorinState.H`` (full n_state).
+    Mirrors ``create_model.py`` but from the model OBJECT (baked BCs).  Returns
+    ``(full_sm, n_state)``."""
+    import sympy as sp
+    from zoomy_core.systemmodel import SystemModel
+    from zoomy_core.transformation.to_openfoam import (
+        FoamSystemModelPrinter, FoamNumericsPrinter)
+    from zoomy_core.fvm.riemann_solvers import PositiveNonconservativeRusanov
+    # SystemModel.from_model (NOT model.system_model): the latter currently trips
+    # over VAM's dict-shaped interpolate_to_3d (core regression); from_model is the
+    # same coercion the explicit path uses and carries the baked BCs.
+    full = SystemModel.from_model(model)
+    n_state = len(full.state)
+    dt = sp.Symbol("dt", positive=True)
+    split = model.chorin_split(dt, system_model=full)
+    FoamSystemModelPrinter.write_code(split.SM_pred, FOAM_ROOT / "Model.H",
+                                      namespace_name="Model")
+    FoamNumericsPrinter.write_code(
+        PositiveNonconservativeRusanov(model=split.SM_pred),
+        FOAM_ROOT / "NumericsKernels.H")
+    FoamSystemModelPrinter.write_code(split.SM_press, FOAM_ROOT / "Pressure.H",
+                                      namespace_name="ChorinPressure", dt_symbol=dt)
+    FoamSystemModelPrinter.write_code(split.SM_corr, FOAM_ROOT / "Corrector.H",
+                                      namespace_name="ChorinCorrector")
+    (FOAM_ROOT / "ChorinState.H").write_text(
+        "#pragma once\n"
+        f"namespace Model {{ constexpr int n_state = {n_state}; }}\n")
+    return full, n_state
+
+
+def _wmake_chorin_cached():
+    """wmake the ``chorin_app`` (chorinFoam) for the current headers; cache by a
+    hash of the split headers + driver.  Returns the cached binary path."""
+    _BINCACHE.mkdir(exist_ok=True)
+    h = hashlib.sha256()
+    for name in ("Model.H", "Pressure.H", "Corrector.H", "ChorinState.H",
+                 "NumericsKernels.H", "chorin_app/chorinFoam.C"):
+        h.update((FOAM_ROOT / name).read_bytes())
+    cached = _BINCACHE / f"chorinFoam_{h.hexdigest()[:16]}"
+    if cached.exists():
+        return cached
+    r = _apptainer(
+        f"cd {FOAM_ROOT}/chorin_app; wclean >/dev/null 2>&1; wmake 2>&1 | tail -4 && "
+        f"cp {_OF_CHORIN_BIN} '{cached}'", capture_output=True, text=True)
+    if r.returncode != 0 or not cached.exists():
+        raise RuntimeError(f"chorinFoam wmake failed:\n{r.stdout}\n{r.stderr}")
+    return cached
+
+
+def _build_chorin_case(case, mesh, model, sm, settings):
+    if case.exists():
+        shutil.rmtree(case)
+    (case / "0").mkdir(parents=True); (case / "system").mkdir(); (case / "constant").mkdir()
+    x0, x1, n, order = _mesh_geometry(mesh)
+    _write_grid_system(case, x0, x1, n)
+
+    t_end = float(settings.get("time_end", 1.0))
+    n_snap = int(settings.get("output_snapshots", 20)) or 1
+    maxco = float(settings.get("cfl", 0.3))
+    dt0 = float(settings.get("min_dt", 1e-3)) or 1e-3
+    ptol = float(settings.get("pressure_tol", 1e-8))
+    pmaxit = int(settings.get("pressure_maxit", 2000))
+    params = _model_parameters(model, sm)
+    param_str = " ".join(f"{k} {v:g};" for k, v in params.items())
+    (case / "system" / "controlDict").write_text(
+        "FoamFile { version 2.0; format ascii; class dictionary; object controlDict; }\n"
+        "application chorinFoam;\n"
+        f"startFrom startTime; startTime 0; stopAt endTime; endTime {t_end}; deltaT {dt0};\n"
+        f"writeControl adjustableRunTime; writeInterval {t_end / n_snap:g}; purgeWrite 0;\n"
+        f"maxCo {maxco};\n"
+        f"pressureSolver bicgstab; pressureTol {ptol:g}; pressureMaxIter {pmaxit};\n"
+        f"modelParameters {{ {param_str} }}\n")
+
+    nc = int(mesh.n_inner_cells)
+    cc = np.asarray(mesh.cell_centers)[:, :nc]
+    Q = np.zeros((len(sm.state), nc))
+    Q = np.asarray(model.initial_conditions.apply(cc, Q))[:, order]
+    patches = {"left": "zeroGradient", "right": "zeroGradient",
+               "frontAndBack": "empty", "topAndBottom": "empty"}
+    for i in range(len(sm.state)):
+        _field_file(case, f"Q{i}", Q[i], patches)
+
+
+def run_chorin_to_vtk(model, settings, output_dir, on_progress=None):
+    """Chorin (pressure-projection) analog of :func:`run_to_vtk` — split codegen →
+    wmake chorin_app → case (8-state VAM) → chorinFoam → VTK series.  Returns the
+    ``.pvd`` path.  ``model`` must expose ``chorin_split`` (e.g. VAM)."""
+    from zoomy_core.mesh.lsq_mesh import LSQMesh
+    output_dir = Path(output_dir); output_dir.mkdir(parents=True, exist_ok=True)
+    mp = settings.get("mesh", "mesh.h5")
+    if not os.path.isabs(mp):
+        mp = os.path.join(settings.get("_case_dir", os.getcwd()), mp)
+    mesh = LSQMesh.from_hdf5(mp)
+
+    full, n_state = _codegen_chorin(model)
+    binary = _wmake_chorin_cached()
+    case = output_dir / "foam_case"
+    _build_chorin_case(case, mesh, model, full, settings)
+    _run_stream(case, binary, on_progress)
+    return _to_vtk(case, n_state)[0]
