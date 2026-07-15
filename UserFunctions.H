@@ -14,6 +14,14 @@
         (the prototype the whole pattern is modelled on).
       * eigensystem — numerical eigendecomposition of the normal-projected
         quasilinear matrix, for models with no closed-form spectrum (SME/VAM).
+      * solve — per-cell linear solve A^-1 b; the point-implicit source atom
+        (S_lin = (I - dt*J)^-1 S).
+
+    These are the complete set of opaque kernels core declares in
+    zoomy_core/model/kernel_functions.py, minus `conditional`, which the C++
+    printer emits inline as a ternary (generic_c.py) and so never reaches here.
+    tests/test_userfunctions_contract.py enumerates core's kernels and fails if
+    a new one appears unimplemented (REQ-168).
 
     There is NO `max_wavespeed` here — core dropped it (4e3e1f9) in favour of the
     generated `Numerics::local_max_abs_eigenvalue`, built from the model's
@@ -197,6 +205,64 @@ inline Foam::scalar eigensystem(I idx_, Ts... a_flat_args)
                     static_cast<Foam::scalar>(L(i, j));
 
         cache_key.assign(a_flat, a_flat + M);
+    }
+    return cache_out[idx];
+}
+
+// ── solve — opaque per-cell linear solve, the point-implicit source atom ──
+//
+// ``solve(idx, *A_flat, *b_flat)`` -> the idx-th component of A^-1 b, with
+// ``A`` the row-major n*n matrix (first n*n args after idx) and ``b`` the
+// length-n RHS (last n args); n is inferred from the arg count (n*n + n).
+//
+// This is the single backend-specific atom of the NSM point-implicit source
+// treatment: the linearised source ``S_lin = (I - dt*J)^-1 S`` emits one
+// ``solve(i, A_flat, b_flat)`` per row with ``A = I - dt*J``, ``b = S``.  Same
+// shape as ``eigensystem`` above: the printer emits the n component reads of
+// ONE cell with identical args, so a 1-slot cache makes them share a single
+// factorisation — and, as there, correctness depends on it, since all n
+// components must come from the SAME solve.  colPivHouseholderQr matches the
+// contract in zoomy_core/model/kernel_functions.py.
+template <typename I, typename... Ts>
+inline Foam::scalar solve(I idx_, Ts... ab_flat_args)
+{
+    const int idx = static_cast<int>(idx_);
+    const Foam::scalar ab[] = { static_cast<Foam::scalar>(ab_flat_args)... };
+    constexpr int M = sizeof...(ab_flat_args);
+
+    // M = n*n + n  =>  n = (-1 + sqrt(1 + 4M)) / 2
+    const int n =
+        static_cast<int>(std::lround((-1.0 + std::sqrt(1.0 + 4.0*double(M)))/2.0));
+    if (n*n + n != M)
+    {
+        FatalErrorInFunction
+            << "solve: arg count " << M << " is not n*n + n for integer n."
+            << Foam::exit(Foam::FatalError);
+    }
+
+    static thread_local std::vector<Foam::scalar> cache_key;
+    static thread_local std::vector<Foam::scalar> cache_out;
+    bool hit = (static_cast<int>(cache_key.size()) == M);
+    for (int k = 0; hit && k < M; ++k) hit = (cache_key[k] == ab[k]);
+
+    if (!hit)
+    {
+        Eigen::MatrixXd A(n, n);
+        for (int i = 0; i < n; ++i)
+            for (int j = 0; j < n; ++j)
+                A(i, j) = static_cast<double>(ab[i * n + j]);
+
+        Eigen::VectorXd b(n);
+        for (int i = 0; i < n; ++i)
+            b(i) = static_cast<double>(ab[n * n + i]);
+
+        const Eigen::VectorXd x = A.colPivHouseholderQr().solve(b);
+
+        cache_out.assign(n, 0.0);
+        for (int i = 0; i < n; ++i)
+            cache_out[i] = static_cast<Foam::scalar>(x(i));
+
+        cache_key.assign(ab, ab + M);
     }
     return cache_out[idx];
 }
