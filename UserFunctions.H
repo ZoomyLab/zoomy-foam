@@ -8,19 +8,25 @@
     the SWE<->VOF coupling functionObject) gets the opaque leaves resolved by
     including Numerics.H alone.
 
-    NOTE (transitional, mirrors the planned zoomy_core refactor):
+    The opaque leaves foam supplies:
       * compute_derivative — LSQ / Gauss-gradient spatial operator for the
         aux_registry; the canonical "opaque function the printer cannot inline"
         (the prototype the whole pattern is modelled on).
-      * max_wavespeed — TRANSITIONAL.  In the target the Rusanov dissipation
-        calls the *generated* `Numerics::local_max_abs_eigenvalue`, built by the
-        printer directly from `Model::eigenvalues`; the genuinely-opaque leaf is
-        then only `eigenvalues` itself, and `Model::eigenvalues` delegates to a
-        UserFunctions numerical spectrum (Eigen) when the model has no closed
-        form (SME).  SWE has a closed-form spectrum, so that delegation is unused
-        here.  `max_wavespeed` is kept for now ONLY because the current generated
-        kernels still emit `numerics::max_wavespeed(...)`; it disappears once the
-        printer switches to `local_max_abs_eigenvalue`.
+      * eigensystem — numerical eigendecomposition of the normal-projected
+        quasilinear matrix, for models with no closed-form spectrum (SME/VAM).
+
+    There is NO `max_wavespeed` here — core dropped it (4e3e1f9) in favour of the
+    generated `Numerics::local_max_abs_eigenvalue`, built from the model's
+    closed-form `eigenvalues` when it has one (SWE emits the exact
+    max(|u +- sqrt(g*h)|)).  When it does not, that kernel currently falls back
+    to a Gershgorin row-sum of the quasilinear matrix rather than calling
+    `eigensystem` below.  That matrix is dimensionally inhomogeneous (mass row
+    contributes a dimensionless 1, momentum row g*h), so at rest the row-sum
+    evaluates to max(1, 2*g*h) + |u| where the true speed is sqrt(g*h) + |u| —
+    too large by 2*sqrt(g*h) (3.65x at h=0.34 m, and it GROWS with depth).
+    Wiring that call site is core's (REQ-167 GAP 1); `eigensystem` below is
+    ready and dimension-agnostic, so foam needs no change when it lands.  The
+    bound is conservative: it costs dt and adds diffusion, it does not corrupt.
 \*---------------------------------------------------------------------------*/
 
 #include <algorithm>

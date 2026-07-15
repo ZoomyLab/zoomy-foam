@@ -14,7 +14,8 @@
     Numerics.H arrives, delete this shim — the consumer include does not change.
 
     Dependency flow:  Numerics.H -> Model.H
-                                  -> UserFunctions.H (max_wavespeed, …)
+                                  -> UserFunctions.H (compute_derivative,
+                                                      eigensystem)
                                   -> NumericsKernels.H (generated kernels)
 \*---------------------------------------------------------------------------*/
 
