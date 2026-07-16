@@ -16,6 +16,8 @@
 
 #include "fvc.H"
 #include "fvcGrad.H"
+#include "Pstream.H"
+#include "PstreamReduceOps.H"   // returnReduce / minOp — global dt across ranks
 
 // Opaque backend primitives (compute_derivative, eigensystem) from the
 // UserFunctions escape hatch.  Included BEFORE the generated Model.H because the
@@ -99,7 +101,9 @@ quasilinear_operator
     forAll(mesh.boundaryMesh(), patchI)
     {
         const Foam::polyPatch& pp = mesh.boundaryMesh()[patchI];
-        if (patchMap.found(pp.name()))
+        // Physical BC patches AND processor (coupled) patches carry a real face
+        // flux to integrate into the owner cell; empty/other patches do not.
+        if (patchMap.found(pp.name()) || mesh.boundary()[patchI].coupled())
         {
             forAll(pp, localFaceI)
             {
@@ -112,6 +116,27 @@ quasilinear_operator
 
     resultI /= mesh.V();
     return tResult;
+}
+
+// ── swap_coupled_halos — MPI halo exchange on processor patches ONLY ─────
+//
+// Sends/receives each field's owner-cell values across every processor
+// (coupled) patch, so ``patchNeighbourField()`` in the flux loops returns the
+// neighbour rank's up-to-date cell values.  Guarded by ``coupled()``, it never
+// touches a physical BC patch — the ghosts ``correct_boundary_q`` wrote survive.
+// A no-op in serial (no coupled patches exist), so the serial path is unchanged.
+inline void swap_coupled_halos(const Foam::List<Foam::volScalarField*>& fields)
+{
+    forAll(fields, i)
+    {
+        auto& bf = fields[i]->boundaryFieldRef();
+        forAll(bf, patchI)
+            if (bf[patchI].coupled())
+                bf[patchI].initEvaluate(Foam::Pstream::commsTypes::blocking);
+        forAll(bf, patchI)
+            if (bf[patchI].coupled())
+                bf[patchI].evaluate(Foam::Pstream::commsTypes::blocking);
+    }
 }
 
 // ── Per-face Riemann driver: write Dp/Dm from Numerics ──────────────────
@@ -139,6 +164,8 @@ inline void update_numerical_flux
 )
 {
     const Foam::fvMesh& mesh = Q[0]->mesh();
+    swap_coupled_halos(Q);          // MPI: neighbour cells at processor faces
+    swap_coupled_halos(Qaux);
 
     Foam::List<Foam::scalar> Q_minus(Q.size());
     Foam::List<Foam::scalar> Q_plus(Q.size());
@@ -175,14 +202,28 @@ inline void update_numerical_flux
         }
     }
 
-    // External (boundary) faces
+    // External (boundary) faces — physical BC patches AND processor (coupled)
+    // patches.  For a coupled patch the "plus" state is the NEIGHBOUR rank's
+    // cell value, fetched with patchNeighbourField() (an MPI halo swap); for a
+    // named BC patch it is the ghost that correct_boundary_q wrote.  The Riemann
+    // call is otherwise identical, so a processor face is just an interior face
+    // whose neighbour lives on another rank.
     auto patchMap = get_map_patchNameToPatchIndex();
     forAll(mesh.boundaryMesh(), patchI)
     {
         const Foam::polyPatch& pp = mesh.boundaryMesh()[patchI];
-        if (!patchMap.found(pp.name()))
+        const bool coupled = mesh.boundary()[patchI].coupled();
+        if (!coupled && !patchMap.found(pp.name()))
         {
             continue;
+        }
+        Foam::List<Foam::scalarField> qNei(Q.size()), qaNei(Qaux.size());
+        if (coupled)
+        {
+            forAll(Q, i)
+                qNei[i]  = Q[i]->boundaryField()[patchI].patchNeighbourField();
+            forAll(Qaux, i)
+                qaNei[i] = Qaux[i]->boundaryField()[patchI].patchNeighbourField();
         }
         forAll(pp, localFaceI)
         {
@@ -192,13 +233,14 @@ inline void update_numerical_flux
             forAll(Q, i)
             {
                 Q_minus[i] = (*Q[i])[cellI];
-                Q_plus[i]  = Q[i]->boundaryField()[patchI][localFaceI];
+                Q_plus[i]  = coupled ? qNei[i][localFaceI]
+                                     : Q[i]->boundaryField()[patchI][localFaceI];
             }
             forAll(Qaux, i)
             {
                 Qaux_minus[i] = (*Qaux[i])[cellI];
-                Qaux_plus[i]  = Qaux[i]->boundaryField()[patchI]
-                                        [localFaceI];
+                Qaux_plus[i]  = coupled ? qaNei[i][localFaceI]
+                                        : Qaux[i]->boundaryField()[patchI][localFaceI];
             }
 
             const auto F = Numerics::numerical_flux
@@ -391,6 +433,11 @@ inline Foam::scalar compute_dt
             dt = std::min(dt, dtFace);
         }
     }
+    // Global timestep: the whole decomposed domain must march on ONE dt, so
+    // take the min over every MPI rank.  Guarded to parallel runs so the serial
+    // path never enters Pstream collectives.
+    if (Foam::Pstream::parRun())
+        dt = Foam::returnReduce(dt, Foam::minOp<Foam::scalar>());
     return std::max(dt, Foam::scalar(1e-7));
 }
 

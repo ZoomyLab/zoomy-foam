@@ -93,9 +93,17 @@ def _codegen(model):
 
 # ── (b) build (hash-cached) ─────────────────────────────────────────────────
 def _headers_hash():
+    # Hash EVERY source that goes into the zoomyFoam binary, not just the
+    # generated pair — the hand-written headers (numerics*.H, init.H,
+    # UserFunctions.H, Numerics.H) change the binary too, and omitting them meant
+    # an edit there silently reused a stale cached binary.
     h = hashlib.sha256()
-    for name in ("Model.H", "NumericsKernels.H", "zoomyFoam.C"):
-        h.update((FOAM_ROOT / name).read_bytes())
+    for name in ("Model.H", "NumericsKernels.H", "Numerics.H", "numerics.H",
+                 "numerics_o2.H", "init.H", "UserFunctions.H", "zoomyFoam.C"):
+        f = FOAM_ROOT / name
+        if f.exists():
+            h.update(name.encode())
+            h.update(f.read_bytes())
     return h.hexdigest()[:16]
 
 
@@ -282,15 +290,34 @@ def _build_case(case, mesh, model, sm, settings, binary):
 
 
 # ── (d) run ─────────────────────────────────────────────────────────────────
-def _run_stream(case, binary, on_progress):
+def _run_stream(case, binary, on_progress, nprocs=1):
+    """blockMesh → (optionally decomposePar → mpirun -parallel → reconstructPar)
+    → stream the solver's per-step ``Time`` lines to ``on_progress``.
+
+    With ``nprocs > 1`` the case is decomposed (scotch, so it works for any mesh
+    dimension), run under ``mpirun -np N <binary> -parallel``, and reconstructed
+    back to the serial time dirs the VTK/HDF5 export consumes.  The solver is
+    dimension- and rank-agnostic (global dt via returnReduce, processor-patch
+    fluxes via patchNeighbourField), so a decomposed run reproduces serial."""
+    nprocs = int(nprocs or 1)
     _apptainer(f"cd {case}; blockMesh > log.blockMesh 2>&1", binds=[case], check=True)
+    if nprocs > 1:
+        (case / "system" / "decomposeParDict").write_text(
+            "FoamFile { version 2.0; format ascii; class dictionary; object decomposeParDict; }\n"
+            f"numberOfSubdomains {nprocs};\nmethod scotch;\n")
+        _apptainer(f"cd {case}; decomposePar -force > log.decomposePar 2>&1",
+                   binds=[case], check=True)
+        run_cmd = f"cd {case}; mpirun -np {nprocs} '{binary}' -parallel -case {case}"
+    else:
+        run_cmd = f"cd {case}; '{binary}' -case {case}"
     p = subprocess.Popen(
-        _apptainer_cmd(f"cd {case}; '{binary}' -case {case}", binds=[case]),
+        _apptainer_cmd(run_cmd, binds=[case]),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     log = (case / "run.log").open("w")
     it, prev_t = 0, 0.0
     # zoomyFoam prints `Time = <t>s` per step (adaptive dt, no separate deltaT
-    # line) — derive dt from consecutive report times.
+    # line) — derive dt from consecutive report times.  Under mpirun only the
+    # master rank prints Info, unprefixed, so the same regex matches.
     time_re = re.compile(r"^Time = ([-\d.eE+]+)")
     for line in p.stdout:
         log.write(line)
@@ -306,6 +333,11 @@ def _run_stream(case, binary, on_progress):
     p.wait(); log.close()
     if p.returncode != 0:
         raise RuntimeError(f"zoomyFoam failed (rc={p.returncode}); see {case/'run.log'}")
+    if nprocs > 1:
+        # Reconstruct the decomposed time dirs so the VTK/HDF5 export is identical
+        # to a serial run.
+        _apptainer(f"cd {case}; reconstructPar > log.reconstructPar 2>&1",
+                   binds=[case], check=True)
 
 
 # ── (e) VTK -> HDF5 ─────────────────────────────────────────────────────────
@@ -429,7 +461,7 @@ def _run_pipeline(model, settings, output_dir, on_progress):
     binary = _wmake_cached()
     case = output_dir / "foam_case"
     _build_case(case, mesh, model, sm, settings, binary)
-    _run_stream(case, binary, on_progress)
+    _run_stream(case, binary, on_progress, nprocs=int(settings.get("nprocs", 1)))
     return case, sm
 
 
@@ -548,5 +580,5 @@ def run_chorin_to_vtk(model, settings, output_dir, on_progress=None):
     binary = _wmake_chorin_cached()
     case = output_dir / "foam_case"
     _build_chorin_case(case, mesh, model, full, settings)
-    _run_stream(case, binary, on_progress)
+    _run_stream(case, binary, on_progress, nprocs=int(settings.get("nprocs", 1)))
     return _to_vtk(case, n_state)[0]

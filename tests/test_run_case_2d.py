@@ -77,3 +77,33 @@ def test_swe2d_dam_break_end_to_end(tmp_path):
     # radial symmetry of a circular dam: opposite quadrants match (bed flat, IC radial)
     assert np.allclose(hg, hg[::-1, :], atol=0.05)          # up/down mirror
     assert np.allclose(hg, hg[:, ::-1], atol=0.05)          # left/right mirror
+
+
+def _run_h(tmp_path, nprocs):
+    import h5py
+    from zoomy_core.mesh.base_mesh import BaseMesh
+    mp = tmp_path / f"mesh_{nprocs}.h5"
+    BaseMesh.create_2d(domain=DOMAIN, nx=NX, ny=NY).write_to_hdf5(str(mp))
+    out = tmp_path / f"np{nprocs}"
+    out.mkdir()
+    h5 = rc.run_case(
+        _swe2d_model(),
+        {"mesh": str(mp), "time_end": 0.15, "output_snapshots": 1,
+         "cfl": 0.45, "reconstruction_order": 1, "nprocs": nprocs},
+        out)
+    with h5py.File(h5, "r") as f:
+        its = sorted(f["fields"], key=lambda s: int(s.split("_")[1]))
+        return f["fields"][its[-1]]["Q"][:]
+
+
+@pytest.mark.skipif(not rc.SIF.exists(), reason="OpenFOAM apptainer image not available")
+def test_swe2d_mpi_matches_serial(tmp_path):
+    """The solver is rank-agnostic — a 2-processor decomposed run (scotch +
+    mpirun -parallel + reconstructPar, driven by the `nprocs` knob) must
+    reproduce the serial result BIT-for-BIT at order 1 (global dt via
+    returnReduce, processor-face fluxes via patchNeighbourField)."""
+    Q1 = _run_h(tmp_path, 1)
+    Q2 = _run_h(tmp_path, 2)
+    assert Q1.shape == Q2.shape
+    assert np.max(np.abs(Q1 - Q2)) < 1e-10, (
+        f"serial vs 2-proc differ by {np.max(np.abs(Q1 - Q2)):.2e}")

@@ -185,6 +185,8 @@ inline void update_numerical_flux_o2
 )
 {
     const Foam::fvMesh& mesh = Q[0]->mesh();
+    numerics::swap_coupled_halos(Q);        // MPI: neighbour cells at proc faces
+    numerics::swap_coupled_halos(Qaux);
 
     Foam::List<Foam::scalar> W_L(Model::n_dof_q), W_R(Q.size());
     Foam::List<Foam::scalar> Q_L(Model::n_dof_q), Q_R(Q.size());
@@ -235,13 +237,26 @@ inline void update_numerical_flux_o2
         }
     }
 
-    // Boundary faces — keep 1st-order (matches the no-reconstruction
-    // approach in the 1st-order path so BC dispatch is consistent).
+    // Boundary faces — physical BC patches AND processor (coupled) patches, both
+    // kept 1st-order (the no-reconstruction path, so BC dispatch is consistent;
+    // a processor face thus carries a 1-cell-halo 1st-order flux — a thin seam
+    // of reduced order at the decomposition boundary, still conservative).  For
+    // a coupled patch the "R" state is the neighbour rank's cell (patchNeighbour-
+    // Field); for a named BC patch it is the correct_boundary_q ghost.
     auto patchMap = get_map_patchNameToPatchIndex();
     forAll(mesh.boundaryMesh(), patchI)
     {
         const Foam::polyPatch& pp = mesh.boundaryMesh()[patchI];
-        if (!patchMap.found(pp.name())) continue;
+        const bool coupled = mesh.boundary()[patchI].coupled();
+        if (!coupled && !patchMap.found(pp.name())) continue;
+        Foam::List<Foam::scalarField> qNei(Q.size()), qaNei(Qaux.size());
+        if (coupled)
+        {
+            forAll(Q, i)
+                qNei[i]  = Q[i]->boundaryField()[patchI].patchNeighbourField();
+            forAll(Qaux, i)
+                qaNei[i] = Qaux[i]->boundaryField()[patchI].patchNeighbourField();
+        }
         forAll(pp, localFaceI)
         {
             const Foam::label& cellI = pp.faceCells()[localFaceI];
@@ -250,12 +265,14 @@ inline void update_numerical_flux_o2
             forAll(Q, i)
             {
                 Q_L[i] = (*Q[i])[cellI];
-                Q_R[i] = Q[i]->boundaryField()[patchI][localFaceI];
+                Q_R[i] = coupled ? qNei[i][localFaceI]
+                                 : Q[i]->boundaryField()[patchI][localFaceI];
             }
             forAll(Qaux, i)
             {
                 Qaux_L[i] = (*Qaux[i])[cellI];
-                Qaux_R[i] = Qaux[i]->boundaryField()[patchI][localFaceI];
+                Qaux_R[i] = coupled ? qaNei[i][localFaceI]
+                                    : Qaux[i]->boundaryField()[patchI][localFaceI];
             }
             const auto F  = Numerics::numerical_flux
                 (Q_L, Q_R, Qaux_L, Qaux_R, p, nb);

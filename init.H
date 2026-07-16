@@ -41,6 +41,11 @@ void initialize_fields(word runTimeName, const fvMesh& mesh, List<volScalarField
     {
         forAll(Q[QI]->boundaryField(), patchI)
         {
+            // Processor (coupled) patches carry the proper processorFvPatchField
+            // for MPI halo exchange — never overwrite them with zeroGradient/empty
+            // (an empty field on a face-carrying processor patch is invalid and
+            // crashes the first field op).  Only physical/empty patches are set.
+            if (Q[QI]->boundaryField()[patchI].coupled()) continue;
             const word& patchName = mesh.boundary()[patchI].name();
             if (findIndex(Model::map_boundary_tag_to_function_index, patchName) != -1)
             {
@@ -95,6 +100,8 @@ void initialize_fields(word runTimeName, const fvMesh& mesh, List<volScalarField
     {
         forAll(Qaux[QauxI]->boundaryField(), patchI)
         {
+            // Keep processor (coupled) patch fields intact — see the Q loop above.
+            if (Qaux[QauxI]->boundaryField()[patchI].coupled()) continue;
             const word& patchName = mesh.boundary()[patchI].name();
             if (findIndex(Model::map_boundary_tag_to_function_index, patchName) != -1)
             {
