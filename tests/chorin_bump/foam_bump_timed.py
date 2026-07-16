@@ -27,6 +27,11 @@ def main():
     log = (case / "run.log").read_text()
     exe = re.findall(r"ExecutionTime = ([\d.]+) s", log)
     clk = re.findall(r"ClockTime = (\d+) s", log)
+    dts = re.findall(r"deltaT = ([\d.eE+-]+)", log)
+    cos = re.findall(r"Courant Number mean: [\d.eE+-]+ max: ([\d.eE+-]+)", log)
+    nt = len(re.findall(r"^Time = ", log, re.M))
+    print(f"  foam steps={nt}  deltaT last={dts[-1] if dts else '?'}  "
+          f"Courant max last={cos[-1] if cos else '?'}")
     ts = read_times(case); times = sorted(ts)
     ha, b = analytic_h(xc)
     geth = lambda t: (np.full_like(xc, ts[t]["h"]) if np.isscalar(ts[t]["h"]) else ts[t]["h"])
