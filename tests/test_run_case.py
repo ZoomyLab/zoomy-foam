@@ -14,8 +14,18 @@ import pytest
 import zoomy_foam._pipeline as rc
 
 
+# A lake-at-rest IC whose three state rows are all DISTINCT, so the HDF5
+# round-trip can assert row IDENTITY, not just row count. bed=0.3 is a CONSTANT
+# bed (db/dx=0), so g*h*db/dx=0 and this stays exactly at rest at every order —
+# but 0.3 / 1.5 / 0.0 fingerprint b / h / hu uniquely.  This is the foam guard
+# for REQ-158 (vtk_to_hdf5 maps fields positionally; a prepended synthetic field
+# like foamToVTK's cellID would shift every row by one, and "ask for h, get b"
+# passes a mass check silently).  See _keep_state_rows in _pipeline.py.
+_IC_BED, _IC_DEPTH, _IC_HU = 0.3, 1.5, 0.0
+
+
 def _swe_model():
-    """A minimal SWE model instance with a flat-bed constant-depth IC.
+    """A minimal SWE model instance with a constant-bed lake-at-rest IC.
 
     Enough to exercise codegen + case build without asserting physics (the
     dam-break physics is covered by the SIF-gated end-to-end test)."""
@@ -33,7 +43,8 @@ def _swe_model():
             super()._initialize_derived_properties()
 
     m = _SWE1D()
-    m.initial_conditions = IC.Constant(constants=lambda n: np.array([0.0, 1.5, 0.0]))
+    m.initial_conditions = IC.Constant(
+        constants=lambda n: np.array([_IC_BED, _IC_DEPTH, _IC_HU]))
     m.aux_initial_conditions = IC.Constant(constants=lambda n: np.zeros(n))
     return m
 
@@ -66,11 +77,17 @@ def test_case_build_pure_python(tmp_path):
     cd = (case / "system" / "controlDict").read_text()
     assert "application zoomyFoam;" in cd and "endTime 0.8" in cd
     assert "reconstructionOrder 2" in cd and "maxCo 0.45" in cd and "g 9.81" in cd
-    # one 0/Qi per state variable, each nc long
+    # one 0/Qi per state variable, each nc long, written in state order:
+    # Q0=bed, Q1=depth, Q2=hu — the same order the HDF5 round-trip must preserve.
     assert sorted(os.listdir(case / "0")) == ["Q0", "Q1", "Q2"]
-    h = [float(v) for v in re.search(r"\(\s*(.*?)\s*\)",
-         (case / "0" / "Q1").read_text(), re.S).group(1).split()]
-    assert len(h) == 40 and all(abs(v - 1.5) < 1e-9 for v in h)
+
+    def _field(name):
+        return [float(v) for v in re.search(r"\(\s*(.*?)\s*\)",
+                (case / "0" / name).read_text(), re.S).group(1).split()]
+
+    assert all(abs(v - _IC_BED) < 1e-9 for v in _field("Q0"))
+    h = _field("Q1")
+    assert len(h) == 40 and all(abs(v - _IC_DEPTH) < 1e-9 for v in h)
 
 
 @pytest.mark.skipif(not rc.SIF.exists(), reason="OpenFOAM apptainer image not available")
@@ -93,3 +110,9 @@ def test_run_case_end_to_end(tmp_path):
         its = sorted(f["fields"], key=lambda s: int(s.split("_")[1]))
         Q = f["fields"][its[-1]]["Q"][:]
         assert Q.shape[0] == 3            # [b, h, hu] only — no cellID/diagnostics
+        # REQ-158 guard: rows must be [b, h, hu] BY IDENTITY, not just by count.
+        # A positional shift (foamToVTK's cellID leaking as row 0) would put the
+        # bed where h belongs; lake-at-rest keeps every row at its distinct IC.
+        assert np.allclose(Q[0], _IC_BED,   atol=1e-6), "row 0 is not the bed"
+        assert np.allclose(Q[1], _IC_DEPTH, atol=1e-6), "row 1 is not the depth"
+        assert np.allclose(Q[2], _IC_HU,    atol=1e-6), "row 2 is not hu"
