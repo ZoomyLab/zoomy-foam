@@ -58,6 +58,13 @@ int main()
     check("eigensystem sum lambda", l0 + l1, 0.0);      // trace
     check("eigensystem prod lambda", l0 * l1, -4.0);    // determinant
 
+    // ── eigenvalues(idx, *A_flat) -> lambda-only, same spectrum as eigensystem
+    const double e0 = numerics::eigenvalues(0, 0.0, 1.0, 4.0, 0.0);
+    const double e1 = numerics::eigenvalues(1, 0.0, 1.0, 4.0, 0.0);
+    check("eigenvalues max|lambda|", std::max(std::fabs(e0), std::fabs(e1)), 2.0);
+    check("eigenvalues sum", e0 + e1, 0.0);        // trace
+    check("eigenvalues prod", e0 * e1, -4.0);      // determinant
+
     // R and L must be mutually inverse — the Roe dissipation |A| = R|Lambda|L
     // is only consistent if they come from the SAME eigenbasis (the reason the
     // 1-slot cache exists).  (R*L)[0][0] and [0][1] of the 2x2 => I.

@@ -58,11 +58,40 @@ def test_split_guard_non_split_model():
                                     {"output": {"directory": "/tmp/x"}})
 
 
-def test_2d_mesh_not_implemented():
+def test_2d_mesh_descriptor(tmp_path):
+    """A 2-D {domain:[x0,x1,y0,y1], n_cells:[nx,ny]} descriptor is now accepted
+    (the solver is dimension-agnostic; only the structured builder was 1-D)."""
+    hs = solvers.HyperbolicSolver()
+    out = str(tmp_path / "out")
+    settings = {"output": {"directory": out}}
+    s = hs._foam_settings({"domain": [0.0, 10.0, 0.0, 4.0], "n_cells": [8, 4]},
+                          settings, hs._output_dir(settings))
+    from zoomy_core.mesh.lsq_mesh import LSQMesh
+    assert LSQMesh.from_hdf5(s["mesh"]).n_inner_cells == 8 * 4
+
+
+def test_3d_mesh_still_rejected():
     hs = solvers.HyperbolicSolver()
     with pytest.raises(NotImplementedError):
-        hs._foam_settings({"domain": [0, 1, 0, 1], "n_cells": [4, 4]},
+        hs._foam_settings({"domain": [0, 1, 0, 1, 0, 1], "n_cells": [4, 4, 4]},
                           {"output": {"directory": "/tmp/x"}}, "/tmp/x")
+
+
+def test_2d_mesh_geometry_ordering(tmp_path):
+    """_mesh_geometry recovers the 2-D box + n_cells and orders cells the way
+    OpenFOAM's `hex (nx ny 1)` block does (x fastest, y slowest)."""
+    from zoomy_core.mesh.base_mesh import BaseMesh
+    from zoomy_core.mesh.lsq_mesh import LSQMesh
+    mp = tmp_path / "m2.h5"
+    BaseMesh.create_2d(domain=(0.0, 10.0, 0.0, 4.0), nx=8, ny=4).write_to_hdf5(str(mp))
+    mesh = LSQMesh.from_hdf5(str(mp))
+    lo, hi, n, order, dim = rc._mesh_geometry(mesh)
+    assert dim == 2 and n == [8, 4]
+    assert (round(lo[0]), round(hi[0]), round(lo[1]), round(hi[1])) == (0, 10, 0, 4)
+    # cell centres in OF order must be non-decreasing in y, and x-fastest.
+    cc = np.asarray(mesh.cell_centers)[:, :mesh.n_inner_cells][:, order]
+    assert np.all(np.diff(cc[1]) >= -1e-9)                      # y non-decreasing
+    assert np.allclose(cc[0][:8], sorted(cc[0][:8]))            # first y-row sorted in x
 
 
 @pytest.mark.skipif(not rc.SIF.exists(), reason="OpenFOAM apptainer image not available")

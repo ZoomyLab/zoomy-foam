@@ -16,10 +16,10 @@ Design (gui REQ-133, user-approved 2026-07-13):
     is always honored; ``settings.time_end`` / ``settings.mesh.n_cells`` carry the
     run/grid properties.  Model-/scheme-specific things (reconstruction,
     eigenvalues, sources, IC, BC) come from the MODEL symbolically.
-  * ``mesh`` is a descriptor ``{"domain": [x0, x1], "n_cells": [n]}`` (structured
-    1-D interval — the shared SWE/SME channel cases).  RESOLUTION always comes
-    from the mesh/settings, never a solver param.  A 2-D / ``.msh`` case goes
-    through ``gmshToFoam`` — a documented follow-up.
+  * ``mesh`` is a descriptor ``{"domain": [x0,x1(,y0,y1)], "n_cells": [nx(,ny)]}``
+    — a structured 1-D interval OR 2-D quad grid (dimension = ``len(n_cells)``).
+    RESOLUTION always comes from the mesh/settings, never a solver param.  A 3-D
+    or unstructured ``.msh`` case goes through ``gmshToFoam`` — a follow-up.
   * NO case knowledge lives here — the wrapper owns codegen → controlDict →
     wmake → run → VTK; case physics (walls, inflow) are BCs on the MODEL.
 """
@@ -46,27 +46,35 @@ def _get(obj, dotted, default=None):
 
 
 def _domain_ncells(mesh, settings):
-    """Resolve ``mesh`` → (domain=[x0,x1], n).  Descriptor only for now; a
-    ``.msh`` (2-D via gmshToFoam) is a documented follow-up."""
-    if isinstance(mesh, dict):
-        domain = list(mesh["domain"])
-        n_cells = mesh["n_cells"]
-    else:
+    """Resolve ``mesh`` → (domain, n_cells, dim) for a structured 1-D or 2-D grid.
+
+    ``mesh`` is a ``{'domain': [x0,x1(,y0,y1)], 'n_cells': [nx(,ny)]}`` descriptor
+    (dimension = ``len(n_cells)``).  A 3-D or unstructured case must come as a
+    gmsh ``.msh`` (gmshToFoam) — a documented follow-up."""
+    if not isinstance(mesh, dict):
         raise NotImplementedError(
-            "zoomy_foam solvers build a structured 1-D blockMesh from a "
-            "{'domain': [x0, x1], 'n_cells': [n]} descriptor; a 2-D / .msh case "
-            "(gmshToFoam) is a follow-up (REQ-133).")
-    if len(domain) != 2:
+            "zoomy_foam solvers build a structured grid from a "
+            "{'domain': [x0,x1(,y0,y1)], 'n_cells': [nx(,ny)]} descriptor; a "
+            ".msh case (gmshToFoam) is a follow-up.")
+    domain = list(mesh["domain"])
+    n_cells = mesh["n_cells"]
+    n_cells = [int(v) for v in n_cells] if isinstance(n_cells, (list, tuple)) \
+        else [int(n_cells)]
+    dim = len(n_cells)
+    if dim > 2:
         raise NotImplementedError(
-            "zoomy_foam solvers currently build a 1-D interval blockMesh only "
-            f"(got a {len(domain) // 2}-D domain); 2-D via gmshToFoam is a follow-up.")
-    n = int(n_cells[0] if isinstance(n_cells, (list, tuple)) else n_cells)
-    return domain, n
+            "zoomy_foam structured build handles 1-D and 2-D; a 3-D case must "
+            "come as a gmsh .msh for gmshToFoam.")
+    if len(domain) != 2 * dim:
+        raise ValueError(
+            f"domain {domain} has {len(domain)} bounds; expected {2 * dim} "
+            f"for a {dim}-D n_cells={n_cells}.")
+    return domain, n_cells, dim
 
 
 class _BaseSolver(param.Parameterized):
-    """Shared ``settings`` → foam-pipeline translation (writes the 1-D mesh.h5
-    the pipeline consumes, and maps the structured output group)."""
+    """Shared ``settings`` → foam-pipeline translation (writes the structured
+    mesh.h5 the pipeline consumes, and maps the structured output group)."""
 
     def _output_dir(self, settings):
         d = _get(settings, "output.directory")
@@ -76,17 +84,28 @@ class _BaseSolver(param.Parameterized):
         return d
 
     def _foam_settings(self, mesh, settings, output_dir):
-        domain, n = _domain_ncells(mesh, settings)
+        domain, n_cells, dim = _domain_ncells(mesh, settings)
         from zoomy_core.mesh.base_mesh import BaseMesh
         mp = Path(output_dir) / "mesh.h5"
-        BaseMesh.create_1d(domain=(domain[0], domain[1]),
-                           n_inner_cells=n).write_to_hdf5(str(mp))
-        return {
+        if dim == 1:
+            bm = BaseMesh.create_1d(domain=(domain[0], domain[1]),
+                                    n_inner_cells=n_cells[0])
+        else:
+            bm = BaseMesh.create_2d(domain=tuple(domain),
+                                    nx=n_cells[0], ny=n_cells[1])
+        bm.write_to_hdf5(str(mp))
+        out = {
             "mesh": str(mp),
             "time_end": _get(settings, "time_end", 1.0),
             "output_snapshots": _get(settings, "output.snapshots", 10),
             "min_dt": _get(settings, "min_dt", 1e-3),
         }
+        # BC patch names must match the model's tags; a case may override the
+        # per-axis defaults (left/right | West/East/South/North).
+        fn = _get(settings, "face_names")
+        if fn:
+            out["face_names"] = list(fn)
+        return out
 
 
 class HyperbolicSolver(_BaseSolver):

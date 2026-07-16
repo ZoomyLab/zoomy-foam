@@ -12,8 +12,10 @@
       * compute_derivative — LSQ / Gauss-gradient spatial operator for the
         aux_registry; the canonical "opaque function the printer cannot inline"
         (the prototype the whole pattern is modelled on).
-      * eigensystem — numerical eigendecomposition of the normal-projected
-        quasilinear matrix, for models with no closed-form spectrum (SME/VAM).
+      * eigensystem — numerical eigendecomposition (lambda, R, L) of the
+        normal-projected quasilinear matrix, for models with no closed-form
+        spectrum (SME/VAM).
+      * eigenvalues — the lambda-only companion of eigensystem (wave speed / CFL).
       * solve — per-cell linear solve A^-1 b; the point-implicit source atom
         (S_lin = (I - dt*J)^-1 S).
 
@@ -203,6 +205,47 @@ inline Foam::scalar eigensystem(I idx_, Ts... a_flat_args)
             for (int j = 0; j < n; ++j)
                 cache_out[n + n * n + i * n + j] =
                     static_cast<Foam::scalar>(L(i, j));
+
+        cache_key.assign(a_flat, a_flat + M);
+    }
+    return cache_out[idx];
+}
+
+// ── eigenvalues — λ-only companion of eigensystem, for the wave speed ─────
+//
+// ``eigenvalues(idx, *A_flat)`` -> real part of the idx-th eigenvalue of the
+// row-major n*n matrix A_flat (n = sqrt(M)).  The wave-speed / CFL bound
+// max|lambda_i(A_n)| needs only the spectrum, so this skips eigensystem's
+// eigenvector solve and the R^-1 (the part that can fail near wet/dry) — ~2/3
+// less work per face.  Same 1-slot cache: the printer emits the n component
+// reads of ONE face with identical args, and they share a single decomposition.
+template <typename I, typename... Ts>
+inline Foam::scalar eigenvalues(I idx_, Ts... a_flat_args)
+{
+    const int idx = static_cast<int>(idx_);
+    const Foam::scalar a_flat[] = { static_cast<Foam::scalar>(a_flat_args)... };
+    constexpr int M = sizeof...(a_flat_args);
+    const int n = static_cast<int>(std::lround(std::sqrt(double(M))));
+
+    static thread_local std::vector<Foam::scalar> cache_key;
+    static thread_local std::vector<Foam::scalar> cache_out;
+    bool hit = (static_cast<int>(cache_key.size()) == M);
+    for (int k = 0; hit && k < M; ++k) hit = (cache_key[k] == a_flat[k]);
+
+    if (!hit)
+    {
+        Eigen::MatrixXd A(n, n);
+        for (int i = 0; i < n; ++i)
+            for (int j = 0; j < n; ++j)
+                A(i, j) = static_cast<double>(a_flat[i * n + j]);
+
+        // eigenvectors OFF — this is the whole point of the lighter kernel.
+        Eigen::EigenSolver<Eigen::MatrixXd> solver(A, /*computeEigenvectors=*/false);
+        const Eigen::VectorXd w = solver.eigenvalues().real();
+
+        cache_out.assign(n, 0.0);
+        for (int i = 0; i < n; ++i)
+            cache_out[i] = static_cast<Foam::scalar>(w(i));
 
         cache_key.assign(a_flat, a_flat + M);
     }

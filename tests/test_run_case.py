@@ -67,8 +67,9 @@ def test_case_build_pure_python(tmp_path):
     mp = tmp_path / "mesh.h5"
     BaseMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=40).write_to_hdf5(str(mp))
     mesh = LSQMesh.from_hdf5(str(mp))
-    x0, x1, n, _order = rc._mesh_geometry(mesh)
-    assert (round(x0), round(x1), n) == (0, 10, 40)
+    lo, hi, n, _order, dim = rc._mesh_geometry(mesh)
+    assert dim == 1
+    assert (round(lo[0]), round(hi[0]), n[0]) == (0, 10, 40)
 
     case = tmp_path / "foam_case"
     rc._build_case(case, mesh, model, sm,

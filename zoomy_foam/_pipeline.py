@@ -117,42 +117,86 @@ def _wmake_cached():
 
 
 # ── (c) case build ──────────────────────────────────────────────────────────
-def _mesh_geometry(mesh):
-    """(x0, x1, n) for a uniform 1-D interval mesh from an LSQMesh.
+def _default_face_names(dim):
+    """Side-patch names in axis order (x-lo, x-hi[, y-lo, y-hi]).  1-D keeps the
+    historical left/right; 2-D uses the compass tags the shared cases already
+    tag their BCs with (mesh.FACE_NAMES = West/East/South/North)."""
+    return ("left", "right") if dim == 1 else ("West", "East", "South", "North")
 
-    Only structured 1-D is handled here (the shared SWE/SME channel cases); a
-    genuine 2-D/unstructured mesh should come in as a gmsh ``.msh`` and go
-    through ``gmshToFoam`` — raised as NotImplementedError until wired."""
+
+def _mesh_geometry(mesh):
+    """Structured-grid geometry for a uniform 1-D or 2-D LSQMesh.
+
+    Returns ``(lo, hi, n, order, dim)``: ``lo/hi/n`` are per-active-axis lists
+    (x, then y), ``order`` maps the LSQMesh cell order to OpenFOAM's blockMesh
+    order (x fastest, y slowest — ``hex (nx ny 1)``), ``dim`` in {1, 2}.  The
+    foam SOLVER is dimension-agnostic (it reads the full face normal); only this
+    structured-grid builder is bounded — a 3-D or unstructured case must arrive
+    as a gmsh ``.msh`` and go through ``gmshToFoam``."""
     nc = int(mesh.n_inner_cells)
     cc = np.asarray(mesh.cell_centers)[:, :nc]
-    xc = cc[0]
-    y_flat = np.allclose(cc[1], cc[1][0]) if cc.shape[0] > 1 else True
-    z_flat = np.allclose(cc[2], cc[2][0]) if cc.shape[0] > 2 else True
-    if not (y_flat and z_flat):
+    active = [ax for ax in range(min(cc.shape[0], 3))
+              if not np.allclose(cc[ax], cc[ax][0])] or [0]
+    if active != list(range(len(active))):
         raise NotImplementedError(
-            "zoomy_foam.run_case currently builds structured 1-D blockMesh only; "
-            "a 2-D/unstructured case must be supplied as a gmsh .msh for gmshToFoam.")
-    order = np.argsort(xc)
-    xc = xc[order]
-    dx = float(np.mean(np.diff(xc))) if nc > 1 else 1.0
-    return float(xc.min() - dx / 2), float(xc.max() + dx / 2), nc, order
+            "zoomy_foam builds structured grids with contiguous active axes "
+            "(1-D in x, 2-D in x–y); supply a gmsh .msh for anything else.")
+    dim = len(active)
+    if dim > 2:
+        raise NotImplementedError(
+            "zoomy_foam structured build handles 1-D and 2-D; a 3-D or "
+            "unstructured case must come as a gmsh .msh for gmshToFoam.")
+    lo, hi, n = [], [], []
+    for ax in active:
+        u = np.unique(np.round(cc[ax], 9))
+        d = float(np.mean(np.diff(u))) if len(u) > 1 else 1.0
+        lo.append(float(u.min() - d / 2))
+        hi.append(float(u.max() + d / 2))
+        n.append(int(len(u)))
+    # OF cell order for hex (nx ny 1) is x-fastest, y-slowest.  lexsort's LAST
+    # key is primary, so keys (x, y) sort by y then x — exactly that order.
+    order = np.lexsort(tuple(cc[ax] for ax in active))
+    return lo, hi, n, order, dim
 
 
-def _write_grid_system(case, x0, x1, n):
-    """Structured 1-D blockMeshDict + minimal fvSchemes/fvSolution (shared by the
-    explicit and Chorin case builders)."""
+def _write_grid_system(case, lo, hi, n, dim=1, face_names=None):
+    """Structured blockMeshDict (1-D interval or 2-D quad grid) + minimal
+    fvSchemes/fvSolution, shared by the explicit and Chorin builders.
+
+    The mesh box is ``[lo, hi]`` on each active axis; the y (1-D only) and z (all)
+    directions are a single ``empty`` cell so OpenFOAM's operators run in the
+    intended dimension.  ``face_names`` names the ``2*dim`` side patches in axis
+    order — they MUST match the model's BC tags, else the solver's name-based BC
+    dispatch (init.H) leaves them at the field default (zeroGradient)."""
+    fn = tuple(face_names) if face_names else _default_face_names(dim)
+    x0, x1 = lo[0], hi[0]
+    if dim >= 2:
+        y0, y1, nx, ny = lo[1], hi[1], n[0], n[1]
+    else:
+        y0, y1, nx, ny = 0.0, 1.0, n[0], 1
+    # 8 hex vertices of [x0,x1]×[y0,y1]×[0,1].
+    verts = [(x0, y0, 0), (x1, y0, 0), (x1, y1, 0), (x0, y1, 0),
+             (x0, y0, 1), (x1, y0, 1), (x1, y1, 1), (x0, y1, 1)]
+    vtxt = "".join(f"({vx} {vy} {vz})" for vx, vy, vz in verts)
+    # Hex face vertex-loops: x-lo/x-hi, y-lo/y-hi, z-lo/z-hi.
+    xlo, xhi = "(0 4 7 3)", "(1 2 6 5)"
+    ylo, yhi = "(0 1 5 4)", "(3 7 6 2)"
+    zfaces = "(0 3 2 1) (4 5 6 7)"
+    patches = [f"  {fn[0]} {{ type patch; faces ( {xlo} ); }}",
+               f"  {fn[1]} {{ type patch; faces ( {xhi} ); }}"]
+    if dim >= 2:
+        patches += [f"  {fn[2]} {{ type patch; faces ( {ylo} ); }}",
+                    f"  {fn[3]} {{ type patch; faces ( {yhi} ); }}",
+                    f"  frontAndBack {{ type empty; faces ( {zfaces} ); }}"]
+    else:
+        patches += [f"  frontAndBack {{ type empty; faces ( {ylo} {yhi} ); }}",
+                    f"  topAndBottom {{ type empty; faces ( {zfaces} ); }}"]
     (case / "system" / "blockMeshDict").write_text(
         "FoamFile { version 2.0; format ascii; class dictionary; object blockMeshDict; }\n"
         "convertToMeters 1;\n"
-        f"vertices ( ({x0} 0 0)({x1} 0 0)({x1} 1 0)({x0} 1 0)"
-        f"({x0} 0 1)({x1} 0 1)({x1} 1 1)({x0} 1 1) );\n"
-        f"blocks ( hex (0 1 2 3 4 5 6 7) ({n} 1 1) simpleGrading (1 1 1) );\n"
-        "edges (); boundary (\n"
-        "  left  { type patch; faces ( (0 4 7 3) ); }\n"
-        "  right { type patch; faces ( (1 2 6 5) ); }\n"
-        "  frontAndBack { type empty; faces ( (0 1 5 4) (3 7 6 2) ); }\n"
-        "  topAndBottom { type empty; faces ( (0 3 2 1) (4 5 6 7) ); }\n"
-        "); mergePatchPairs ();\n")
+        f"vertices ( {vtxt} );\n"
+        f"blocks ( hex (0 1 2 3 4 5 6 7) ({nx} {ny} 1) simpleGrading (1 1 1) );\n"
+        "edges (); boundary (\n" + "\n".join(patches) + "\n); mergePatchPairs ();\n")
     (case / "system" / "fvSchemes").write_text(
         "FoamFile { version 2.0; format ascii; class dictionary; object fvSchemes; }\n"
         "ddtSchemes { default none; } gradSchemes { default Gauss linear; }\n"
@@ -197,8 +241,9 @@ def _build_case(case, mesh, model, sm, settings, binary):
     if case.exists():
         shutil.rmtree(case)
     (case / "0").mkdir(parents=True); (case / "system").mkdir(); (case / "constant").mkdir()
-    x0, x1, n, order = _mesh_geometry(mesh)
-    _write_grid_system(case, x0, x1, n)
+    lo, hi, n, order, dim = _mesh_geometry(mesh)
+    face_names = settings.get("face_names") or _default_face_names(dim)
+    _write_grid_system(case, lo, hi, n, dim, face_names)
 
     t_end = float(settings.get("time_end", 1.0))
     n_snap = int(settings.get("output_snapshots", 20)) or 1
@@ -228,8 +273,9 @@ def _build_case(case, mesh, model, sm, settings, binary):
     Q = np.zeros((len(sm.state), nc))
     Q = model.initial_conditions.apply(cc, Q)
     Q = np.asarray(Q)[:, order]
-    patches = {"left": "zeroGradient", "right": "zeroGradient",
-               "frontAndBack": "empty", "topAndBottom": "empty"}
+    patches = {**{fnm: "zeroGradient" for fnm in face_names}, "frontAndBack": "empty"}
+    if dim == 1:
+        patches["topAndBottom"] = "empty"
     for i in range(len(sm.state)):
         _field_file(case, f"Q{i}", Q[i], patches)
     return binary
@@ -455,8 +501,9 @@ def _build_chorin_case(case, mesh, model, sm, settings):
     if case.exists():
         shutil.rmtree(case)
     (case / "0").mkdir(parents=True); (case / "system").mkdir(); (case / "constant").mkdir()
-    x0, x1, n, order = _mesh_geometry(mesh)
-    _write_grid_system(case, x0, x1, n)
+    lo, hi, n, order, dim = _mesh_geometry(mesh)
+    face_names = _default_face_names(dim)
+    _write_grid_system(case, lo, hi, n, dim, face_names)
 
     t_end = float(settings.get("time_end", 1.0))
     n_snap = int(settings.get("output_snapshots", 20)) or 1
@@ -479,8 +526,9 @@ def _build_chorin_case(case, mesh, model, sm, settings):
     cc = np.asarray(mesh.cell_centers)[:, :nc]
     Q = np.zeros((len(sm.state), nc))
     Q = np.asarray(model.initial_conditions.apply(cc, Q))[:, order]
-    patches = {"left": "zeroGradient", "right": "zeroGradient",
-               "frontAndBack": "empty", "topAndBottom": "empty"}
+    patches = {**{fnm: "zeroGradient" for fnm in face_names}, "frontAndBack": "empty"}
+    if dim == 1:
+        patches["topAndBottom"] = "empty"
     for i in range(len(sm.state)):
         _field_file(case, f"Q{i}", Q[i], patches)
 
