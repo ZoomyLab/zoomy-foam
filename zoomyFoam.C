@@ -19,7 +19,9 @@ Description
 
 \*---------------------------------------------------------------------------*/
 
+#include <cmath>
 #include <string>
+#include <vector>
 #include "UList.H"
 #include "argList.H"
 #include "dimensionSets.H"
@@ -175,6 +177,21 @@ int main(int argc, char *argv[])
         runTime.controlDict().lookupOrDefault<label>("reconstructionOrder", 1);
     Info<< "reconstructionOrder = " << reconstructionOrder << endl;
 
+    // a-posteriori positivity limiter.  "mood" turns on the local-MOOD wet/dry
+    // safeguard in the order-2 explicit path (inert at order 1, which is already
+    // positive via Audusse HR); "none" (default) leaves the scheme untouched.
+    const word positivity =
+        runTime.controlDict().lookupOrDefault<word>("positivity", word("none"));
+    const bool moodPositivity =
+        (positivity == "mood") && (reconstructionOrder >= 2);
+    if (positivity == "mood")
+    {
+        Info<< "positivity = mood  (local a-posteriori MOOD, "
+            << (moodPositivity ? "active" : "inert at order 1") << ")" << endl;
+    }
+    // Depth row: Q0 = bed, Q1 = h for every shallow model here (SWE/SME/VAM).
+    const label hIndex = 1;
+
     // Time integration scheme.  "explicit" (default) folds the source into the
     // explicit RHS and integrates everything with forward-Euler / SSP-RK2.
     // "imex" runs a genuine additive IMEX Runge–Kutta (ARS family, see
@@ -268,12 +285,12 @@ int main(int argc, char *argv[])
     // This is the explicit RHS of dQ/dt = L(Q).  Under IMEX the source is handled
     // implicitly after the hyperbolic stage, so it is excluded here
     // (includeSource = false) and the explicit RHS carries flux + NCP only.
-    auto compute_rhs = [&](bool includeSource)
+    auto compute_rhs = [&](bool includeSource, label order)
     {
         Model::update_aux_variables(Q, Qaux, dtAux, mesh);
         if (includeSource) numerics::update_source(Src, Q, Qaux, p);
         else forAll(Src, i) Src[i]->primitiveFieldRef() = 0.0;
-        if (reconstructionOrder >= 2)
+        if (order >= 2)
         {
             // Reconstruct ALL model reconstruction-variables — no
             // hand-crafted per-slot skipping.  Well-balancing is the
@@ -303,6 +320,78 @@ int main(int argc, char *argv[])
             L[i] = Src[i]->primitiveField() - tDiv().primitiveField()
                  - NCcell[i]->primitiveField();
         }
+    };
+
+    // ── a-posteriori local-MOOD scratch + limiter (see call site) ────────────
+    // Qcand holds the order-2 candidate while the 1st-order fallback RHS is
+    // evaluated at Qold; moodMask flags the troubled cells to override.
+    List<scalarField> Qcand(Model::n_dof_q);
+    std::vector<unsigned char> moodMask(mesh.nCells(), 0);
+    if (moodPositivity)
+        forAll(Q, i) Qcand[i] = scalarField(mesh.nCells(), 0.0);
+
+    // Per-step ``Model::update_variables`` hook, applied to every cell each step
+    // exactly as the numpy/jax solvers do and dmplex does in UpdateState — the
+    // missing seam that made foam the only backend not to call it.  It is the
+    // model's per-cell state map, and it must be NEUTRAL: it does NOT truncate h
+    // and is NOT a wet/dry safety net (the 1/h desingularization lives in the
+    // NumericalSystemModel's ``hinv`` aux, not here).  For every model currently
+    // built it is the identity (verified no-op), so wiring it changes nothing;
+    // it exists so a model that legitimately needs a per-step variable update
+    // gets one, at parity with the other backends.
+    auto apply_update_variables = [&](scalar dt)
+    {
+        Foam::List<Foam::scalar> qc(Q.size()), qac(Qaux.size());
+        for (label c = 0; c < mesh.nCells(); ++c)
+        {
+            forAll(Q, i)    qc[i]  = Q[i]->primitiveField()[c];
+            forAll(Qaux, i) qac[i] = Qaux[i]->primitiveField()[c];
+            const auto r = Model::update_variables(qc, qac, p, dt);
+            forAll(Q, i) Q[i]->primitiveFieldRef()[c] = r[i];
+        }
+    };
+
+    // Detect h<0 (PAD) / non-finite (CAD) cells in the current (candidate) Q and
+    // override ONLY those with a 1st-order forward-Euler update from Qold (Q^n).
+    // A single pass suffices: the override touches only troubled cells and leaves
+    // healthy neighbours' order-2 values intact, so it cannot seed a new one.
+    auto apply_mood = [&](scalar dt)
+    {
+        label nt = 0;
+        for (label c = 0; c < mesh.nCells(); ++c)
+        {
+            bool bad = (Q[hIndex]->primitiveField()[c] < -1.0e-10);
+            for (label i = 0; i < Q.size() && !bad; ++i)
+                if (!std::isfinite(Q[i]->primitiveField()[c])) bad = true;
+            moodMask[c] = bad ? 1 : 0;
+            if (bad) ++nt;
+        }
+        if (nt == 0) return;
+        Info<< "[MOOD] troubled = " << nt << endl;
+
+        // Stash the order-2 candidate, evaluate a 1st-order RHS at Q^n.
+        forAll(Q, i) Qcand[i] = Q[i]->primitiveField();
+        forAll(Q, i) Q[i]->primitiveFieldRef() = Qold[i];
+        numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
+        compute_rhs(true, 1);        // L = 1st-order forward-Euler RHS from Q^n
+
+        // Override troubled cells; untroubled cells keep the order-2 candidate.
+        forAll(Q, i)
+        {
+            scalarField qn = Qcand[i];
+            forAll(qn, c) if (moodMask[c]) qn[c] = Qold[i][c] + dt * L[i][c];
+            Q[i]->primitiveFieldRef() = qn;
+        }
+        numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
+
+        // Single-pass invariant check (dmplex diagnostic): the O1 step from Q^n
+        // at CFL<=0.5 is itself positive, so this should never fire.
+        label nt2 = 0;
+        for (label c = 0; c < mesh.nCells(); ++c)
+            if (Q[hIndex]->primitiveField()[c] < -1.0e-10) ++nt2;
+        if (nt2 > 0)
+            Info<< "[MOOD] WARNING still troubled = " << nt2
+                << " after override" << endl;
     };
 
     const scalar endTime = runTime.endTime().value();
@@ -396,7 +485,7 @@ int main(int argc, char *argv[])
             // Evaluate the stage RHS pair K_E=f_E(Q), K_I=f_I(Q) at current Q.
             auto eval_stage = [&](label st)
             {
-                compute_rhs(false);          // updates aux; L = f_E (no source)
+                compute_rhs(false, reconstructionOrder);  // aux; L = f_E (no source)
                 numerics::update_source(Src, Q, Qaux, p);  // f_I at same aux
                 forAll(Q, i)
                 {
@@ -459,7 +548,7 @@ int main(int argc, char *argv[])
             forAll(Q, i) Qold[i] = Q[i]->primitiveField();
 
             // Stage 1
-            compute_rhs(true);
+            compute_rhs(true, reconstructionOrder);
             forAll(Q, i)
             {
                 Q[i]->primitiveFieldRef() = Qold[i] + dt_used * L[i];
@@ -467,24 +556,41 @@ int main(int argc, char *argv[])
             numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
 
             // Stage 2 — L evaluated at Q*
-            compute_rhs(true);
+            compute_rhs(true, reconstructionOrder);
             forAll(Q, i)
             {
                 Q[i]->primitiveFieldRef() =
                     0.5 * (Qold[i] + Q[i]->primitiveField() + dt_used * L[i]);
             }
             numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
+
+            // ── a-posteriori LOCAL MOOD positivity (port of dmplex
+            // MUSCLSolver.hpp:124-245 / TransportStep.hpp FormRHSTroubledO1).
+            // The order-2 SSP-RK2 candidate above stands for the healthy domain;
+            // any cell left with h<0 (PAD) or non-finite (CAD) is OVERRIDDEN by a
+            // local 1st-order forward-Euler update from Qold (Q^n).  Only troubled
+            // cells change — a troubled cell's own faces are all troubled-adjacent,
+            // so a full order-1 RHS gives them the identical value dmplex's
+            // face-filtered RHS would (the filter is a pure efficiency device).
+            // Untroubled cells keep 2nd order; the overridden near-dry cells carry
+            // ~zero flux, so mass stays at machine precision (dmplex: 8.8e-16).
+            if (moodPositivity) apply_mood(dt_used);
         }
         else
         {
             // Explicit forward Euler, source folded in.
-            compute_rhs(true);
+            compute_rhs(true, reconstructionOrder);
             forAll(Q, i)
             {
                 Q[i]->primitiveFieldRef() += dt_used * L[i];
             }
             numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
         }
+
+        // Per-step model variable hook, applied after every scheme branch at
+        // parity with numpy/jax/dmplex (identity for every model built today, so
+        // a strict no-op — see the lambda's note).
+        apply_update_variables(dt_used);
 
         // Push the post-solve local interface state, then advance the
         // coupling.  All no-ops when inactive.

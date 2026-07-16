@@ -216,11 +216,11 @@ inline void update_numerical_flux_o2
         Q_L = Model::state_from_reconstruction(W_L, Qaux_L, p);
         Q_R = Model::state_from_reconstruction(W_R, Qaux_R, p);
 
-        // (No hand-crafted positivity guard here — that was a C++
-        // special-case keyed on a hardcoded depth index, and it wrongly
-        // fired across still-water regions for plain SWE.  Wet/dry
-        // positivity belongs in the model-emitted reconstruction /
-        // limiter, not in the solver.)
+        // (Wet/dry robustness lives in the emitted kernels — the NumericalSystem
+        // Model's desingularized ``hinv`` aux and the max(0,·)/max(eps,·) guards
+        // on the wave speed — NOT in a solver-side reconstruction special-case.
+        // MOOD then repairs any cell whose AVERAGE still goes h<0, without ever
+        // truncating h.)
 
         const auto F  = Numerics::numerical_flux
             (Q_L, Q_R, Qaux_L, Qaux_R, p, n);

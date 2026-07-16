@@ -206,6 +206,9 @@ def _build_case(case, mesh, model, sm, settings, binary):
     scheme = settings.get("time_scheme", "explicit")
     maxco = float(settings.get("cfl", 0.4))
     dt0 = float(settings.get("min_dt", 1e-3)) or 1e-3
+    # a-posteriori positivity: "mood" enables the local-MOOD wet/dry limiter in
+    # the order-2 explicit path; "none" (default) leaves it off.
+    positivity = str(settings.get("positivity", "none"))
     params = _model_parameters(model, sm)
     param_str = " ".join(f"{k} {v:g};" for k, v in params.items())
     imex = ("imexTableau ars232; imexMaxIter 20; imexTol 1e-12;"
@@ -215,7 +218,8 @@ def _build_case(case, mesh, model, sm, settings, binary):
         "application zoomyFoam;\n"
         f"startFrom startTime; startTime 0; stopAt endTime; endTime {t_end}; deltaT {dt0};\n"
         f"writeControl adjustableRunTime; writeInterval {t_end / n_snap:g}; purgeWrite 0;\n"
-        f"maxCo {maxco}; reconstructionOrder {order_recon}; timeScheme {scheme}; {imex}\n"
+        f"maxCo {maxco}; reconstructionOrder {order_recon}; timeScheme {scheme}; "
+        f"positivity {positivity}; {imex}\n"
         f"modelParameters {{ {param_str} }}\n")
 
     # 0/Qi from the model's initial conditions at the (ordered) inner cell centres
