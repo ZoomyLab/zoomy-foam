@@ -152,7 +152,7 @@ int main(int argc, char *argv[])
             for (int m = 0; m < nP; ++m)
                 Q[e2sP[m]]->primitiveFieldRef()[c] = Pv[m*nc + c];
         forAll(e2sP, m) Q[e2sP[m]]->correctBoundaryConditions();
-        ChorinPressure::update_aux_variables(Q, QauxPress, dt, mesh);
+        ChorinPressure::update_aux_variables(Q, QauxPress, pPress, dt, mesh);
         List<scalar> q8(NS), qa(ChorinPressure::n_dof_qaux);
         for (label c = 0; c < nc; ++c)
         {
@@ -235,7 +235,7 @@ int main(int argc, char *argv[])
     const auto& e2sC = ChorinCorrector::equation_to_state_index;  // {2,3,4,5}
     auto corrector = [&](scalar dt)
     {
-        ChorinCorrector::update_aux_variables(Q, QauxCorr, dt, mesh);
+        ChorinCorrector::update_aux_variables(Q, QauxCorr, pCorr, dt, mesh);
         List<scalar> q8(NS), qa(ChorinCorrector::n_dof_qaux);
         for (label c = 0; c < nc; ++c)
         {
@@ -250,7 +250,7 @@ int main(int argc, char *argv[])
     // ── predictor explicit RHS (flux + NCP, pressure-zeroed): L = Src − ∇·F ──
     auto predictorRHS = [&]()
     {
-        Model::update_aux_variables(Q, QauxPred, 0.0, mesh);
+        Model::update_aux_variables(Q, QauxPred, pPred, 0.0, mesh);
         numerics::update_source(Src, Q, QauxPred, pPred);
         numerics::update_numerical_flux(Dp, Dm, Q, QauxPred, pPred);
         forAll(Src, i)
@@ -286,7 +286,7 @@ int main(int argc, char *argv[])
     };
     applyWall();   // also stamp the wall on the initial state
 
-    Model::update_aux_variables(Q, QauxPred, 0.0, mesh);
+    Model::update_aux_variables(Q, QauxPred, pPred, 0.0, mesh);
     forAll(Q, i) Q[i]->write();
     const scalar endTime = runTime.endTime().value();
 
@@ -295,7 +295,7 @@ int main(int argc, char *argv[])
 
     while (runTime.run())
     {
-        Model::update_aux_variables(Q, QauxPred, 0.0, mesh);
+        Model::update_aux_variables(Q, QauxPred, pPred, 0.0, mesh);
         scalar dt = numerics::compute_dt(Q, QauxPred, pPred, minInradius, Co);
         dt = min(min(dt, maxDeltaT), endTime - runTime.value());
         runTime.setDeltaT(dt); ++runTime;

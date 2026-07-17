@@ -77,6 +77,12 @@ inline void update_W_gradients
     const Foam::List<Foam::volScalarField*>& W
 )
 {
+    // Swap W across processor patches BEFORE fvc::grad: update_W_fields fills W's
+    // internal + named-BC boundary but not its processor halo, so an un-swapped
+    // fvc::grad would read a stale neighbour value and corrupt gradW at every
+    // cell adjacent to a partition — poisoning the reconstruction there even
+    // away from the seam.  No-op in serial.
+    swap_coupled_halos(W);
     forAll(W, i)
     {
         // Primitive-field assignment to bypass the dim check
@@ -248,6 +254,22 @@ inline void update_numerical_flux_o2
     //    computed correctly per-rank by fvc::grad's own halo swap, so W_R equals
     //    the undecomposed reconstruction — the partition line is 2nd-order and
     //    bit-for-bit decomposition-transparent (no 2-cell halo needed).
+    // Neighbour cell centres for the processor-face reconstruction distance
+    // rR = xF - C_nei.  mesh.C() is a sliced geometry field whose coupled
+    // boundary does not carry a usable patchNeighbourField, so swap an explicit
+    // (regular) copy once — static geometry, so one exchange fills the neighbour
+    // centres.  A no-op in serial.
+    Foam::volVectorField Ccells
+    (
+        Foam::IOobject("Ccells_recon", mesh.time().name(), mesh,
+                       Foam::IOobject::NO_READ, Foam::IOobject::NO_WRITE),
+        mesh.C()
+    );
+    {
+        Foam::List<Foam::volVectorField*> cl(1); cl[0] = &Ccells;
+        numerics::swap_coupled_halos(cl);
+    }
+
     auto patchMap = get_map_patchNameToPatchIndex();
     forAll(mesh.boundaryMesh(), patchI)
     {
@@ -267,7 +289,7 @@ inline void update_numerical_flux_o2
                 gWnei[i] = gradW[i]->boundaryField()[patchI].patchNeighbourField();
             forAll(Qaux, i)
                 qaNei[i] = Qaux[i]->boundaryField()[patchI].patchNeighbourField();
-            Cnei = mesh.C().boundaryField()[patchI].patchNeighbourField();
+            Cnei = Ccells.boundaryField()[patchI].patchNeighbourField();
         }
         forAll(pp, localFaceI)
         {

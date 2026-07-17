@@ -120,6 +120,12 @@ int main(int argc, char *argv[])
             ),
             *Q[i]
         );
+        // Copy-construct from fvc::grad(Q) so gradW inherits PROCESSOR patch
+        // fields (a bare dimensionedVector value-constructor makes them
+        // `calculated`, whose patchNeighbourField returns owner — not neighbour —
+        // data, breaking the order-2 reconstruction across a partition).  The
+        // internal field is overwritten each step by update_W_gradients; only the
+        // coupled boundary TYPES matter here.
         gradW[i] = new volVectorField
         (
             IOobject
@@ -128,10 +134,7 @@ int main(int argc, char *argv[])
                 runTime.name(), mesh,
                 IOobject::NO_READ, IOobject::NO_WRITE
             ),
-            mesh,
-            dimensionedVector(
-                "zero", dimless/dimLength, vector::zero
-            )
+            Foam::fvc::grad(*Q[i])
         );
     }
 
@@ -275,7 +278,7 @@ int main(int argc, char *argv[])
 
     forAll(Q,    QI)    Q[QI]->write();
     forAll(Qaux, QauxI) Qaux[QauxI]->write();
-    Model::update_aux_variables(Q, Qaux, dtAux, mesh);
+    Model::update_aux_variables(Q, Qaux, p, dtAux, mesh);
     numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
 
     // Cell volume field for normalising the divergence operator.
@@ -287,7 +290,7 @@ int main(int argc, char *argv[])
     // (includeSource = false) and the explicit RHS carries flux + NCP only.
     auto compute_rhs = [&](bool includeSource, label order)
     {
-        Model::update_aux_variables(Q, Qaux, dtAux, mesh);
+        Model::update_aux_variables(Q, Qaux, p, dtAux, mesh);
         if (includeSource) numerics::update_source(Src, Q, Qaux, p);
         else forAll(Src, i) Src[i]->primitiveFieldRef() = 0.0;
         if (order >= 2)
@@ -431,7 +434,7 @@ int main(int argc, char *argv[])
 
         // CFL — computed from the start-of-step state so both RK2 stages
         // share the same dt.
-        Model::update_aux_variables(Q, Qaux, dtAux, mesh);
+        Model::update_aux_variables(Q, Qaux, p, dtAux, mesh);
         scalar dt = numerics::compute_dt(Q, Qaux, p, minInradius, Co);
         dt = Foam::min(dt, maxDeltaT);   // honor the optional hard dt cap
         scalar dt_used;
@@ -495,7 +498,7 @@ int main(int argc, char *argv[])
             };
 
             // Stage 0 (explicit-only for ARS: A_I[0][0] = 0).
-            Model::update_aux_variables(Q, Qaux, dtAux, mesh);
+            Model::update_aux_variables(Q, Qaux, p, dtAux, mesh);
             numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
             eval_stage(0);
 
@@ -513,7 +516,7 @@ int main(int argc, char *argv[])
                     RHSx[k] = rx;
                     Q[k]->primitiveFieldRef() = rx;     // Q ← rhs_i (= Newton qstar)
                 }
-                Model::update_aux_variables(Q, Qaux, dtAux, mesh);
+                Model::update_aux_variables(Q, Qaux, p, dtAux, mesh);
                 numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
 
                 // Implicit stage: solve  Y − rhs_i − dt·γ_ii·S(Y) = 0  per cell.
