@@ -337,17 +337,24 @@ inline void update_source
     Foam::List<Foam::volScalarField*>& Src,
     const Foam::List<Foam::volScalarField*>& Q,
     const Foam::List<Foam::volScalarField*>& Qaux,
-    const Foam::List<Foam::scalar>& p
+    const Foam::List<Foam::scalar>& p,
+    const Foam::fvMesh& mesh
 )
 {
     const Foam::label nC = Q[0]->size();
+    // REQ-185: source(Q, Qaux, p, time, dt, X) — the simulation time and step
+    // come from the runTime, the position X from the cell centre.  A source that
+    // ignores them (frictionless SWE) is unaffected; a t/x-dependent one binds.
+    const Foam::scalar time = mesh.time().value();
+    const Foam::scalar dt   = mesh.time().deltaTValue();
+    const Foam::volVectorField& C = mesh.C();
     Foam::List<Foam::scalar> q(Q.size());
     Foam::List<Foam::scalar> qa(Qaux.size());
     for (Foam::label cellI = 0; cellI < nC; ++cellI)
     {
         forAll(Q, i)    q[i]  = (*Q[i])[cellI];
         forAll(Qaux, i) qa[i] = (*Qaux[i])[cellI];
-        const auto S = Model::source(q, qa, p);
+        const auto S = Model::source(q, qa, p, time, dt, C[cellI]);
         forAll(Src, i)
         {
             Src[i]->primitiveFieldRef()[cellI] = S[i][0];
@@ -376,11 +383,16 @@ inline void implicit_source_step
     const Foam::List<Foam::scalar>& p,
     const Foam::scalar dt,
     const Foam::label maxiter,
-    const Foam::scalar tol
+    const Foam::scalar tol,
+    const Foam::fvMesh& mesh
 )
 {
     const Foam::label nC = Q[0]->size();
     const int nq = Model::n_dof_q;
+    // REQ-185: the Newton functor binds the simulation time and this cell's
+    // centre X so every FD-Jacobian evaluation hits the same source(...,time,dt,X).
+    const Foam::scalar time = mesh.time().value();
+    const Foam::volVectorField& C = mesh.C();
 
     Foam::List<Foam::scalar> qstar(nq), qa(Model::n_dof_qaux), qOut(nq);
 
@@ -389,13 +401,14 @@ inline void implicit_source_step
         forAll(Q, i)    qstar[i] = (*Q[i])[c];
         forAll(Qaux, i) qa[i]    = (*Qaux[i])[c];
 
+        const Foam::vector Xc = C[c];
         const bool ok = implicit_source_cell
         (
             qstar, qa, p, dt, maxiter, tol,
-            [](const Foam::List<Foam::scalar>& q_,
+            [time, dt, Xc](const Foam::List<Foam::scalar>& q_,
                const Foam::List<Foam::scalar>& qa_,
                const Foam::List<Foam::scalar>& p_)
-            { return Model::source(q_, qa_, p_); },
+            { return Model::source(q_, qa_, p_, time, dt, Xc); },
             qOut
         );
 

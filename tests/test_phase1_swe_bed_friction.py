@@ -34,8 +34,9 @@ def main():
     assert "Q[1]" in code  # depth (g·h, h^(7/3), etc.)
     assert "p[0]" in code  # g
     assert "p[1]" in code  # n_m
-    # Friction source on momentum row (Foam::abs from Abs() of hu)
-    assert "Foam::abs" in code or "abs(" in code
+    # Friction source on momentum row: |hu| renders as Foam::mag (the OpenFOAM
+    # idiom for Abs(); older printers emitted Foam::abs).
+    assert "Foam::mag" in code or "Foam::abs" in code or "abs(" in code
 
     # BC tag list: wall/inflow/outflow in alphabetic order.
     assert 'map_boundary_tag_to_function_index{ "inflow", "outflow", "wall" }' in code

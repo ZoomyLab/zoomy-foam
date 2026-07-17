@@ -158,7 +158,10 @@ int main(int argc, char *argv[])
         {
             forAll(Q, i) q8[i] = (*Q[i])[c];
             forAll(QauxPress, i) qa[i] = (*QauxPress[i])[c];
-            const auto r = ChorinPressure::source(q8, qa, pPress);
+            // REQ-185: source(...,time,dt,X); the elliptic pressure block ignores
+            // them but the interface carries the runtime time and cell centre.
+            const auto r = ChorinPressure::source(
+                q8, qa, pPress, mesh.time().value(), dt, mesh.C()[c]);
             for (int m = 0; m < nP; ++m) out[m*nc + c] = r[m][0];
         }
     };
@@ -251,7 +254,7 @@ int main(int argc, char *argv[])
     auto predictorRHS = [&]()
     {
         Model::update_aux_variables(Q, QauxPred, pPred, 0.0, mesh);
-        numerics::update_source(Src, Q, QauxPred, pPred);
+        numerics::update_source(Src, Q, QauxPred, pPred, mesh);
         numerics::update_numerical_flux(Dp, Dm, Q, QauxPred, pPred);
         forAll(Src, i)
         {

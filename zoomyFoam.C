@@ -291,7 +291,7 @@ int main(int argc, char *argv[])
     auto compute_rhs = [&](bool includeSource, label order)
     {
         Model::update_aux_variables(Q, Qaux, p, dtAux, mesh);
-        if (includeSource) numerics::update_source(Src, Q, Qaux, p);
+        if (includeSource) numerics::update_source(Src, Q, Qaux, p, mesh);
         else forAll(Src, i) Src[i]->primitiveFieldRef() = 0.0;
         if (order >= 2)
         {
@@ -489,7 +489,7 @@ int main(int argc, char *argv[])
             auto eval_stage = [&](label st)
             {
                 compute_rhs(false, reconstructionOrder);  // aux; L = f_E (no source)
-                numerics::update_source(Src, Q, Qaux, p);  // f_I at same aux
+                numerics::update_source(Src, Q, Qaux, p, mesh);  // f_I at same aux
                 forAll(Q, i)
                 {
                     KE[st][i] = L[i];
@@ -524,7 +524,7 @@ int main(int argc, char *argv[])
                 if (gii != 0.0)
                 {
                     numerics::implicit_source_step
-                        (Q, Qaux, p, dt_used * gii, imexMaxIter, imexTol);
+                        (Q, Qaux, p, dt_used * gii, imexMaxIter, imexTol, mesh);
                     numerics::correct_boundary_q(Q, Qaux, p, runTime.value(), precice.active());
                 }
                 eval_stage(i);
