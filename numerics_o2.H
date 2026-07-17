@@ -187,6 +187,8 @@ inline void update_numerical_flux_o2
     const Foam::fvMesh& mesh = Q[0]->mesh();
     numerics::swap_coupled_halos(Q);        // MPI: neighbour cells at proc faces
     numerics::swap_coupled_halos(Qaux);
+    numerics::swap_coupled_halos(W);        // + neighbour W and gradient, so a
+    numerics::swap_coupled_halos(gradW);    // processor face reconstructs at 2nd order
 
     Foam::List<Foam::scalar> W_L(Model::n_dof_q), W_R(Q.size());
     Foam::List<Foam::scalar> Q_L(Model::n_dof_q), Q_R(Q.size());
@@ -237,42 +239,72 @@ inline void update_numerical_flux_o2
         }
     }
 
-    // Boundary faces — physical BC patches AND processor (coupled) patches, both
-    // kept 1st-order (the no-reconstruction path, so BC dispatch is consistent;
-    // a processor face thus carries a 1-cell-halo 1st-order flux — a thin seam
-    // of reduced order at the decomposition boundary, still conservative).  For
-    // a coupled patch the "R" state is the neighbour rank's cell (patchNeighbour-
-    // Field); for a named BC patch it is the correct_boundary_q ghost.
+    // Boundary faces.
+    //  * Physical BC patches: kept 1st-order (no reconstruction); Q_R is the
+    //    correct_boundary_q ghost, so BC dispatch stays consistent.
+    //  * Processor (coupled) patches: FULL 2nd-order reconstruction, identical to
+    //    an interior face.  The neighbour rank's W, gradW and cell centre come
+    //    over the 1-ring processor patch (patchNeighbourField); gradW was already
+    //    computed correctly per-rank by fvc::grad's own halo swap, so W_R equals
+    //    the undecomposed reconstruction — the partition line is 2nd-order and
+    //    bit-for-bit decomposition-transparent (no 2-cell halo needed).
     auto patchMap = get_map_patchNameToPatchIndex();
     forAll(mesh.boundaryMesh(), patchI)
     {
         const Foam::polyPatch& pp = mesh.boundaryMesh()[patchI];
         const bool coupled = mesh.boundary()[patchI].coupled();
         if (!coupled && !patchMap.found(pp.name())) continue;
-        Foam::List<Foam::scalarField> qNei(Q.size()), qaNei(Qaux.size());
+
+        // Neighbour-rank fields at this processor patch (unused for a BC patch).
+        Foam::List<Foam::scalarField> Wnei(W.size()), qaNei(Qaux.size());
+        Foam::List<Foam::vectorField> gWnei(gradW.size());
+        Foam::vectorField Cnei;
         if (coupled)
         {
-            forAll(Q, i)
-                qNei[i]  = Q[i]->boundaryField()[patchI].patchNeighbourField();
+            forAll(W, i)
+                Wnei[i]  = W[i]->boundaryField()[patchI].patchNeighbourField();
+            forAll(gradW, i)
+                gWnei[i] = gradW[i]->boundaryField()[patchI].patchNeighbourField();
             forAll(Qaux, i)
                 qaNei[i] = Qaux[i]->boundaryField()[patchI].patchNeighbourField();
+            Cnei = mesh.C().boundaryField()[patchI].patchNeighbourField();
         }
         forAll(pp, localFaceI)
         {
             const Foam::label& cellI = pp.faceCells()[localFaceI];
             const Foam::vector& nb = pp.faceNormals()[localFaceI];
 
-            forAll(Q, i)
+            if (coupled)
             {
-                Q_L[i] = (*Q[i])[cellI];
-                Q_R[i] = coupled ? qNei[i][localFaceI]
-                                 : Q[i]->boundaryField()[patchI][localFaceI];
+                // Taylor-reconstruct both sides to the face, as an interior face.
+                const Foam::vector& xF = pp.faceCentres()[localFaceI];
+                const Foam::vector rL = xF - mesh.C()[cellI];
+                const Foam::vector rR = xF - Cnei[localFaceI];
+                forAll(W, i)
+                {
+                    W_L[i] = (*W[i])[cellI] + ((*gradW[i])[cellI] & rL);
+                    W_R[i] = Wnei[i][localFaceI] + (gWnei[i][localFaceI] & rR);
+                }
+                forAll(Qaux, i)
+                {
+                    Qaux_L[i] = (*Qaux[i])[cellI];
+                    Qaux_R[i] = qaNei[i][localFaceI];
+                }
+                Q_L = Model::state_from_reconstruction(W_L, Qaux_L, p);
+                Q_R = Model::state_from_reconstruction(W_R, Qaux_R, p);
             }
-            forAll(Qaux, i)
+            else
             {
-                Qaux_L[i] = (*Qaux[i])[cellI];
-                Qaux_R[i] = coupled ? qaNei[i][localFaceI]
-                                    : Qaux[i]->boundaryField()[patchI][localFaceI];
+                forAll(Q, i)
+                {
+                    Q_L[i] = (*Q[i])[cellI];
+                    Q_R[i] = Q[i]->boundaryField()[patchI][localFaceI];
+                }
+                forAll(Qaux, i)
+                {
+                    Qaux_L[i] = (*Qaux[i])[cellI];
+                    Qaux_R[i] = Qaux[i]->boundaryField()[patchI][localFaceI];
+                }
             }
             const auto F  = Numerics::numerical_flux
                 (Q_L, Q_R, Qaux_L, Qaux_R, p, nb);

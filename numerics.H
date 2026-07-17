@@ -125,7 +125,10 @@ quasilinear_operator
 // neighbour rank's up-to-date cell values.  Guarded by ``coupled()``, it never
 // touches a physical BC patch — the ghosts ``correct_boundary_q`` wrote survive.
 // A no-op in serial (no coupled patches exist), so the serial path is unchanged.
-inline void swap_coupled_halos(const Foam::List<Foam::volScalarField*>& fields)
+// Templated on the field type so it swaps both scalar (Q/Qaux/W) and vector
+// (gradW) fields — order-2 needs the neighbour gradient at the processor face.
+template<class GeoField>
+inline void swap_coupled_halos(const Foam::List<GeoField*>& fields)
 {
     forAll(fields, i)
     {
