@@ -38,3 +38,13 @@ include-package-data = true
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["zoomy_foam*"]
+
+[tool.pytest.ini_options]
+# Tier + area markers for the foam suite.  Default `pytest` runs the small gate;
+# `-m regression` the reference marches; `large` additionally needs --run-large.
+markers = [
+  "small: gate tier — runs on every change (default pytest)",
+  "regression: compares against blessed references in tests/refs",
+  "large: slow regression; needs --run-large",
+  "foam: backend/area tag (selection only)",
+]

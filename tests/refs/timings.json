@@ -1,0 +1,16 @@
+{
+ "parallel_2rank_small": 30.312,
+ "ritter_dry": 11.568,
+ "ritter_dry_o2_small": 11.252,
+ "stoker_wet": 11.398,
+ "stoker_wet_o2_small": 11.21,
+ "swashes_ritter_dry_o1": 33.94,
+ "swashes_ritter_dry_o2": 34.418,
+ "swashes_stoker_wet_o1": 33.855,
+ "swashes_stoker_wet_o2": 33.987,
+ "swe_2d": 12.191,
+ "vam_bump": 30.78,
+ "vam_chorin": 15.757,
+ "wb_lake": 8.675,
+ "wb_long": 11.446
+}

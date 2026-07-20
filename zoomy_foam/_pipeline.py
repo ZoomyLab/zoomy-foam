@@ -35,6 +35,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -307,6 +308,15 @@ def _build_case(case, mesh, model, sm, settings, binary):
         "application zoomyFoam;\n"
         f"startFrom startTime; startTime 0; stopAt endTime; endTime {t_end}; deltaT {dt0};\n"
         f"writeControl adjustableRunTime; writeInterval {t_end / n_snap:g}; purgeWrite 0;\n"
+        # OpenFOAM's DEFAULT writePrecision is 6 significant digits, which caps
+        # every exported field at ~3e-07 absolute on an O(0.3) value.  Measured
+        # consequence: the lake-at-rest surface deviation read back as exactly
+        # 4.8429e-07 at order 1 AND order 2, at t=1 s AND t=10 s -- a constant,
+        # time- and order-independent floor that looks exactly like a lost
+        # well-balancing but is pure output truncation (|u| meanwhile decayed to
+        # 1e-15, i.e. the lake really was at rest).  Every reference in the test
+        # suite is only as good as this number, so it is raised to full double.
+        f"writePrecision 15;\n"
         f"maxCo {maxco}; reconstructionOrder {order_recon}; timeScheme {scheme}; "
         f"positivity {positivity}; {imex}\n"
         f"modelParameters {{ {param_str} }}\n")
@@ -385,6 +395,7 @@ def _run_stream(case, binary, on_progress, nprocs=1, n_dof_q=None):
         run_cmd = f"cd {case}; mpirun -np {nprocs} '{binary}' -parallel -case {case}"
     else:
         run_cmd = f"cd {case}; '{binary}' -case {case}"
+    _t_solver = time.perf_counter()
     p = subprocess.Popen(
         _apptainer_cmd(run_cmd, binds=[case]),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -415,6 +426,14 @@ def _run_stream(case, binary, on_progress, nprocs=1, n_dof_q=None):
                 except Exception:
                     pass
     p.wait(); log.close()
+    # The SOLVER's own wall time, excluding apptainer startup, blockMesh,
+    # foamToVTK and the HDF5 pack.  The test suite budgets against THIS rather
+    # than the whole-pipeline time: the pipeline is five subprocesses whose
+    # scheduling swamps the measurement (measured 23% run-to-run spread with no
+    # code change), while the solver loop is the number that actually tracks
+    # scheme cost.  Written to a file rather than returned so no caller
+    # signature changes.
+    (case / "solver_wall.txt").write_text(f"{time.perf_counter() - _t_solver:.6f}\n")
     if p.returncode != 0:
         raise RuntimeError(f"zoomyFoam failed (rc={p.returncode}); see {case/'run.log'}")
     if n_dof_q is not None:
@@ -433,11 +452,20 @@ def _time_dirs(case):
                   key=lambda d: float(d.name))
 
 
-def _strip_nonstate(case, n_state):
+def _strip_nonstate(case, n_state, n_aux=0):
     """Keep only the state fields ``Q0..Q{n-1}`` in each written time dir, so the
     exported HDF5 ``Q`` is exactly the model state — not zoomyFoam's internal
-    reconstruction diagnostics (``Dm*``/``Dp*``) or aux (``Qaux*``)."""
-    keep = {f"Q{i}" for i in range(n_state)} | {"uniform"}
+    reconstruction diagnostics (``Dm*``/``Dp*``).
+
+    ``n_aux > 0`` additionally keeps ``Qaux0..Qaux{n_aux-1}``, which the export
+    then splits into a separate ``Qaux`` dataset.  Aux is dropped by DEFAULT
+    because the server's shared-HDF5 contract is state-only; the test suite opts
+    in, because a reference that pins Q alone cannot see a broken
+    ``update_aux_variables`` (the auxes carry the reconstruction gradients and
+    the bed slope, so an aux defect shows up in Q only after it has already
+    corrupted the physics)."""
+    keep = ({f"Q{i}" for i in range(n_state)}
+            | {f"Qaux{i}" for i in range(n_aux)} | {"uniform"})
     for d in _time_dirs(case):
         for fp in d.iterdir():
             if fp.name not in keep:
@@ -465,31 +493,86 @@ def _vtk_field_names(vtk_path):
     return names
 
 
-def _keep_state_rows(h5_path, n_state, sample_vtk):
+def _keep_state_rows(h5_path, n_state, vtks, n_aux=0):
     """Drop foamToVTK's synthetic ``cellID`` (and any non-state field): keep the
-    ``Q0..Q{n-1}`` rows, in state order, in every frame's ``Q``."""
+    ``Q0..Q{n-1}`` rows, in state order, in every frame's ``Q``.
+
+    With ``n_aux > 0`` the ``Qaux0..Qaux{n_aux-1}`` rows are split off into a
+    sibling ``Qaux`` dataset in the same frame group.
+
+    Selection is BY NAME, never by position, and is resolved PER FRAME.
+
+    Both of those matter and neither is theoretical:
+
+    * foamToVTK does not emit cell_data in declaration order (observed:
+      ``cellID, Qaux3, Q2, Qaux1, Qaux4, Qaux0, Q1, Qaux2, Q0``), so a
+      positional slice would interleave aux rows into the state.
+    * FRAMES ARE NOT HOMOGENEOUS.  Under ``nprocs > 1`` the reconstructed ``0/``
+      time dir carries only ``Q0..Qn-1`` — ``reconstructPar`` does not backfill
+      the aux into the pre-existing serial ``0/`` that ``decomposePar`` was
+      seeded from, while every later time dir has the full set.  Resolving the
+      index list once from frame 0 and applying it to every frame would
+      therefore mis-index every later frame.
+    """
     import h5py
-    names = _vtk_field_names(sample_vtk)
-    try:
-        idx = [names.index(f"Q{i}") for i in range(n_state)]
-    except ValueError:
-        return  # unexpected field naming — leave Q untouched rather than corrupt it
-    if idx == list(range(n_state)):
-        return
+    vtks = [str(v) for v in (vtks if isinstance(vtks, (list, tuple)) else [vtks])]
     with h5py.File(h5_path, "a") as f:
-        for k in f["fields"]:
+        keys = sorted(f["fields"], key=lambda k: int(k.split("_")[1]))
+        for j, k in enumerate(keys):
+            names = _vtk_field_names(vtks[min(j, len(vtks) - 1)])
+            try:
+                idx = [names.index(f"Q{i}") for i in range(n_state)]
+            except ValueError:
+                continue  # unexpected naming — leave this frame's Q untouched
             g = f["fields"][k]
             Q = g["Q"][:]
             del g["Q"]
             g.create_dataset("Q", data=Q[idx])
+            if not n_aux:
+                continue
+            try:
+                aux_idx = [names.index(f"Qaux{i}") for i in range(n_aux)]
+            except ValueError:
+                continue  # this frame has no aux (see the nprocs>1 note above)
+            if "Qaux" in g:
+                del g["Qaux"]
+            g.create_dataset("Qaux", data=Q[aux_idx])
 
 
-def _to_vtk(case, n_state):
+def _drop_auxless_times(case, n_aux):
+    """Drop time dirs that do not carry the full aux set, so every exported frame
+    has the SAME field list.
+
+    Why this is necessary rather than tidy: ``zoomy_prepost.vtk_to_hdf5`` fixes
+    the packed field schema from the FIRST frame, so one short frame silently
+    truncates ``Q`` for the whole series (measured: every frame came back with 4
+    rows instead of 9).
+
+    Only the t=0 dir is ever short, and only under ``nprocs > 1``: it is the IC
+    that ``_build_case`` wrote (state only), the solver's own startup aux write
+    went to ``processor*/0/``, and ``reconstructPar`` does not overwrite an
+    existing serial time dir.  Deleting ``0/`` and re-reconstructing is not an
+    option — ``reconstructPar`` then fails outright (exit 1).
+    """
+    need = {f"Qaux{i}" for i in range(n_aux)}
+    dirs = _time_dirs(case)
+    for d in dirs[:-1]:                      # never drop the final frame
+        if not need.issubset({f.name for f in d.iterdir()}):
+            shutil.rmtree(d, ignore_errors=True)
+    if not need.issubset({f.name for f in dirs[-1].iterdir()}):
+        raise RuntimeError(
+            f"the final time dir {dirs[-1]} carries no aux fields; cannot export "
+            f"with_aux (looked for {sorted(need)})")
+
+
+def _to_vtk(case, n_state, n_aux=0):
     """Strip to the state fields, `foamToVTK`, and write a `.pvd` collection with
     physical OF times. Returns ``(source, vtks)`` — ``source`` is the ``.pvd``
     path (or an ordered frame list on a count mismatch), ``vtks`` the sorted
     frame files."""
-    _strip_nonstate(case, n_state)
+    _strip_nonstate(case, n_state, n_aux)
+    if n_aux:
+        _drop_auxless_times(case, n_aux)
     _apptainer(f"cd {case}; foamToVTK > log.foamToVTK 2>&1", binds=[case], check=True)
     vtkdir = case / "VTK"
     vtks = sorted(vtkdir.glob("*.vtk"),
@@ -504,16 +587,16 @@ def _to_vtk(case, n_state):
     return [str(p) for p in vtks], vtks   # count mismatch → numeric-index order
 
 
-def _to_hdf5(case, output_dir, n_state):
-    source, vtks = _to_vtk(case, n_state)
+def _to_hdf5(case, output_dir, n_state, n_aux=0):
+    source, vtks = _to_vtk(case, n_state, n_aux)
     from zoomy_prepost import vtk_to_hdf5
     out = vtk_to_hdf5(source, str(Path(output_dir) / "simulation.h5"))
-    _keep_state_rows(out, n_state, str(vtks[0]))
+    _keep_state_rows(out, n_state, vtks, n_aux)
     return out
 
 
 # ── public entry ────────────────────────────────────────────────────────────
-def run_case(model, settings, output_dir, on_progress=None):
+def run_case(model, settings, output_dir, on_progress=None, with_aux=False):
     """Run a shared folder-case on the zoomyFoam backend; return the HDF5 path.
 
     Parameters
@@ -528,9 +611,13 @@ def run_case(model, settings, output_dir, on_progress=None):
     output_dir : str | Path
         Where the OpenFOAM case + ``simulation.h5`` are written.
     on_progress : callable(iteration, time, dt) | None
+    with_aux : bool
+        Also export the model's aux state as a per-frame ``Qaux`` dataset.  Off
+        by default so the server's state-only HDF5 contract is unchanged.
     """
     case, sm = _run_pipeline(model, settings, output_dir, on_progress)
-    return _to_hdf5(case, Path(output_dir), len(sm.state))
+    n_aux = len(sm.aux_state) if with_aux else 0
+    return _to_hdf5(case, Path(output_dir), len(sm.state), n_aux)
 
 
 def _run_pipeline(model, settings, output_dir, on_progress):
@@ -569,7 +656,12 @@ def _codegen_chorin(model):
     predictor ``Model.H`` + ``NumericsKernels.H`` + ``Pressure.H`` (ChorinPressure)
     + ``Corrector.H`` (ChorinCorrector) + ``ChorinState.H`` (full n_state).
     Mirrors ``create_model.py`` but from the model OBJECT (baked BCs).  Returns
-    ``(full_sm, n_state)``."""
+    ``(full_sm, n_state, n_pred_aux)``.
+
+    ``n_pred_aux`` is the PREDICTOR's aux count (``Model::n_dof_qaux``), which is
+    what chorinFoam writes as ``Qaux*``.  It is NOT ``len(full.aux_state)``: the
+    predictor is a different sub-system with its own aux, and the printer appends
+    the automatic ``hinv`` to whichever SystemModel it renders."""
     import sympy as sp
     from zoomy_core.systemmodel import SystemModel
     from zoomy_core.transformation.to_openfoam import (
@@ -594,7 +686,9 @@ def _codegen_chorin(model):
     (FOAM_ROOT / "ChorinState.H").write_text(
         "#pragma once\n"
         f"namespace Model {{ constexpr int n_state = {n_state}; }}\n")
-    return full, n_state
+    # AFTER write_code: the printer appends the automatic `hinv` aux in place, so
+    # reading this before the call would under-count by one.
+    return full, n_state, len(split.SM_pred.aux_state)
 
 
 def _wmake_chorin_cached():
@@ -637,6 +731,7 @@ def _build_chorin_case(case, mesh, model, sm, settings):
         "application chorinFoam;\n"
         f"startFrom startTime; startTime 0; stopAt endTime; endTime {t_end}; deltaT {dt0};\n"
         f"writeControl adjustableRunTime; writeInterval {t_end / n_snap:g}; purgeWrite 0;\n"
+        f"writePrecision 15;\n"      # see the explicit builder: default 6 truncates at ~3e-07
         f"maxCo {maxco};\n"
         f"pressureSolver bicgstab; pressureTol {ptol:g}; pressureMaxIter {pmaxit};\n"
         f"modelParameters {{ {param_str} }}\n")
@@ -663,10 +758,35 @@ def run_chorin_to_vtk(model, settings, output_dir, on_progress=None):
         mp = os.path.join(settings.get("_case_dir", os.getcwd()), mp)
     mesh = LSQMesh.from_hdf5(mp)
 
-    full, n_state = _codegen_chorin(model)
+    full, n_state, _ = _codegen_chorin(model)
     binary = _wmake_chorin_cached()
     case = output_dir / "foam_case"
     _build_chorin_case(case, mesh, model, full, settings)
     _run_stream(case, binary, on_progress, nprocs=int(settings.get("nprocs", 1)),
                 n_dof_q=n_state)
     return _to_vtk(case, n_state)[0]
+
+
+def run_chorin_case(model, settings, output_dir, on_progress=None, with_aux=False):
+    """Chorin analog of :func:`run_case`: same pipeline, exported to HDF5.
+
+    ``run_chorin_to_vtk`` stops at the VTK series because that is the shape the
+    gui wants.  The test suite needs the same ``(Q, Qaux)`` readback it gets for
+    the hyperbolic path — otherwise the VAM/chorin pair would be the one pair
+    compared on a weaker footing than every other test.
+    """
+    from zoomy_core.mesh.lsq_mesh import LSQMesh
+    output_dir = Path(output_dir); output_dir.mkdir(parents=True, exist_ok=True)
+    mp = settings.get("mesh", "mesh.h5")
+    if not os.path.isabs(mp):
+        mp = os.path.join(settings.get("_case_dir", os.getcwd()), mp)
+    mesh = LSQMesh.from_hdf5(mp)
+
+    full, n_state, n_pred_aux = _codegen_chorin(model)
+    binary = _wmake_chorin_cached()
+    case = output_dir / "foam_case"
+    _build_chorin_case(case, mesh, model, full, settings)
+    _run_stream(case, binary, on_progress, nprocs=int(settings.get("nprocs", 1)),
+                n_dof_q=n_state)
+    n_aux = n_pred_aux if with_aux else 0
+    return _to_hdf5(case, Path(output_dir), n_state, n_aux)

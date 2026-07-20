@@ -612,7 +612,13 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                             : qVof;
                     const auto Fc = Numerics::numerical_flux       (qSwe, qR, qaux, qaux, param, nHat);
                     const auto Fl = Numerics::numerical_fluctuations(qSwe, qR, qaux, qaux, param, nHat);
-                    qStar = Fc[1] + Fl[1][1];
+                    // Fc is List<List<scalar>> under the v6 (n_state, 1) flux
+                    // ABI, so row 1 must be dereferenced to its scalar.  This
+                    // site was missed when the other nine flat-index sites
+                    // (numerics.H, numerics_o2.H, precice/PreciceManager.H) were
+                    // adopted, because swePreciceCoupling is not built by the
+                    // default wmake and nothing exercised it.
+                    qStar = Fc[1][0] + Fl[1][1];
                 }
                 // half-Riemann star depth (two-rarefaction approximation,
                 // level-0 slots; L = peer, R = this column): the alpha fill

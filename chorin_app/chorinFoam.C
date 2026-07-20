@@ -76,7 +76,7 @@ int main(int argc, char *argv[])
     }
 
     // ── per-sub-system aux (internal, recomputed each stage) ────────────────
-    auto mkAux = [&](int n, const word& pfx)
+    auto mkAux = [&](int n, const word& pfx, bool write = false)
     {
         List<volScalarField*> A(n);
         forAll(A, i)
@@ -84,14 +84,21 @@ int main(int argc, char *argv[])
             A[i] = new volScalarField
             (
                 IOobject(pfx + std::to_string(i), runTime.name(), mesh,
-                         IOobject::NO_READ, IOobject::NO_WRITE),
+                         IOobject::NO_READ,
+                         write ? IOobject::AUTO_WRITE : IOobject::NO_WRITE),
                 mesh, dimensionedScalar(pfx, dimless, 0.0)
             );
             setPatchTypes(*A[i]);
         }
         return A;
     };
-    List<volScalarField*> QauxPred = mkAux(Model::n_dof_qaux, "auxPred");
+    // The PREDICTOR aux is written as `Qaux*` (AUTO_WRITE) so the exported HDF5
+    // carries it exactly like the hyperbolic zoomyFoam path does.  Without it the
+    // chorin/VAM pair would be the only case in the suite compared on Q alone,
+    // which cannot see a broken update_aux_variables.  The pressure and corrector
+    // auxes stay internal: they are stage-local scratch with no meaning between
+    // stages.
+    List<volScalarField*> QauxPred = mkAux(Model::n_dof_qaux, "Qaux", true);
     List<volScalarField*> QauxPress = mkAux(ChorinPressure::n_dof_qaux, "auxPress");
     List<volScalarField*> QauxCorr = mkAux(ChorinCorrector::n_dof_qaux, "auxCorr");
 
