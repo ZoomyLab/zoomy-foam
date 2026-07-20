@@ -107,6 +107,39 @@ def _headers_hash():
     return h.hexdigest()[:16]
 
 
+def _wmake_script(build_dir, of_bin, cached):
+    """Shell for one cached wmake: build in ``build_dir``, and copy ``of_bin``
+    to ``cached`` ONLY if the compile actually succeeded.
+
+    Two guards, both load-bearing — this used to read
+
+        wmake 2>&1 | tail -4 && cp <of_bin> <cached>
+
+    where ``&&`` binds to the PIPELINE's status, i.e. ``tail``'s, which is
+    always 0.  A FAILED wmake therefore still copied whatever stale binary
+    happened to sit in the install dir into .bincache under the NEW header
+    hash; ``cached.exists()`` then went true and the RuntimeError never fired.
+    Observed consequence: a "clean 16.84 s build" that ran a stale 4-state
+    binary against a freshly generated 3-state Model.H — silent, and it would
+    corrupt every reference produced from that cache entry.
+
+      1. ``rm -f`` the install target first, so a stale binary cannot be
+         mistaken for a fresh one even if the status check is subverted.
+      2. capture wmake's OWN status via a log file rather than a pipe.  Done
+         with a plain redirect + ``$?`` instead of ``set -o pipefail`` /
+         ``$PIPESTATUS`` because the container shell is not guaranteed to be
+         bash; this form is POSIX and works in dash too.
+
+    The trailing ``[ $rc -eq 0 ]`` makes a failed compile exit non-zero, so
+    the caller's ``returncode`` check raises instead of caching junk."""
+    log = "wmake.$$.log"
+    return (
+        f"cd {build_dir}; wclean >/dev/null 2>&1; rm -f {of_bin}; "
+        f"wmake > {log} 2>&1; rc=$?; tail -4 {log}; rm -f {log}; "
+        f"[ $rc -eq 0 ] && cp {of_bin} '{cached}'"
+    )
+
+
 def _wmake_cached():
     """wmake zoomyFoam for the currently-emitted headers; cache by header hash.
 
@@ -116,8 +149,7 @@ def _wmake_cached():
     cached = _BINCACHE / f"zoomyFoam_{_headers_hash()}"
     if cached.exists():
         return cached
-    r = _apptainer(f"cd {FOAM_ROOT}; wclean >/dev/null 2>&1; wmake 2>&1 | tail -4 && "
-                   f"cp {_OF_BIN} '{cached}'",
+    r = _apptainer(_wmake_script(FOAM_ROOT, _OF_BIN, cached),
                    capture_output=True, text=True)
     if r.returncode != 0 or not cached.exists():
         raise RuntimeError(f"zoomyFoam wmake failed:\n{r.stdout}\n{r.stderr}")
@@ -522,8 +554,8 @@ def _wmake_chorin_cached():
     if cached.exists():
         return cached
     r = _apptainer(
-        f"cd {FOAM_ROOT}/chorin_app; wclean >/dev/null 2>&1; wmake 2>&1 | tail -4 && "
-        f"cp {_OF_CHORIN_BIN} '{cached}'", capture_output=True, text=True)
+        _wmake_script(f"{FOAM_ROOT}/chorin_app", _OF_CHORIN_BIN, cached),
+        capture_output=True, text=True)
     if r.returncode != 0 or not cached.exists():
         raise RuntimeError(f"chorinFoam wmake failed:\n{r.stdout}\n{r.stderr}")
     return cached
