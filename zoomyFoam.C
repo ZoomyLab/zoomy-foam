@@ -67,6 +67,15 @@ int main(int argc, char *argv[])
         )
     );
 
+    // Build fingerprint: the DOF counts COMPILED INTO this binary.  The driver
+    // prints them so the Python pipeline can assert the binary it just ran was
+    // actually built from the Model.H it just generated.  A stale cached binary
+    // is otherwise invisible: it reads Q0..Qn-1 happily, writes ITS OWN DOF
+    // count back out, and the export layer silently drops the extra fields.
+    Info<< "zoomy: n_dof_q = " << Model::n_dof_q
+        << " n_dof_qaux = " << Model::n_dof_qaux
+        << " dimension = " << Model::dimension << endl;
+
     List<volScalarField*>     Q  (Model::n_dof_q);
     List<volScalarField*>     Qaux(Model::n_dof_qaux);
     List<surfaceScalarField*> Dp (Q.size());

@@ -135,7 +135,11 @@ def _wmake_script(build_dir, of_bin, cached):
     log = "wmake.$$.log"
     return (
         f"cd {build_dir}; wclean >/dev/null 2>&1; rm -f {of_bin}; "
-        f"wmake > {log} 2>&1; rc=$?; tail -4 {log}; rm -f {log}; "
+        # tail -60, not -4: a template-heavy OpenFOAM compile error is many lines
+        # of instantiation context, and the LAST 4 are the `make: *** Error 1`
+        # trailer -- i.e. the old width reliably hid the actual diagnostic and
+        # reported only that something failed.
+        f"wmake > {log} 2>&1; rc=$?; tail -60 {log}; rm -f {log}; "
         f"[ $rc -eq 0 ] && cp {of_bin} '{cached}'"
     )
 
@@ -322,7 +326,42 @@ def _build_case(case, mesh, model, sm, settings, binary):
 
 
 # ── (d) run ─────────────────────────────────────────────────────────────────
-def _run_stream(case, binary, on_progress, nprocs=1):
+def _assert_binary_matches_model(binary, reported_dof, expected_dof, case):
+    """Hard-fail if the binary that just ran was not built from the Model.H we
+    just generated.
+
+    This is the second half of the stale-binary defence.  The first half stops a
+    failed ``wmake`` from POISONING the cache (see :func:`_wmake_script`); this
+    one catches a mismatch however it arose — a hand-copied binary, a cache entry
+    predating a hash-input change, a partially-bound container.
+
+    The check is cheap because the binary reports its own compiled-in DOF count
+    at startup (``zoomy: n_dof_q = N`` in zoomyFoam.C).  That is the ONLY
+    trustworthy source: the DOF count is baked in at compile time, so it cannot
+    be faked by regenerating headers.  Comparing against Model.H on disk would
+    prove nothing — Model.H is exactly the file the stale binary disagrees with.
+
+    Why this must RAISE rather than warn: a stale binary is silent by
+    construction.  It reads Q0..Qn-1 fine, writes back its OWN number of fields,
+    and ``_strip_nonstate`` then deletes the surplus — so a 4-state binary run
+    against a 3-state model exports a perfectly well-formed 3-state result that
+    is physically wrong.  Nothing downstream can detect it."""
+    if reported_dof is None:
+        raise RuntimeError(
+            f"zoomyFoam did not print its `zoomy: n_dof_q` build fingerprint — "
+            f"the cached binary at {binary} predates the fingerprint banner and "
+            f"cannot be verified against the generated Model.H (expected "
+            f"n_dof_q = {expected_dof}). Delete {_BINCACHE} and rebuild; see "
+            f"{case / 'run.log'}.")
+    if reported_dof != expected_dof:
+        raise RuntimeError(
+            f"STALE BINARY: {binary} was compiled with Model::n_dof_q = "
+            f"{reported_dof}, but the Model.H just generated for this run has "
+            f"n_dof_q = {expected_dof}. The results in {case} are from the WRONG "
+            f"model and must not be used. Delete {_BINCACHE} and rebuild.")
+
+
+def _run_stream(case, binary, on_progress, nprocs=1, n_dof_q=None):
     """blockMesh → (optionally decomposePar → mpirun -parallel → reconstructPar)
     → stream the solver's per-step ``Time`` lines to ``on_progress``.
 
@@ -330,7 +369,11 @@ def _run_stream(case, binary, on_progress, nprocs=1):
     dimension), run under ``mpirun -np N <binary> -parallel``, and reconstructed
     back to the serial time dirs the VTK/HDF5 export consumes.  The solver is
     dimension- and rank-agnostic (global dt via returnReduce, processor-patch
-    fluxes via patchNeighbourField), so a decomposed run reproduces serial."""
+    fluxes via patchNeighbourField), so a decomposed run reproduces serial.
+
+    ``n_dof_q`` is the state size of the model we just generated headers for.
+    When given, the binary's SELF-REPORTED ``zoomy: n_dof_q = N`` banner is
+    checked against it — see :func:`_assert_binary_matches_model`."""
     nprocs = int(nprocs or 1)
     _apptainer(f"cd {case}; blockMesh > log.blockMesh 2>&1", binds=[case], check=True)
     if nprocs > 1:
@@ -351,8 +394,17 @@ def _run_stream(case, binary, on_progress, nprocs=1):
     # line) — derive dt from consecutive report times.  Under mpirun only the
     # master rank prints Info, unprefixed, so the same regex matches.
     time_re = re.compile(r"^Time = ([-\d.eE+]+)")
+    # Both drivers self-report the state size COMPILED INTO them: zoomyFoam via
+    # `zoomy: n_dof_q = N`, chorinFoam via its pre-existing
+    # `chorinFoam: n_state=N` (the full shared state, which is what the chorin
+    # pipeline generates fields for and exports).
+    banner_re = re.compile(r"^(?:zoomy: n_dof_q = |chorinFoam: n_state=)(\d+)")
+    reported_dof = None
     for line in p.stdout:
         log.write(line)
+        b = banner_re.match(line.strip())
+        if b:
+            reported_dof = int(b.group(1))
         m = time_re.match(line.strip())
         if m:
             t = float(m.group(1)); it += 1
@@ -365,6 +417,8 @@ def _run_stream(case, binary, on_progress, nprocs=1):
     p.wait(); log.close()
     if p.returncode != 0:
         raise RuntimeError(f"zoomyFoam failed (rc={p.returncode}); see {case/'run.log'}")
+    if n_dof_q is not None:
+        _assert_binary_matches_model(binary, reported_dof, int(n_dof_q), case)
     if nprocs > 1:
         # Reconstruct the decomposed time dirs so the VTK/HDF5 export is identical
         # to a serial run.
@@ -493,7 +547,8 @@ def _run_pipeline(model, settings, output_dir, on_progress):
     binary = _wmake_cached()
     case = output_dir / "foam_case"
     _build_case(case, mesh, model, sm, settings, binary)
-    _run_stream(case, binary, on_progress, nprocs=int(settings.get("nprocs", 1)))
+    _run_stream(case, binary, on_progress, nprocs=int(settings.get("nprocs", 1)),
+                n_dof_q=len(sm.state))
     return case, sm
 
 
@@ -612,5 +667,6 @@ def run_chorin_to_vtk(model, settings, output_dir, on_progress=None):
     binary = _wmake_chorin_cached()
     case = output_dir / "foam_case"
     _build_chorin_case(case, mesh, model, full, settings)
-    _run_stream(case, binary, on_progress, nprocs=int(settings.get("nprocs", 1)))
+    _run_stream(case, binary, on_progress, nprocs=int(settings.get("nprocs", 1)),
+                n_dof_q=n_state)
     return _to_vtk(case, n_state)[0]

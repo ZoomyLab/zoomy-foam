@@ -432,7 +432,9 @@ public:
                                 (rt, ghost, interiorAux, interiorAux, p_, nUnit);
                             const auto FLf = Numerics::numerical_fluctuations
                                 (rt, ghost, interiorAux, interiorAux, p_, nUnit);
-                            Fstar = Ff[1] + FLf[1][1];
+                            // Ff is (n_state, 1): row = equation, single column.
+                            // Row 1 is the mass equation; [0] takes its scalar.
+                            Fstar = Ff[1][0] + FLf[1][1];
                         }
                         else if (massRow_ == "central")
                         {

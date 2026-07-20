@@ -240,8 +240,8 @@ inline void update_numerical_flux_o2
 
         forAll(Dp, i)
         {
-            (*Dp[i])[faceI] = (-F[i] + FL[0][i]) * magS;
-            (*Dm[i])[faceI] = ( F[i] + FL[1][i]) * magS;
+            (*Dp[i])[faceI] = (-F[i][0] + FL[0][i]) * magS;
+            (*Dm[i])[faceI] = ( F[i][0] + FL[1][i]) * magS;
         }
     }
 
@@ -338,9 +338,9 @@ inline void update_numerical_flux_o2
             forAll(Dp, i)
             {
                 Dp[i]->boundaryFieldRef()[patchI][localFaceI] =
-                    (-F[i] + FL[0][i]) * magS;
+                    (-F[i][0] + FL[0][i]) * magS;
                 Dm[i]->boundaryFieldRef()[patchI][localFaceI] =
-                    ( F[i] + FL[1][i]) * magS;
+                    ( F[i][0] + FL[1][i]) * magS;
             }
         }
     }
