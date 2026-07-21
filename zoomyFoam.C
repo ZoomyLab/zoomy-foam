@@ -39,6 +39,7 @@ Description
 #include "fixedValueFvPatchFields.H"
 #include "emptyFvPatchFields.H"
 #include "Model.H"
+#include "MarchConstants.H"   // EMITTED march constants (mandate 6a)
 #include "init.H"
 #include "precice/PreciceManager.H"
 
@@ -379,9 +380,15 @@ int main(int argc, char *argv[])
         label nt = 0;
         for (label c = 0; c < mesh.nCells(); ++c)
         {
-            bool bad = (Q[hIndex]->primitiveField()[c] < -1.0e-10);
-            for (label i = 0; i < Q.size() && !bad; ++i)
-                if (!std::isfinite(Q[i]->primitiveField()[c])) bad = true;
+            // PAD: STRICT (h < 0), and written as !(h >= bound) so a NaN depth
+            // — which makes every ordered comparison false, including the old
+            // `h < bound` — is caught by this same predicate instead of
+            // passing as healthy.  Bound is EMITTED by zoomy_core (mandate 6a),
+            // never a literal here; core and amrex use the same strict zero.
+            bool bad = !(Q[hIndex]->primitiveField()[c] >= Model::c_mood_h_bound);
+            if (Model::c_mood_require_finite)
+                for (label i = 0; i < Q.size() && !bad; ++i)
+                    if (!std::isfinite(Q[i]->primitiveField()[c])) bad = true;
             moodMask[c] = bad ? 1 : 0;
             if (bad) ++nt;
         }
@@ -407,7 +414,7 @@ int main(int argc, char *argv[])
         // at CFL<=0.5 is itself positive, so this should never fire.
         label nt2 = 0;
         for (label c = 0; c < mesh.nCells(); ++c)
-            if (Q[hIndex]->primitiveField()[c] < -1.0e-10) ++nt2;
+            if (!(Q[hIndex]->primitiveField()[c] >= Model::c_mood_h_bound)) ++nt2;
         if (nt2 > 0)
             Info<< "[MOOD] WARNING still troubled = " << nt2
                 << " after override" << endl;

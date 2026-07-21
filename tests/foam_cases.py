@@ -46,38 +46,34 @@ SWASHES_REF_DIR = (pathlib.Path(__file__).resolve().parents[3]
 # Escalante / bump (VAM chorin) geometry.
 ESC_DOMAIN, ESC_NCELLS = (-1.5, 1.5), 60
 
-# Order-2 dry-front negativity — a MEASURED FINDING, not a tuned tolerance.
+# RETIRED 2026-07-21: ``DRY_NEG_TOL = 1e-10``.
 #
-# The order-2 reconstruction at the ritter dry front undershoots h below zero.
-# Measured on the 20-cell twin (t = 0.5 s, CFL 0.9, ETA_L = 5e-3):
+# It was numerically IDENTICAL to the dead band hard-coded in foam's own MOOD
+# detector (``zoomyFoam.C``: ``bad = (h < -1.0e-10)``), so the test asserted the
+# implementation's blind spot rather than the physical contract: an undershoot
+# in (-1e-10, 0) was invisible to the detector AND to the assertion, on this
+# backend only.  Core (``solver_numpy.py``) and amrex (``!(h >= 0.0)``) always
+# detected on strict zero.
 #
-#     positivity none :  min h = -5.146e-07   (MOOD fired 0x)
-#     positivity mood :  min h = -4.969e-12   (MOOD fired 2x)
+# The detector is now strict too — the bound is EMITTED by zoomy_core as
+# ``c_mood_h_bound = 0.0`` (mandate 6a; see zoomy_foam/_constants.py) — so the
+# tests assert the CONTRACT, ``h >= 0``, with no tolerance at all.
 #
-# So the sanctioned a-posteriori limiter (REQ-175) removes five orders of
-# magnitude but does NOT deliver exact non-negativity: a residual undershoot at
-# ~1e-12 survives, which is 1e-9 RELATIVE to the initial depth, i.e. roundoff
-# scale.  Without MOOD the undershoot is 1e-4 relative — genuinely negative
-# water, not roundoff.
+# What the strict detector changed, measured on the 20-cell order-2 twin:
 #
-# The order-2 dry tests therefore run WITH mood and assert against this bound.
-# This is NOT a floor and NOT a clip: h is never modified: the bound is an
-# assertion threshold, and the exact value is stored in the reference so any
-# drift fails the comparison.  Order 1 keeps the strict ``h >= 0``.
+#     t_end = 0.5 s (the march this bound was originally measured on)
+#         positivity none :  min h = -5.146e-07     (MOOD fires 0x)
+#         positivity mood :  min h = -4.969e-12     dead band: INSIDE it, so
+#                                                   those cells were never
+#                                                   flagged
+#     t_end = 8.0 s (the twin as it stands today)
+#         dead-band detector :  min h = +5.722e-06
+#         strict detector    :  min h = +2.803e-05  <- re-blessed reference
 #
-# UPDATE 2026-07-21: the twin's march changed (t_end 0.5 -> 8.0, snapshots 2 -> 1)
-# so the CFL, not the writeInterval, sets dt — see ``assert_cfl_sets_dt``.  The
-# numbers above are the ORIGINAL t=0.5 measurement and are kept because they are
-# what motivates this bound.  Re-measured on the new twin (t = 8.0 s, 24 steps,
-# CFL 0.9, mood): min h = +5.722e-06, i.e. strictly POSITIVE — the longer march
-# leaves the front no longer sitting on the roundoff-scale undershoot.
-#
-# CAVEAT, worth naming: this bound (1e-10) is numerically the SAME as the
-# hard-coded dead band in foam's own MOOD detector (``zoomyFoam.C``:
-# ``bad = (h < -1.0e-10)``), whereas core and amrex detect on strict zero.  So
-# an undershoot in (-1e-10, 0) is invisible to BOTH the detector and this
-# assertion on this backend only.  Reported, not silently changed.
-DRY_NEG_TOL = 1e-10
+# The strict detector flags every negative-h cell, so more cells take the O1
+# override and the order-2 solution shifts by ~3.5e-04 in Q.  h is still NEVER
+# floored or clipped: MOOD recomputes troubled cells from Q^n, it does not
+# modify h in place.
 
 
 # ── boundary conditions ─────────────────────────────────────────────────────

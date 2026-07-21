@@ -12,6 +12,10 @@
 Model.H
 NumericsKernels.H
 UpdateAuxVariables.H
+# Emitted march constants (mandate 6a) — zoomy_foam/_constants.py writes this
+# from zoomy_core.solver.constants on every codegen, so it is a build product
+# exactly like Model.H: never hand-edited, never committed.
+MarchConstants.H
 
 # Python cache (test scripts under tests/)
 __pycache__/

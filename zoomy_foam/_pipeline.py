@@ -85,10 +85,20 @@ def _codegen(model):
     from zoomy_core.fvm.riemann_solvers import PositiveNonconservativeRusanov
     from zoomy_core.transformation.to_openfoam import (
         FoamSystemModelPrinter, FoamNumericsPrinter)
+    from zoomy_foam._constants import write_march_constants
     sm = SystemModel.from_model(model)
+    # Emission order kept as it was (Model.H before the Riemann solver is
+    # constructed).  Checked, not assumed: constructing
+    # ``PositiveNonconservativeRusanov(model=sm)`` first and printing after
+    # yields a BYTE-IDENTICAL Model.H, so the order is not load-bearing — it is
+    # preserved only to keep this diff to the constants emission.
     FoamSystemModelPrinter.write_code(sm, FOAM_ROOT / "Model.H")
-    FoamNumericsPrinter.write_code(
-        PositiveNonconservativeRusanov(model=sm), FOAM_ROOT / "NumericsKernels.H")
+    nsm = PositiveNonconservativeRusanov(model=sm)
+    FoamNumericsPrinter.write_code(nsm, FOAM_ROOT / "NumericsKernels.H")
+    # Mandate 6a: the MOOD detector bound is RESOLVED BY CORE, not restated as a
+    # literal in zoomyFoam.C.  Emitted on EVERY codegen so the header can never
+    # lag the model the binary is compiled against.
+    write_march_constants(nsm, FOAM_ROOT / "MarchConstants.H")
     return sm
 
 
@@ -99,7 +109,11 @@ def _headers_hash():
     # UserFunctions.H, Numerics.H) change the binary too, and omitting them meant
     # an edit there silently reused a stale cached binary.
     h = hashlib.sha256()
-    for name in ("Model.H", "NumericsKernels.H", "Numerics.H", "numerics.H",
+    # MarchConstants.H is generated and carries the MOOD detector bound: leaving
+    # it out would let a changed bound reuse a stale binary, which is the exact
+    # failure mode this hash exists to prevent.
+    for name in ("Model.H", "NumericsKernels.H", "MarchConstants.H",
+                 "Numerics.H", "numerics.H",
                  "numerics_o2.H", "init.H", "UserFunctions.H", "zoomyFoam.C"):
         f = FOAM_ROOT / name
         if f.exists():

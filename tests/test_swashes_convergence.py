@@ -27,7 +27,7 @@ import foam_models as models
 import foam_refs as refs
 import zoomy_foam._pipeline as rc
 from conftest import CFL, fit_order
-from foam_cases import (DRY_NEG_TOL, SWASHES_DOMAIN, SWASHES_T_END, chain,
+from foam_cases import (SWASHES_DOMAIN, SWASHES_T_END, chain,
                         describe, ic_for, l1_vs_analytic, march)
 
 pytestmark = pytest.mark.skipif(
@@ -56,7 +56,12 @@ def test_swashes_order(overwrite, tmp_path, capsys, case, order):
     # enabled only where it is needed and never silently for everything.
     dry_o2 = (case == "ritter_dry" and order == 2)
     extra = {"positivity": "mood"} if dry_o2 else None
-    h_floor = -DRY_NEG_TOL if dry_o2 else 0.0
+    # THE CONTRACT, in every case: h >= 0, no tolerance.  The dry-order-2 branch
+    # used to be exempted to -DRY_NEG_TOL (1e-10), which was exactly the MOOD
+    # detector's old dead band — the test agreed with the detector's blind spot
+    # instead of checking the physics.  Detector is strict now (c_mood_h_bound,
+    # emitted by core), so the exemption is gone.
+    h_floor = 0.0
 
     errs, Q, Qaux = [], None, None
     t0 = time.perf_counter()

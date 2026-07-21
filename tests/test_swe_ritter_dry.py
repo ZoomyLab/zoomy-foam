@@ -14,7 +14,7 @@ import foam_models as models
 import foam_refs as refs
 import zoomy_foam._pipeline as rc
 from conftest import CFL
-from foam_cases import (DRY_NEG_TOL, SWASHES_DOMAIN, ETA_L, assert_cfl_sets_dt,
+from foam_cases import (SWASHES_DOMAIN, ETA_L, assert_cfl_sets_dt,
                         cfl_witness, chain, describe, march, ritter_ic)
 
 pytestmark = pytest.mark.skipif(
@@ -72,14 +72,16 @@ def test_ritter_dry_o2_small(overwrite, tmp_path, capsys):
     elapsed = time.perf_counter() - t0
 
     assert np.isfinite(Q).all() and np.isfinite(Qaux).all()
-    # See foam_cases.DRY_NEG_TOL: order 2 + dry front undershoots h. MOOD takes
-    # it from -5.1e-07 (1e-4 relative) to -5.0e-12 (1e-9 relative, roundoff).
-    # h itself is NEVER floored — this is the assertion bound, and the value is
-    # stored in the reference so a drift fails.
+    # THE CONTRACT, not the implementation: h >= 0, no tolerance.  This used to
+    # assert against DRY_NEG_TOL = 1e-10, the SAME number as the MOOD detector's
+    # own dead band — so the test could not see anything the detector was
+    # already blind to.  The detector is strict now (bound emitted by core as
+    # c_mood_h_bound = 0.0), so the test asserts the physics.  h is still never
+    # floored: MOOD recomputes troubled cells from Q^n, it does not clip them.
     print(f"[dry-front] order-2 min h = {Q[1].min():.6e} (mood)")
-    assert Q[1].min() > -DRY_NEG_TOL, (
-        f"order-2 dry front undershoot {Q[1].min():.3e} exceeds the measured "
-        f"roundoff-scale bound {DRY_NEG_TOL:.0e}")
+    assert Q[1].min() >= 0.0, (
+        f"negative depth {Q[1].min():.3e} at the order-2 dry front — no floor "
+        "is permitted, and a strict MOOD detector is meant to catch this")
     # The CFL — not the output writer — must be what chose dt, and the achieved
     # step count / dt spread is pinned in the reference so a future CFL change
     # cannot come back bit-identical the way the 0.9 change did.

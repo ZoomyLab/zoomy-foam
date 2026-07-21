@@ -22,6 +22,7 @@ from zoomy_core.fvm.riemann_solvers import PositiveNonconservativeRusanov
 from zoomy_core.systemmodel import SystemModel
 from zoomy_core.transformation.to_openfoam import (
     FoamSystemModelPrinter, FoamNumericsPrinter)
+from zoomy_foam._constants import write_march_constants
 
 HERE = Path(__file__).resolve().parent
 
@@ -135,6 +136,10 @@ def emit(level, out=HERE, outer="extrapolation", closure="none", bcs="coupling",
     # eigenvalues; max_wavespeed was dropped).
     FoamSystemModelPrinter.write_code(sm, out / "Model.H")
     FoamNumericsPrinter.write_code(num, out / "NumericsKernels.H")
+    # Mandate 6a: the MOOD detector bound is resolved by core.  Emitted here too
+    # so a hand-driven `create_model.py + wmake` build (the coupling
+    # participants) produces the SAME header set the test pipeline does.
+    write_march_constants(num, out / "MarchConstants.H")
     print(f"emitted SME(level={level}, closure={closure}, bcs={bcs}) -> {out}  "
           f"state={[str(s) for s in sm.state]}")
 
