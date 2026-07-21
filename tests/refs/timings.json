@@ -1,4 +1,7 @@
 {
+ "coupling_L0L1_w2": 67.661,
+ "coupling_L1L1_w2": 65.578,
+ "coupling_L1L2_w2": 64.148,
  "parallel_2rank_small": 23.031,
  "ritter_dry": 8.732,
  "ritter_dry_o2_small": 8.672,
