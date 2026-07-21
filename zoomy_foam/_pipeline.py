@@ -317,6 +317,12 @@ def _build_case(case, mesh, model, sm, settings, binary):
         # 1e-15, i.e. the lake really was at rest).  Every reference in the test
         # suite is only as good as this number, so it is raised to full double.
         f"writePrecision 15;\n"
+        # spaceDimension: the 1/d factor of the CFL law lives INSIDE
+        # numerics::compute_dt (same formula as core), so maxCo is a pure
+        # safety factor and 0.9 is the law in 1-D and 2-D alike.  The mesh
+        # cannot supply d — OpenFOAM meshes a 1-D case as 3-D with `empty`
+        # directions — so it is written here from _mesh_geometry.
+        f"spaceDimension {dim};\n"
         f"maxCo {maxco}; reconstructionOrder {order_recon}; timeScheme {scheme}; "
         f"positivity {positivity}; {imex}\n"
         f"modelParameters {{ {param_str} }}\n")
@@ -696,9 +702,20 @@ def _wmake_chorin_cached():
     hash of the split headers + driver.  Returns the cached binary path."""
     _BINCACHE.mkdir(exist_ok=True)
     h = hashlib.sha256()
+    # ``numerics.H`` / ``Numerics.H`` are hashed too: chorinFoam.C #includes
+    # numerics.H and calls ``numerics::compute_dt``, so an edit confined to
+    # that header changes the chorin BINARY.  Omitting it meant a
+    # numerics.H-only change silently reused a stale cached chorinFoam — the
+    # same stale-binary hole ``_headers_hash`` was already hardened against
+    # for zoomyFoam, never closed here.  Found while landing the CFL-law
+    # change, which edits exactly numerics.H.
     for name in ("Model.H", "Pressure.H", "Corrector.H", "ChorinState.H",
-                 "NumericsKernels.H", "chorin_app/chorinFoam.C"):
-        h.update((FOAM_ROOT / name).read_bytes())
+                 "NumericsKernels.H", "Numerics.H", "numerics.H",
+                 "chorin_app/chorinFoam.C"):
+        f = FOAM_ROOT / name
+        if f.exists():
+            h.update(name.encode())
+            h.update(f.read_bytes())
     cached = _BINCACHE / f"chorinFoam_{h.hexdigest()[:16]}"
     if cached.exists():
         return cached
@@ -732,6 +749,7 @@ def _build_chorin_case(case, mesh, model, sm, settings):
         f"startFrom startTime; startTime 0; stopAt endTime; endTime {t_end}; deltaT {dt0};\n"
         f"writeControl adjustableRunTime; writeInterval {t_end / n_snap:g}; purgeWrite 0;\n"
         f"writePrecision 15;\n"      # see the explicit builder: default 6 truncates at ~3e-07
+        f"spaceDimension {dim};\n"      # see the explicit builder
         f"maxCo {maxco};\n"
         f"pressureSolver bicgstab; pressureTol {ptol:g}; pressureMaxIter {pmaxit};\n"
         f"modelParameters {{ {param_str} }}\n")

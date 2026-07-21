@@ -417,15 +417,35 @@ inline void implicit_source_step
 }
 
 // ── CFL-limited timestep using Numerics::local_max_abs_eigenvalue ───────
+//
+// SAME formula as zoomy_core (``zoomy_core/fvm/timestepping.py:adaptive``):
+//
+//     dt <= Co * 2*r_in / (d * |lambda|_max)
+//
+// with ``r_in`` the cell inradius (so ``2*r_in`` is the conservative cell
+// "diameter") and ``d`` the SPATIAL dimension actually being solved.  This
+// used to read ``Co * r_in / lam`` — no factor 2, no ``1/d`` — which made the
+// ``Co`` knob mean something different here than in core: ``Co = 0.9`` on a
+// 1-D mesh delivered an effective classical CFL of 0.45, i.e. HALF the law,
+// and the 2-D runs (``Co = 0.45``) landed at 0.225.  With the dimensional
+// factor now INSIDE the formula, ``Co`` is a pure safety factor in (0, 1] and
+// the single ``CFL = 0.9`` of the test suite is correct in every dimension.
+//
+// ``spaceDimension`` comes from the case's controlDict (written from the mesh
+// by ``zoomy_foam/_pipeline.py``); OpenFOAM always meshes in 3-D with the
+// unsolved directions collapsed to one `empty` cell, so ``mesh.nGeometricD()``
+// would report the wrong ``d`` for a 1-D run.
 inline Foam::scalar compute_dt
 (
     const Foam::List<Foam::volScalarField*>& Q,
     const Foam::List<Foam::volScalarField*>& Qaux,
     const Foam::List<Foam::scalar>& p,
     const Foam::surfaceScalarField& minInradius,
-    Foam::scalar Co
+    Foam::scalar Co,
+    Foam::label spaceDimension
 )
 {
+    const Foam::scalar dimFac = Foam::scalar(Foam::max(spaceDimension, 1));
     const Foam::fvMesh& mesh = Q[0]->mesh();
     const Foam::surfaceVectorField n_face(mesh.Sf() / mesh.magSf());
 
@@ -445,7 +465,8 @@ inline Foam::scalar compute_dt
 
         if (lam > Foam::SMALL)
         {
-            const Foam::scalar dtFace = Co * minInradius[faceI] / lam;
+            const Foam::scalar dtFace =
+                Co * 2.0 * minInradius[faceI] / (dimFac * lam);
             dt = std::min(dt, dtFace);
         }
     }

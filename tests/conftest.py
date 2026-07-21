@@ -31,14 +31,30 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 
 # ── CFL law (user law — never silently reduced) ─────────────────────────────
-CFL_1D, CFL_2D = 0.9, 0.45
+# ONE number, in EVERY dimension.  ``numerics::compute_dt`` (numerics.H) now
+# carries the spatial-dimension factor INSIDE the formula, identical to core:
+#
+#     dt <= CFL * 2*r_in / (d * |lambda|_max)      (d = controlDict spaceDimension)
+#
+# so ``CFL`` is a pure safety factor in (0, 1] and "effective 0.9 in 1-D, 0.45
+# in 2-D" falls out of the ``1/d`` by construction.  A ``CFL_2D = 0.45``
+# constant encoded that same dimensional factor a SECOND time.  Do NOT split
+# this back per dimension — the mesh dimension reaches the solver through
+# ``spaceDimension`` in the case controlDict (``_pipeline._build_case``).
+CFL = 0.9
 
 # VAM / non-hydrostatic models carry their OWN documented limit: measured stable
 # only to ~0.15, breaking at 0.20 on the dispersive modes.  They therefore run at
 # the CASE-PROVEN CFL, and the law-CFL behaviour is REPORTED rather than silently
 # accommodated.  This is not an augmentation of the hyperbolic law — it is a
 # different model class with its own measured stability bound.
-CFL_VAM = 0.15
+#
+# RE-EXPRESSED, not reduced: that 0.15 was measured against the OLD
+# ``dt = Co*r_in/lam`` form.  The formula above delivers 2/d times more dt for
+# the same ``Co``; the VAM cases are 1-D (d = 1), so the SAME physical dt limit
+# is now written 0.075.  The measured bound is unchanged — only the units of
+# the knob are.
+CFL_VAM = 0.075
 
 # Smooth-problem order floors.  ONLY applied to smooth problems: the SWASHES
 # rates are RECORDED and compared, never floored (see test_swashes_convergence).

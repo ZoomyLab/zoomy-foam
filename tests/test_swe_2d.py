@@ -3,7 +3,7 @@
 Everything else in this suite is 1-D (SME(level=0, dimension=2) = one horizontal
 direction).  This is the only test that exercises the second horizontal momentum
 row, the 2-D flux assembly and a mesh whose faces are not all axis-aligned in a
-single direction — and the only one that runs at CFL_2D.
+single direction — and the only one that runs at CFL.
 """
 import time
 
@@ -13,7 +13,7 @@ import pytest
 import foam_models as models
 import foam_refs as refs
 import zoomy_foam._pipeline as rc
-from conftest import CFL_2D
+from conftest import CFL
 from foam_cases import chain, describe, gaussian_pulse_2d, march
 
 pytestmark = pytest.mark.skipif(
@@ -35,7 +35,7 @@ def test_swe_2d_pulse(overwrite, tmp_path, capsys):
     # BaseMesh.create_2d takes a FLAT (x_min, x_max, y_min, y_max) domain.
     Q, Qaux, info = march(model, tmp_path, n_inner_cells=(24, 24),
                           domain=(-1.0, 1.0, -1.0, 1.0), t_end=0.1,
-                          cfl=CFL_2D, order=1, dimension=2)
+                          cfl=CFL, order=1, dimension=2)
     elapsed = time.perf_counter() - t0
 
     assert Q.shape[0] == 4 and Q.shape[1] == 24 * 24

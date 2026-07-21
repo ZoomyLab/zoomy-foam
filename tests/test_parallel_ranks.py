@@ -23,7 +23,7 @@ import pytest
 import foam_models as models
 import foam_refs as refs
 import zoomy_foam._pipeline as rc
-from conftest import CFL_1D
+from conftest import CFL
 from foam_cases import SWASHES_DOMAIN, chain, describe, march, stoker_ic
 
 pytestmark = pytest.mark.skipif(
@@ -82,9 +82,9 @@ def test_two_rank_twin_small(overwrite, tmp_path, capsys):
 
     t0 = time.perf_counter()
     Q1, A1, i1 = march(model, tmp_path / "serial", n_inner_cells=32,
-                       domain=SWASHES_DOMAIN, t_end=0.5, cfl=CFL_1D, order=1)
+                       domain=SWASHES_DOMAIN, t_end=0.5, cfl=CFL, order=1)
     Q2, A2, i2 = march(model, tmp_path / "par2", n_inner_cells=32,
-                       domain=SWASHES_DOMAIN, t_end=0.5, cfl=CFL_1D, order=1,
+                       domain=SWASHES_DOMAIN, t_end=0.5, cfl=CFL, order=1,
                        nprocs=2)
     elapsed = time.perf_counter() - t0
 
@@ -132,9 +132,9 @@ def test_two_rank_physics(overwrite, tmp_path, capsys):
 
     t0 = time.perf_counter()
     Q1, A1, i1 = march(model, tmp_path / "serial", n_inner_cells=200,
-                       domain=SWASHES_DOMAIN, t_end=6.0, cfl=CFL_1D, order=2)
+                       domain=SWASHES_DOMAIN, t_end=6.0, cfl=CFL, order=2)
     Q2, A2, i2 = march(model, tmp_path / "par2", n_inner_cells=200,
-                       domain=SWASHES_DOMAIN, t_end=6.0, cfl=CFL_1D, order=2,
+                       domain=SWASHES_DOMAIN, t_end=6.0, cfl=CFL, order=2,
                        nprocs=2)
     elapsed = time.perf_counter() - t0
 

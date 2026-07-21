@@ -12,7 +12,7 @@ import pytest
 import foam_models as models
 import foam_refs as refs
 import zoomy_foam._pipeline as rc
-from conftest import CFL_1D
+from conftest import CFL
 from foam_cases import (SWASHES_DOMAIN, ETA_L, ETA_R, chain, describe, march,
                         stoker_ic)
 
@@ -31,7 +31,7 @@ def test_stoker_wet(overwrite, tmp_path, capsys):
 
     t0 = time.perf_counter()
     Q, Qaux, info = march(model, tmp_path, n_inner_cells=100,
-                          domain=SWASHES_DOMAIN, t_end=1.0, cfl=CFL_1D, order=1)
+                          domain=SWASHES_DOMAIN, t_end=1.0, cfl=CFL, order=1)
     elapsed = time.perf_counter() - t0
 
     assert Q.shape[0] == len(sm.state)
@@ -70,7 +70,7 @@ def test_stoker_wet_o2_small(overwrite, tmp_path, capsys):
 
     t0 = time.perf_counter()
     Q, Qaux, info = march(model, tmp_path, n_inner_cells=20,
-                          domain=SWASHES_DOMAIN, t_end=0.5, cfl=CFL_1D, order=2)
+                          domain=SWASHES_DOMAIN, t_end=0.5, cfl=CFL, order=2)
     elapsed = time.perf_counter() - t0
 
     assert np.isfinite(Q).all() and np.isfinite(Qaux).all()

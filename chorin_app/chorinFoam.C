@@ -143,6 +143,13 @@ int main(int argc, char *argv[])
     }
 
     const scalar Co = readScalar(runTime.controlDict().lookup("maxCo"));
+    // SPATIAL dimension actually solved (1 for an interval, 2 for a quad grid).
+    // The 1/d factor lives INSIDE numerics::compute_dt, exactly as in core, so
+    // maxCo is a pure safety factor in (0,1] and 0.9 is the law in every
+    // dimension.  OpenFOAM meshes 1-D/2-D cases as 3-D with `empty` directions,
+    // so this cannot be read off the mesh — the pipeline writes it.
+    const label spaceDimension =
+        runTime.controlDict().lookupOrDefault<label>("spaceDimension", 2);
     const scalar maxDeltaT =
         runTime.controlDict().lookupOrDefault<scalar>("maxDeltaT", GREAT);
     surfaceScalarField minInradius = numerics::computeFaceMinInradius(mesh, runTime);
@@ -306,7 +313,7 @@ int main(int argc, char *argv[])
     while (runTime.run())
     {
         Model::update_aux_variables(Q, QauxPred, pPred, 0.0, mesh);
-        scalar dt = numerics::compute_dt(Q, QauxPred, pPred, minInradius, Co);
+        scalar dt = numerics::compute_dt(Q, QauxPred, pPred, minInradius, Co, spaceDimension);
         dt = min(min(dt, maxDeltaT), endTime - runTime.value());
         runTime.setDeltaT(dt); ++runTime;
         const scalar dtu = runTime.deltaTValue();

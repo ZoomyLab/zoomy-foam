@@ -8,7 +8,7 @@ attributes (the GUI auto-generates widgets), a uniform
 VTK→h5 with ``zoomy_prepost``).
 
     from zoomy_foam.solvers import HyperbolicSolver
-    solver = HyperbolicSolver(CFL=0.45, order=2)
+    solver = HyperbolicSolver(CFL=0.9, order=2)
     solver.solve(model, mesh, settings)      # -> .pvd in settings.output.directory
 
 Design (gui REQ-133, user-approved 2026-07-13):
@@ -113,7 +113,10 @@ class HyperbolicSolver(_BaseSolver):
 
     The GUI auto-generates widgets from these bounded params."""
 
-    CFL = param.Number(0.45, bounds=(0.0, 1.0), doc="Courant number")
+    # The 1/d spatial-dimension factor lives INSIDE numerics::compute_dt
+    # (numerics.H), so CFL is a pure safety factor in (0, 1] and 0.9 is the
+    # law in 1-D and 2-D alike.  0.45 here double-counted the dimension.
+    CFL = param.Number(0.9, bounds=(0.0, 1.0), doc="Courant number")
     order = param.Integer(1, bounds=(1, 2), doc="spatial reconstruction order")
     time_scheme = param.Selector(
         default="explicit", objects=["explicit", "imex"],
@@ -134,7 +137,9 @@ class SplitSolver(_BaseSolver):
     wrapper drives the ``chorinFoam`` app (split codegen → wmake chorin_app →
     case → run → VTK) and exposes only the march / pressure-solve knobs."""
 
-    cfl = param.Number(0.30, bounds=(0.0, 1.0), doc="Courant number")
+    # Chorin/VAM keeps its own MEASURED bound (see tests/conftest CFL_VAM),
+    # re-expressed for the corrected compute_dt: 0.15 old form -> 0.075.
+    cfl = param.Number(0.075, bounds=(0.0, 1.0), doc="Courant number")
     pressure_tol = param.Number(1e-8, bounds=(0.0, None),
                                 doc="Chorin pressure BiCGStab tolerance")
     pressure_maxit = param.Integer(2000, bounds=(1, None),

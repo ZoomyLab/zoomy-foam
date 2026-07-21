@@ -26,7 +26,7 @@ import pytest
 import foam_models as models
 import foam_refs as refs
 import zoomy_foam._pipeline as rc
-from conftest import CFL_1D, fit_order
+from conftest import CFL, fit_order
 from foam_cases import (DRY_NEG_TOL, SWASHES_DOMAIN, SWASHES_T_END, chain,
                         describe, ic_for, l1_vs_analytic, march)
 
@@ -63,7 +63,7 @@ def test_swashes_order(overwrite, tmp_path, capsys, case, order):
     for n in SIZES:
         Q, Qaux, info = march(model, tmp_path / f"n{n}", n_inner_cells=n,
                               domain=SWASHES_DOMAIN, t_end=SWASHES_T_END,
-                              cfl=CFL_1D, order=order, extra_settings=extra)
+                              cfl=CFL, order=order, extra_settings=extra)
         assert np.isfinite(Q).all(), f"non-finite state at n = {n}"
         assert Q[1].min() >= h_floor, (
             f"depth {Q[1].min():.3e} at n = {n} below the permitted bound "

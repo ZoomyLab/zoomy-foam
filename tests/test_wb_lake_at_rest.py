@@ -18,7 +18,7 @@ import pytest
 import foam_models as models
 import foam_refs as refs
 import zoomy_foam._pipeline as rc
-from conftest import CFL_1D
+from conftest import CFL
 from foam_cases import chain, describe, lake_at_rest_ic, march, read_raw_state
 
 pytestmark = pytest.mark.skipif(
@@ -61,7 +61,7 @@ def test_lake_at_rest_over_bump(overwrite, tmp_path, capsys):
 
     t0 = time.perf_counter()
     Q, Qaux, info = march(model, tmp_path, n_inner_cells=100, domain=DOMAIN,
-                          t_end=1.0, cfl=CFL_1D, order=1)
+                          t_end=1.0, cfl=CFL, order=1)
     elapsed = time.perf_counter() - t0
 
     assert np.isfinite(Q).all() and np.isfinite(Qaux).all()
@@ -95,7 +95,7 @@ def test_wb_drift_long_march(overwrite, tmp_path, capsys):
 
     t0 = time.perf_counter()
     Q, Qaux, info = march(model, tmp_path, n_inner_cells=200, domain=DOMAIN,
-                          t_end=50.0, cfl=CFL_1D, order=2, snapshots=10)
+                          t_end=50.0, cfl=CFL, order=2, snapshots=10)
     elapsed = time.perf_counter() - t0
 
     assert np.isfinite(Q).all() and np.isfinite(Qaux).all()
