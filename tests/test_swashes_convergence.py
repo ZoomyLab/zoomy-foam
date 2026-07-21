@@ -63,6 +63,32 @@ def test_swashes_order(overwrite, tmp_path, capsys, case, order):
     # emitted by core), so the exemption is gone.
     h_floor = 0.0
 
+    # ── OPEN FINDING (2026-07-21), reported, NOT worked around ───────────────
+    # `[2-ritter_dry]` ABORTS at n = 400 with SIGFPE (rc = -8) since the MOOD
+    # detector became strict.  It is a pre-existing defect that the dead band
+    # was HIDING, not a regression introduced by the strict bound:
+    #
+    #   * pre-change (dead band -1e-10) the same march completes, rate 1.004;
+    #   * post-change it aborts, and the solver log shows the mechanism:
+    #         [MOOD] troubled = 9
+    #         [MOOD] WARNING still troubled = 5 after override    <- "should
+    #         [MOOD] troubled = 11                                    never fire"
+    #       then powf64 raises FE_INVALID inside libm.
+    #
+    # Two separate defects, neither of them in this test:
+    #   1. zoomyFoam.C's apply_mood assumes ONE pass suffices ("it cannot seed
+    #      a new one").  The WARNING firing proves that assumption false — the
+    #      O1 override does not restore positivity here, so negative h survives
+    #      into Q^n.
+    #   2. the emitted eigenvalue slot evaluates sqrt(g)*sqrt(h**5)/h**2, which
+    #      is NaN/FE_INVALID for h < 0.  That expression comes from zoomy_core
+    #      (regularize_pow / the eigenvalue slot), not from this backend.
+    #
+    # Deliberately NOT "fixed" here by widening the bound back (that IS the
+    # defect), by flooring h (forbidden by the user law), or by xfail (that
+    # would hide a live physics defect behind a green suite).  The abort is the
+    # honest signal.  Fixing (2) needs the zoomy_core owner.
+
     errs, Q, Qaux = [], None, None
     t0 = time.perf_counter()
     for n in SIZES:
