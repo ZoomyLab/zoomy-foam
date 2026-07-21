@@ -25,7 +25,7 @@ import json, pathlib, numpy as np
 
 DIR = pathlib.Path(__file__).parent / "refs"
 TIMES = DIR / "timings.json"
-SLOWER_OK = 1.10          # a test may get 10% slower; faster ratchets down
+SLOWER_OK = 1.25          # user ruling 2026-07-21: 10% sat below this shared box's noise floor (23% spread measured on identical code); faster ratchets down
 
 # ── PARKED, WITH MEASURED NUMBERS: the 10% budget is below foam's noise floor ──
 #
