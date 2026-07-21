@@ -107,6 +107,32 @@ def overwrite(request):
             or os.environ.get("ZOOMY_OVERWRITE_RESULTS") == "1")
 
 
+@pytest.fixture(autouse=True)
+def _timing_tier(request):
+    """Tell ``foam_refs.check_time`` which tier the running test is in.
+
+    USER RULING 2026-07-21: the wall-time budget ASSERTS only for tests marked
+    ``regression`` / ``large``; everywhere else it still measures, prints and
+    ratchets, but a slow run does not fail the gate.  Reason: the ratchet
+    records the FASTEST time ever seen, so on this shared box a normal run of
+    unchanged code trips even a 25% tolerance (measured: 23% spread across five
+    back-to-back runs).
+
+    Derived from the item's own markers rather than from an argument at each
+    ``check_time`` call site, so the gate cannot drift out of sync with how a
+    test is actually tiered.
+    """
+    import foam_refs
+
+    prev = foam_refs.ASSERT_TIME
+    foam_refs.ASSERT_TIME = bool(
+        {"regression", "large"} & set(request.node.keywords))
+    try:
+        yield
+    finally:
+        foam_refs.ASSERT_TIME = prev
+
+
 def fit_order(sizes, errors):
     """Fitted convergence rate from a resolution sweep (least squares in log)."""
     return float(-np.polyfit(np.log(sizes), np.log(errors), 1)[0])

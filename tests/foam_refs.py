@@ -61,12 +61,15 @@ SLOWER_OK = 1.25          # user ruling 2026-07-21: 10% sat below this shared bo
 # (+10% to +32%) with zero physics failures. So the flakiness is confined to this
 # assertion and never touches a correctness claim.
 #
-# This is a change to an approved design and is NOT taken unilaterally here, so
-# SLOWER_OK stays at 1.10 and the mechanism is untouched. Options for the user,
-# in preference order: (a) raise SLOWER_OK for foam to ~1.35, above the measured
-# floor; (b) record a median of N runs instead of ratcheting to the minimum;
-# (c) re-bless on an idle box and treat timing failures as advisory. Until one is
-# chosen, expect timing failures whenever the box is under concurrent load.
+# RESOLVED 2026-07-21 (user ruling), and it is NOT option (a) alone. Two changes:
+#   * SLOWER_OK raised 1.10 -> 1.25, above this box's noise floor;
+#   * the ASSERTION is SCOPED to the `regression` / `large` tiers (see
+#     `ASSERT_TIME` and conftest's `_timing_tier` fixture).
+# Everything still MEASURES, PRINTS and RATCHETS everywhere — the user wants
+# every wall time reported — but only the heavy tiers, whose runtime is a
+# deliberate claim, can fail on it. This kills the failure mode where the
+# ratchet drives the reference to the fastest run ever seen and a healthy
+# median-speed run then trips the budget with identical physics.
 
 
 def check(name, overwrite=False, **arrays):
@@ -83,15 +86,38 @@ def check(name, overwrite=False, **arrays):
             f"{name}.{k}: max|diff| {np.abs(v - ref[k]).max():.3e}"
 
 
+#: Whether :func:`check_time` ASSERTS or merely records.  Set per test by the
+#: ``_timing_tier`` autouse fixture in conftest: True only for the
+#: ``regression`` / ``large`` tiers (user ruling 2026-07-21).  Default False so
+#: a direct call outside pytest records rather than fails.
+ASSERT_TIME = False
+
+
 def check_time(name, seconds, overwrite=False):
-    """Fail if >10% slower than the recorded time; lower it if faster."""
+    """Record the wall time, ratchet the reference down, assert on heavy tiers.
+
+    MEASURE EVERYWHERE, FAIL NARROWLY (user ruling 2026-07-21).  Every test
+    still prints its wall time and still ratchets the stored reference — the
+    user wants every time reported.  What is scoped is the ASSERTION: only
+    ``regression`` / ``large`` tests fail on a slowdown, because those are the
+    ones whose runtime is a deliberate claim.  On the small gate,
+    ratchet-to-minimum plus this box's measured 23% run-to-run spread makes the
+    budget fire on unchanged physics — noise, not signal (see SLOWER_OK above).
+    """
     db = json.loads(TIMES.read_text()) if TIMES.exists() else {}
     ref = db.get(name)
-    print(f"[time] {name}: {seconds:.2f} s (ref {ref})")
+    gate = "assert" if ASSERT_TIME else "record-only"
+    print(f"[time] {name}: {seconds:.2f} s (ref {ref}) [{gate}]")
     if overwrite or ref is None or seconds < ref:
         db[name] = round(seconds, 3)
         DIR.mkdir(exist_ok=True)
         TIMES.write_text(json.dumps(dict(sorted(db.items())), indent=1))
+        return
+    if not ASSERT_TIME:
+        # Still SURFACE the regression — it is just not fatal on this tier.
+        if seconds > ref * SLOWER_OK:
+            print(f"[time] NOTE {name}: {seconds:.2f}s vs {ref:.2f}s "
+                  f"(+{100*(seconds/ref-1):.0f}%) — not asserted on this tier")
         return
     assert seconds <= ref * SLOWER_OK, \
         f"{name}: {seconds:.2f}s vs {ref:.2f}s (+{100*(seconds/ref-1):.0f}%)"
