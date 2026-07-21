@@ -1,16 +1,16 @@
 {
  "parallel_2rank_small": 23.031,
- "ritter_dry": 8.648,
- "ritter_dry_o2_small": 8.604,
+ "ritter_dry": 8.616,
+ "ritter_dry_o2_small": 8.524,
  "stoker_wet": 8.57,
- "stoker_wet_o2_small": 8.583,
+ "stoker_wet_o2_small": 8.542,
  "swashes_ritter_dry_o1": 26.028,
  "swashes_ritter_dry_o2": 26.614,
  "swashes_stoker_wet_o1": 25.9,
  "swashes_stoker_wet_o2": 26.117,
- "swe_2d": 9.419,
+ "swe_2d": 9.363,
  "vam_bump": 26.901,
- "vam_chorin": 13.369,
- "wb_lake": 8.733,
+ "vam_chorin": 13.313,
+ "wb_lake": 8.671,
  "wb_long": 10.131
 }

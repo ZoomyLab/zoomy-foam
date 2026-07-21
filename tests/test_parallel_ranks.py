@@ -24,7 +24,8 @@ import foam_models as models
 import foam_refs as refs
 import zoomy_foam._pipeline as rc
 from conftest import CFL
-from foam_cases import SWASHES_DOMAIN, chain, describe, march, stoker_ic
+from foam_cases import (SWASHES_DOMAIN, assert_cfl_sets_dt, cfl_witness, chain,
+                        describe, march, stoker_ic)
 
 pytestmark = pytest.mark.skipif(
     not rc.SIF.exists(), reason=f"OpenFOAM apptainer image not found at {rc.SIF}")
@@ -74,7 +75,17 @@ def assert_aux_matches_except_interface(A1, A2, n, label):
 @pytest.mark.small
 @pytest.mark.foam
 def test_two_rank_twin_small(overwrite, tmp_path, capsys):
-    """Small twin: 32 cells, short march, full state compared 1-rank vs 2-rank."""
+    """Small twin: 32 cells, full state compared 1-rank vs 2-rank.
+
+    ``t_end=8, snapshots=1`` so the CFL law sets dt.  At the original
+    ``t_end=0.5, snapshots=2`` the 0.25 s writeInterval clamped dt below the
+    1.27 s dt_CFL, both ranks took exactly 2 writer-set steps, and the
+    rank-invariance claim ("the global dt reduction is rank-invariant") was
+    vacuous — the two ranks agreed because neither was choosing dt.  Now the
+    global reduction genuinely runs every step: measured 8 steps, dt[0]=1.14286
+    (CFL 0.45 gives 15 steps, dt[0]=0.615385).
+    """
+    T_END, SNAPS = 8.0, 1
     model = models.swe(dimension=2, bc="swashes", ic=stoker_ic)
     sm, nsm = chain(model)
     with capsys.disabled():
@@ -82,10 +93,11 @@ def test_two_rank_twin_small(overwrite, tmp_path, capsys):
 
     t0 = time.perf_counter()
     Q1, A1, i1 = march(model, tmp_path / "serial", n_inner_cells=32,
-                       domain=SWASHES_DOMAIN, t_end=0.5, cfl=CFL, order=1)
+                       domain=SWASHES_DOMAIN, t_end=T_END, cfl=CFL, order=1,
+                       snapshots=SNAPS)
     Q2, A2, i2 = march(model, tmp_path / "par2", n_inner_cells=32,
-                       domain=SWASHES_DOMAIN, t_end=0.5, cfl=CFL, order=1,
-                       nprocs=2)
+                       domain=SWASHES_DOMAIN, t_end=T_END, cfl=CFL, order=1,
+                       nprocs=2, snapshots=SNAPS)
     elapsed = time.perf_counter() - t0
 
     _assert_decomposed(tmp_path / "par2", 2)
@@ -96,8 +108,11 @@ def test_two_rank_twin_small(overwrite, tmp_path, capsys):
     # same global dt and the same fluxes, so any drift here is a real defect.
     assert np.array_equal(Q1, Q2), f"sharded state: {np.abs(Q1 - Q2).max():.3e}"
     assert_aux_matches_except_interface(A1, A2, 32, "twin")
+    # Both ranks must be CFL-driven, else the rank-invariance claim is vacuous.
+    assert_cfl_sets_dt(i1, t_end=T_END, snapshots=SNAPS, label="par_1rank")
+    assert_cfl_sets_dt(i2, t_end=T_END, snapshots=SNAPS, label="par_2rank")
 
-    refs.check("parallel_2rank_small", overwrite, Q=Q2, Qaux=A2)
+    refs.check("parallel_2rank_small", overwrite, Q=Q2, Qaux=A2, **cfl_witness(i2))
     refs.check_time("parallel_2rank_small", elapsed, overwrite)
 
 

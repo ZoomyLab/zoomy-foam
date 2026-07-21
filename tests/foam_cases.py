@@ -64,6 +64,19 @@ ESC_DOMAIN, ESC_NCELLS = (-1.5, 1.5), 60
 # This is NOT a floor and NOT a clip: h is never modified: the bound is an
 # assertion threshold, and the exact value is stored in the reference so any
 # drift fails the comparison.  Order 1 keeps the strict ``h >= 0``.
+#
+# UPDATE 2026-07-21: the twin's march changed (t_end 0.5 -> 8.0, snapshots 2 -> 1)
+# so the CFL, not the writeInterval, sets dt — see ``assert_cfl_sets_dt``.  The
+# numbers above are the ORIGINAL t=0.5 measurement and are kept because they are
+# what motivates this bound.  Re-measured on the new twin (t = 8.0 s, 24 steps,
+# CFL 0.9, mood): min h = +5.722e-06, i.e. strictly POSITIVE — the longer march
+# leaves the front no longer sitting on the roundoff-scale undershoot.
+#
+# CAVEAT, worth naming: this bound (1e-10) is numerically the SAME as the
+# hard-coded dead band in foam's own MOOD detector (``zoomyFoam.C``:
+# ``bad = (h < -1.0e-10)``), whereas core and amrex detect on strict zero.  So
+# an undershoot in (-1e-10, 0) is invisible to BOTH the detector and this
+# assertion on this backend only.  Reported, not silently changed.
 DRY_NEG_TOL = 1e-10
 
 
@@ -322,6 +335,62 @@ def solver_steps(logpath) -> dict:
     return {"t": t, "dt": dts, "n_steps": int(t.size),
             "n_dof_q": int(dof.group(1)) if dof else None,
             "solver_wall": float(wall.read_text()) if wall.exists() else None}
+
+
+def assert_cfl_sets_dt(info, *, t_end, snapshots, label, min_steps=4):
+    """Fail unless the CFL law — not the OUTPUT WRITER — chose dt.
+
+    WHY THIS EXISTS (measured 2026-07-21).  ``controlDict`` uses ``writeControl
+    adjustableRunTime`` with ``writeInterval = t_end/n_snap``, and OpenFOAM
+    subdivides each write interval into ``ceil(writeInterval/dt_CFL)`` equal
+    steps so a write lands exactly on the interval boundary.  When ``dt_CFL >=
+    writeInterval`` that collapses to ``dt = writeInterval`` and the CFL number
+    never influences the march at all.
+
+    The three ``*_small`` twins sat in exactly that regime: 20-32 cells,
+    ``t_end = 0.5``, ``snapshots = 2`` gave ``writeInterval = 0.25`` while
+    ``dt_CFL`` was 1.02 s (old law) then 2.04 s (CFL=0.9).  Both clamp to 0.25,
+    so all three came back BIT-IDENTICAL (0.000e+00) across a change that
+    DOUBLED dt — a CFL regression was structurally invisible to them, and their
+    ``n_steps >= 2`` passed trivially because 0.5/0.25 is always 2.
+
+    The invariant asserted here is exact, not heuristic: ``dt[0] ==
+    writeInterval`` iff the CFL bound was looser than the interval, so
+    ``dt[0] < writeInterval`` is precisely "the CFL bound is the binding one".
+    ``min_steps`` additionally rejects the marginal case where the interval sits
+    just above ``dt_CFL`` and yields a two-step march that barely resolves it.
+    """
+    write_interval = t_end / max(int(snapshots), 1)
+    dt = np.asarray(info["dt"], float)
+    assert dt.size and np.all(dt > 0.0), f"[{label}] no positive steps recorded"
+    dt0 = float(dt[0])
+    assert dt0 < write_interval - 1e-12, (
+        f"[{label}] dt[0] = {dt0:.6g} is not below the write interval "
+        f"{write_interval:.6g} — the writeInterval, not the CFL law, is setting "
+        f"dt, so this case CANNOT see a CFL regression (it would come back "
+        f"bit-identical). Raise t_end / lower snapshots / refine the mesh.")
+    assert info["n_steps"] >= min_steps, (
+        f"[{label}] {info['n_steps']} steps (< {min_steps}) — too few for the "
+        f"CFL to be meaningfully exercised")
+    print(f"[cfl-dt] {label}: n_steps={info['n_steps']} dt[0]={dt0:.6g} "
+          f"(writeInterval {write_interval:.6g}) "
+          f"dt in [{dt.min():.6g}, {dt.max():.6g}]")
+    return dt0
+
+
+def cfl_witness(info):
+    """Shape-stable CFL fingerprint for a reference ``.npz``.
+
+    Pins the achieved step count and dt spread so a CFL-law change cannot come
+    back bit-identical.  Deliberately NOT the whole ``dt`` array: its LENGTH
+    changes with the law, and a mismatched-shape ``np.allclose`` raises
+    ``ValueError`` (a test ERROR) instead of failing the assertion cleanly.
+    """
+    dt = np.asarray(info["dt"], float)
+    return {"n_steps": np.array([info["n_steps"]], float),
+            "dt0": np.array([dt[0]]),
+            "dt_min": np.array([dt.min()]),
+            "dt_max": np.array([dt.max()])}
 
 
 def cell_centers(domain, n):
