@@ -40,7 +40,7 @@ SWASHES_T_END = 6.0
 # The cached SWASHES analytic tables live in the thesis case; zoomy_foam always
 # sits inside the superrepo, so this relative hop is stable.
 SWASHES_REF_DIR = (pathlib.Path(__file__).resolve().parents[3]
-                   / "thesis" / "cases" / "swe_swashes_verification"
+                   / "thesis" / "cases" / "verification" / "swe_swashes"
                    / "reference")
 
 # Escalante / bump (VAM chorin) geometry.
@@ -410,7 +410,7 @@ def swashes_table(case: str) -> tuple:
         raise AssertionError(
             f"missing SWASHES analytic table {path} — regenerate it with "
             f"`python run_verification.py` in thesis/cases/"
-            f"swe_swashes_verification (needs the `swashes` binary).")
+            f"verification/swe_swashes (needs the `swashes` binary).")
     cols: dict = {}
     with path.open() as fh:
         for row in csv.DictReader(fh):
