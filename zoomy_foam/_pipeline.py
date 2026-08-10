@@ -84,7 +84,7 @@ def _codegen(model):
     from zoomy_core.systemmodel import SystemModel
     from zoomy_core.fvm.riemann_solvers import PositiveNonconservativeRusanov
     from zoomy_core.transformation.to_openfoam import (
-        FoamSystemModelPrinter, FoamNumericsPrinter)
+        FoamSystemModelPrinter, FoamNumericsPrinter, _promote_with_dry_gate)
     from zoomy_foam._constants import write_march_constants
     sm = SystemModel.from_model(model)
     # Emission order kept as it was (Model.H before the Riemann solver is
@@ -93,12 +93,24 @@ def _codegen(model):
     # yields a BYTE-IDENTICAL Model.H, so the order is not load-bearing — it is
     # preserved only to keep this diff to the constants emission.
     FoamSystemModelPrinter.write_code(sm, FOAM_ROOT / "Model.H")
-    nsm = PositiveNonconservativeRusanov(model=sm)
-    FoamNumericsPrinter.write_code(nsm, FOAM_ROOT / "NumericsKernels.H")
+    # Belt AND braces: promote to the gated NSM HERE, before constructing the
+    # Riemann numerics, rather than relying on ``FoamNumericsPrinter`` to fix
+    # it up later.  ``Numerics.__init__`` (riemann_solvers.py) snapshots
+    # ``local_max_abs_eigenvalue`` EAGERLY at construction from whatever
+    # ``model=`` it is handed; a bare ``sm`` here (as this used to pass)
+    # freezes that snapshot WITHOUT ``desingularize_hinv`` / the REQ-82 eigen-
+    # value floor, so the emitted eigenvalue/flux kernels carry a raw,
+    # unguarded ``1/h`` — silently, not a crash (``FoamSystemModelPrinter``
+    # above is unaffected: it promotes its OWN copy internally).
+    # ``_promote_with_dry_gate`` is idempotent — a no-op if ``sm`` already
+    # somehow arrived as an NSM.
+    nsm = _promote_with_dry_gate(sm)
+    numerics = PositiveNonconservativeRusanov(model=nsm)
+    FoamNumericsPrinter.write_code(numerics, FOAM_ROOT / "NumericsKernels.H")
     # Mandate 6a: the MOOD detector bound is RESOLVED BY CORE, not restated as a
     # literal in zoomyFoam.C.  Emitted on EVERY codegen so the header can never
     # lag the model the binary is compiled against.
-    write_march_constants(nsm, FOAM_ROOT / "MarchConstants.H")
+    write_march_constants(numerics, FOAM_ROOT / "MarchConstants.H")
     return sm
 
 
@@ -685,7 +697,7 @@ def _codegen_chorin(model):
     import sympy as sp
     from zoomy_core.systemmodel import SystemModel
     from zoomy_core.transformation.to_openfoam import (
-        FoamSystemModelPrinter, FoamNumericsPrinter)
+        FoamSystemModelPrinter, FoamNumericsPrinter, _promote_with_dry_gate)
     from zoomy_core.fvm.riemann_solvers import PositiveNonconservativeRusanov
     # SystemModel.from_model (NOT model.system_model): the latter currently trips
     # over VAM's dict-shaped interpolate_to_3d (core regression); from_model is the
@@ -696,8 +708,14 @@ def _codegen_chorin(model):
     split = model.chorin_split(dt, system_model=full)
     FoamSystemModelPrinter.write_code(split.SM_pred, FOAM_ROOT / "Model.H",
                                       namespace_name="Model")
+    # Belt AND braces (same reasoning as ``_codegen``): promote the predictor
+    # sub-system to the gated NSM before constructing the Riemann numerics.
+    # ``split_for_pressure_structural`` (model/splitter.py) already ATTEMPTS
+    # this per sub-system, but discards the promoted return value, so
+    # ``split.SM_pred`` still arrives here as a bare, un-gated SystemModel —
+    # verified empirically, not assumed.  Idempotent either way.
     FoamNumericsPrinter.write_code(
-        PositiveNonconservativeRusanov(model=split.SM_pred),
+        PositiveNonconservativeRusanov(model=_promote_with_dry_gate(split.SM_pred)),
         FOAM_ROOT / "NumericsKernels.H")
     FoamSystemModelPrinter.write_code(split.SM_press, FOAM_ROOT / "Pressure.H",
                                       namespace_name="ChorinPressure", dt_symbol=dt)
