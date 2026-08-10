@@ -942,10 +942,26 @@ bool Foam::functionObjects::swePreciceCoupling::execute()
     { winFresh_ = true; winFresh2_ = true; ++winIdx_; }
     if (precice_->requiresReadingCheckpoint())      readCheckpoint();
     else if (precice_->requiresWritingCheckpoint()) writeCheckpoint();
+    // Write at the window end NEAREST the requested instant (half-window
+    // tolerance), not at the first one strictly past it.  `SMALL` (1e-15)
+    // cannot bridge the clock's accumulated round-off (~2e-13 by t=4 s at
+    // window 2e-3), so a target that IS a window end is missed and the write
+    // lands one whole window late -- off the peer solver's runTime grid.
     if (precice_->isTimeWindowComplete()
-        && mesh_.time().value() + SMALL >= lastWrite_ + outInterval_)
+        && mesh_.time().value() + 0.5*mesh_.time().deltaTValue()
+           >= lastWrite_ + outInterval_)
     {
-        const_cast<Time&>(mesh_.time()).writeNow(); lastWrite_ = mesh_.time().value();
+        const_cast<Time&>(mesh_.time()).writeNow();
+        // Re-base on the OUTPUT GRID, not on the write time.  A window end
+        // overshoots the requested instant by up to one window; carrying that
+        // overshoot into the next target ratchets the whole write series
+        // forward (measured: 0.024 s of drift over 4 s at window 2e-3).  The
+        // peer solver writes on the exact runTime grid, so the two series then
+        // no longer share instants and every cross-participant mass balance
+        // has to interpolate -- which aliases |d2M/dt2|*dT^2 (~7e-6 m^2 here,
+        // three orders above the true coupling residual) into a phantom drift.
+        lastWrite_ =
+            outInterval_*std::floor(mesh_.time().value()/outInterval_ + 0.5);
         // canonical-column output: the SAME [b,h,u,v,w,p](zeta) data the
         // coupling exchanges (writeBack), persisted for postprocessing —
         // plots then show exactly what the peer received.

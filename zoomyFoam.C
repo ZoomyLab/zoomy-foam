@@ -460,6 +460,22 @@ int main(int argc, char *argv[])
         Model::update_aux_variables(Q, Qaux, p, dtAux, mesh);
         scalar dt = numerics::compute_dt(Q, Qaux, p, minInradius, Co, spaceDimension);
         dt = Foam::min(dt, maxDeltaT);   // honor the optional hard dt cap
+        // Land EXACTLY on the absolute write instants k*writeInterval.  The
+        // write below is gated on "within half a step of k*writeInterval", so
+        // without this clamp the frame on disk carries the time of whatever
+        // substep happened to straddle the instant (measured: 3.949703 for a
+        // 0.05 grid, as soon as the CFL binds inside a coupling window and the
+        // solver subcycles).  The peer participant and the monolithic
+        // reference write at 3.95, so every cross-run balance then has to
+        // interpolate across a whole write interval — which aliases
+        // |d2M/dt2|*dT^2 into a phantom mass drift orders above the real
+        // coupling residual.  The clamp only ever SHORTENS the step, so it
+        // stays inside the CFL bound and inside the remaining coupling window.
+        {
+            const scalar dtWrite =
+                nextWriteIndex*outInterval - runTime.value();
+            if (dtWrite > SMALL && dtWrite < dt) dt = dtWrite;
+        }
         scalar dt_used;
         if (precice.active())
         {
@@ -631,10 +647,14 @@ int main(int argc, char *argv[])
         {
             precice.readCheckpoint(Q);
         }
-        else if (runTime.value() + 0.5*dt_used >= nextWriteIndex*outInterval)
+        else if (runTime.value()
+                 >= nextWriteIndex*outInterval - 1e-9*outInterval)
         {
-            // Landed on (within half a step of) the next absolute write
-            // boundary k*writeInterval — write there and advance to the next k.
+            // Landed ON the next absolute write boundary k*writeInterval (the
+            // dt clamp above guarantees it to round-off) — write there and
+            // advance to the next k.  A half-STEP tolerance here would fire
+            // one substep early and then skip the boundary entirely, putting
+            // the frame at e.g. 3.949703 instead of 3.95.
             runTime.writeNow();
             nextWriteIndex =
                 Foam::label(runTime.value()/outInterval + 0.5) + 1;
