@@ -112,13 +112,23 @@ def build_system_model(level, outer="extrapolation", closure="none", bcs="coupli
     # standard Manning term  −g·n²·q|q|/h^(7/3)  on the momentum row — the stiff
     # source the IMEX scheme treats implicitly (and exactly the SWASHES
     # MacDonald-case friction).  "none" = inviscid (production default).
-    # "newtonian" = the full vertical-stress closure set (Newtonian shear +
-    # Navier bed slip + stress-free surface): activates the moment equations
-    # (q_1.. relax toward a sheared equilibrium profile).  nu / lambda_s are
-    # RUNTIME modelParameters — but only if these closures are emitted.
+    # "newtonian" and "roughwall" are both the full vertical-stress closure set
+    # (Newtonian bulk shear + a BED law + stress-free surface), which activates
+    # the moment equations (q_1.. relax toward a sheared equilibrium profile);
+    # they differ ONLY in the bed law:
+    #   newtonian  NavierSlip  τ_b = λ_s u_b            LINEAR, and λ_s is a
+    #              friction COEFFICIENT (not a slip length): the damping rate
+    #              is λ_s/(ρh), so an O(1) λ_s critically damps a shallow flow.
+    #   roughwall  RoughWall   τ_b = ρ C_f u_b|u_b|,  C_f = (κ/ln(z_p/z_0))²,
+    #              z_0 = k_s/30 — the turbulent log-law bed drag, parameterised
+    #              by a MEASURABLE roughness k_s and reference height z_p.
+    # nu / lambda_s / k_s / z_p / kappa are RUNTIME modelParameters — but only
+    # the ones the emitted closure set actually registers.
     closures = ([C.ManningFriction()] if closure == "manning"
                 else [C.Newtonian(), C.NavierSlip(), C.StressFree()]
-                if closure == "newtonian" else [])
+                if closure == "newtonian"
+                else [C.Newtonian(), C.RoughWall(), C.StressFree()]
+                if closure == "roughwall" else [])
     return SystemModel.from_model(     # REQ-143: from_model is the one path
         SME(level=level, closures=closures, project_nz=project_nz,
             boundary_conditions=boundary))
@@ -150,7 +160,9 @@ if __name__ == "__main__":
     ap.add_argument("--out", type=Path, default=HERE)
     ap.add_argument("--outer", choices=["extrapolation", "wall"],
                     default="extrapolation")
-    ap.add_argument("--closure", choices=["none", "manning", "newtonian"], default="none")
+    ap.add_argument("--closure",
+                    choices=["none", "manning", "newtonian", "roughwall"],
+                    default="none")
     ap.add_argument("--bcs", choices=["coupling", "open", "subcritical"],
                     default="coupling")
     ap.add_argument("--q-in", type=float, default=1.0)
