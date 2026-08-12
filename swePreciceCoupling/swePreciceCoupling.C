@@ -474,7 +474,22 @@ namespace
 // the window target from the identical exchanged snapshot pair with the
 // identical kernel -> bit-identical -> the debt ledger closes the interface
 // mass budget exactly.
-Foam::List<Foam::scalar> charGhostLocal(
+//
+// RE-SYNCED 2026-08-12.  "Kept in sync by hand" failed exactly as designed:
+// the SME side gained an OBLIQUE-FACE path (PreciceManager.H::
+// characteristicGhost) when the 2-D models arrived, this copy did not, and it
+// still took the face normal as the SCALAR normalX.  On a face whose normal is
+// not +/-x that is not an approximation, it is a SILENT disconnection: for
+// n = (0,+/-1,0) normalX = 0, the incoming test `lam(k)*normalX < 0` is false
+// for EVERY characteristic, the ghost collapses to the interior state and the
+// VOF computes its window mass target with ZERO peer influence.  The `central`
+// and `shared` mass rows below carried the same defect as a bare `*nHat.x()`
+// factor, which is identically zero on a y-normal face -- so that interface
+// exchanged nothing while the run converged and exited 0.
+//
+// x-normal faces take the legacy path unchanged: this function IS the previous
+// charGhostLocal, byte for byte, and the wrapper below hands it nOut.x().
+Foam::List<Foam::scalar> charGhostLocalX(
     const Foam::List<Foam::scalar>& q,
     const Foam::List<Foam::scalar>& qaux,
     const Foam::List<Foam::scalar>& peer,
@@ -507,6 +522,60 @@ Foam::List<Foam::scalar> charGhostLocal(
     const Eigen::Matrix<double, n, 1> qg = R * wg;
     for (int i = 0; i < n; ++i) ghost[i] = qg(i);
     return ghost;
+}
+
+//- Normal-aware entry point: the oblique branch of
+//  PreciceManager::characteristicGhost, ported verbatim.
+//  Oblique coupled faces (unit outward normal with a genuine y component):
+//  exploit ROTATION INVARIANCE -- rotate every horizontal moment PAIR into the
+//  face frame (q_n, q_t), where the x-quasilinear operator of the rotated
+//  state IS A·n and the outward normal maps to +x, run the x-aligned
+//  characteristic filter, rotate the ghost back.  2-D moment states are
+//  GROUPED BY DIRECTION [b, h, q_x_0..q_x_L, q_y_0..q_y_L] (SWE = L=0 =
+//  [b,h,hu,hv]); each moment pair (q_x_k, q_y_k) transforms as a plane vector,
+//  so ONE rotation per pair covers the whole hierarchy.  x-normal faces take
+//  the legacy path unchanged (bit-compatible with every validated 1-D
+//  coupling case).
+Foam::List<Foam::scalar> charGhostLocal(
+    const Foam::List<Foam::scalar>& q,
+    const Foam::List<Foam::scalar>& qaux,
+    const Foam::List<Foam::scalar>& peer,
+    const Foam::vector& nOut,
+    const Foam::List<Foam::scalar>& p)
+{
+    if (Foam::mag(nOut.y()) > 1e-12)
+    {
+        if (Model::dimension != 2 || (Model::n_dof_q - 2) % 2 != 0)
+        {
+            FatalErrorInFunction
+                << "[swePreciceCoupling] oblique coupled face (n=" << nOut
+                << ") needs the grouped 2-D layout [b,h,qx_k...,qy_k...]."
+                << Foam::exit(Foam::FatalError);
+        }
+        const int nm = (Model::n_dof_q - 2) / 2;   // moment pairs
+        const Foam::scalar cx = nOut.x(), cy = nOut.y();
+        auto rot = [&](const Foam::List<Foam::scalar>& v)
+        {
+            Foam::List<Foam::scalar> r(v);
+            for (int k = 0; k < nm; ++k)
+            {
+                const Foam::scalar qx = v[2 + k], qy = v[2 + nm + k];
+                r[2 + k]      =  qx*cx + qy*cy;    // q_n
+                r[2 + nm + k] = -qx*cy + qy*cx;    // q_t
+            }
+            return r;
+        };
+        Foam::List<Foam::scalar> gh =
+            charGhostLocalX(rot(q), qaux, rot(peer), 1.0, p);
+        for (int k = 0; k < nm; ++k)
+        {
+            const Foam::scalar gn = gh[2 + k], gt = gh[2 + nm + k];
+            gh[2 + k]      = gn*cx - gt*cy;
+            gh[2 + nm + k] = gn*cy + gt*cx;
+        }
+        return gh;
+    }
+    return charGhostLocalX(q, qaux, peer, nOut.x(), p);
 }
 }
 
@@ -578,11 +647,47 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                       / Foam::sqrt(Foam::pow(hS, 4)
                                  + Foam::pow(Foam::max(scalar(1e-8), hS), 4));
                 }
+                // 2-D states carry a momentum PAIR: the level-invariant rows
+                // price the NORMAL discharge q·n, not q_x.  Grouped layout
+                // [b,h,qx_0..qx_L,qy_0..qy_L] → q_y_0 sits at 2+(n_dof_q-2)/2
+                // (SWE: index 3).  Same arithmetic as PreciceManager.H's
+                // `twoD`/`iy0` block — the two sides must evaluate the
+                // IDENTICAL expression or the mass ledger cannot telescope.
+                //
+                // GATED ON THE FACE, NOT ON Model::dimension (this is the one
+                // place the copy deliberately reads differently from its
+                // original).  nHat is normalised as n/(|n| + SMALL), so on an
+                // x-normal face nHat.x() is 1-2.2e-16, NOT 1.0 — and then
+                // 0.5*(a+b)*nx and 0.5*(a*nx + b*nx) differ in the last bit.
+                // Measured: PreciceManager's unconditional `twoD` form breaks
+                // bit-equality against the legacy row on ~62% of states.
+                // Every validated case is x-normal, so the legacy expression
+                // is reproduced there CHARACTER FOR CHARACTER and only a
+                // genuinely oblique face takes the projected form — the same
+                // 1e-12 predicate the characteristic ghost switches on.
+                const bool oblique = (Foam::mag(nHat.y()) > 1e-12);
+                scalar qLn = 0.0, qRn = 0.0;
+                if (oblique && (qstarMode_ == "central"
+                             || qstarMode_ == "shared"))
+                {
+                    if (Model::dimension != 2 || (Model::n_dof_q - 2) % 2 != 0)
+                    {
+                        FatalErrorInFunction
+                            << "[swePreciceCoupling] oblique coupled face (n="
+                            << nHat << ") needs the grouped 2-D layout "
+                            << "[b,h,qx_k...,qy_k...]."
+                            << Foam::exit(Foam::FatalError);
+                    }
+                    const int iy0 = 2 + (Model::n_dof_q - 2) / 2;
+                    qLn = qSwe[2]*nHat.x() + qSwe[iy0]*nHat.y();
+                    qRn = qVof[2]*nHat.x() + qVof[iy0]*nHat.y();
+                }
                 if (qstarMode_ == "central")
                 {
                     // level-invariant central mass flux (jump-free): pairs
                     // with preciceMassRow=central on the SME side.
-                    qStar = 0.5*(qSwe[2] + qVof[2])*nHat.x();
+                    qStar = oblique ? 0.5*(qLn + qRn)
+                                    : 0.5*(qSwe[2] + qVof[2])*nHat.x();
                 }
                 else if (qstarMode_ == "shared")
                 {
@@ -599,16 +704,24 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                              / Foam::sqrt(Foam::pow(hh, 4)
                              + Foam::pow(Foam::max(scalar(1e-8), hh), 4));
                     };
-                    const scalar sStar = Foam::max(
-                        Foam::mag(qL*hiv(hL)) + Foam::sqrt(gAcc*Foam::max(hL, scalar(0))),
-                        Foam::mag(qRm*hiv(hR)) + Foam::sqrt(gAcc*Foam::max(hR, scalar(0))));
-                    qStar = 0.5*(qL + qRm)*nHat.x() - 0.5*sStar*(hR - hL);
+                    const scalar sStar = oblique
+                        ? Foam::max(
+                            Foam::mag(qLn*hiv(hL)) + Foam::sqrt(gAcc*Foam::max(hL, scalar(0))),
+                            Foam::mag(qRn*hiv(hR)) + Foam::sqrt(gAcc*Foam::max(hR, scalar(0))))
+                        : Foam::max(
+                            Foam::mag(qL*hiv(hL)) + Foam::sqrt(gAcc*Foam::max(hL, scalar(0))),
+                            Foam::mag(qRm*hiv(hR)) + Foam::sqrt(gAcc*Foam::max(hR, scalar(0))));
+                    // qLn/qRn already carry the orientation, so the legacy
+                    // `*nHat.x()` must NOT reappear on the oblique leg.
+                    qStar = oblique
+                        ? 0.5*(qLn + qRn)          - 0.5*sStar*(hR - hL)
+                        : 0.5*(qL + qRm)*nHat.x()  - 0.5*sStar*(hR - hL);
                 }
                 else
                 {
                     const List<scalar> qR =
                         (qstarMode_ == "characteristic")
-                            ? charGhostLocal(qSwe, qauxRP, qVof, nHat.x(), param)
+                            ? charGhostLocal(qSwe, qauxRP, qVof, nHat, param)
                             : qVof;
                     const auto Fc = Numerics::numerical_flux       (qSwe, qR, qaux, qaux, param, nHat);
                     const auto Fl = Numerics::numerical_fluctuations(qSwe, qR, qaux, qaux, param, nHat);
@@ -636,6 +749,16 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     // level>=1 needs the path-conservative intermediate state, a
                     // separate treatment.)  h* and q0* from ONE solve → u=q0*/h*
                     // consistent with the imposed height h*.
+                    // flux_x is the x-FLUX, so this star state is defined on an
+                    // x-normal face ONLY.  Stop loudly rather than build a star
+                    // state from the wrong flux direction — a silent wrong
+                    // answer of exactly the kind this re-sync exists to remove.
+                    if (Foam::mag(nHat.y()) > 1e-12)
+                        FatalErrorInFunction
+                            << "[swePreciceCoupling] imposeMode=qstar uses "
+                            << "Model::flux_x and is x-normal only; face normal "
+                            << nHat << " needs the normal flux."
+                            << Foam::exit(Foam::FatalError);
                     const auto FL = Model::flux_x(qSwe, qaux, param);
                     const auto FR = Model::flux_x(qVof, qaux, param);
                     const scalar aL = Numerics::local_max_abs_eigenvalue(qSwe, qaux, param, nHat)[0];
