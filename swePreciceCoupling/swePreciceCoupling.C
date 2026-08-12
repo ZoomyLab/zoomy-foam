@@ -631,10 +631,17 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
             // now-identity preCICE map).
             const List<scalar> qSwe = Model::project_from_3d(colPeer, param);
             const List<scalar> qVof = col.qFrozen;
-            const scalar hVof = columnDepth(I, col);
 
             scalar qStar = 0.0;
-            scalar hFill = hVof;
+            // NO DEFAULT STAGE.  `hFill` used to be seeded with the column's
+            // OWN depth `columnDepth(I, col)` and was only overwritten if one
+            // of two estimates happened to succeed; when neither did, the
+            // interface imposed a flux with no stage condition at all.  Both
+            // branches below now assign it, so the seed is unreachable — it is
+            // zero rather than the column depth so that any future path that
+            // forgets to assign fails loudly (a dry inlet) instead of silently
+            // reverting to "the interface is just my own column".
+            scalar hFill = 0.0;
             if (!winFresh2_)
             {
                 // ONE target per window (frozen, like the SME's mass row):
@@ -645,7 +652,47 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 qStar = col.winTarget;
                 hFill = col.winHFill;
             }
-            else if (qSwe[1] > SMALL && qVof[1] > SMALL)
+            else
+            {
+                // ── THE INTERFACE STAGE ──────────────────────────────────
+                // h* comes from the MODEL'S OWN Riemann fan, via the
+                // registered operator `Numerics::star_state` (zoomy_core
+                // 9c35611).  It is emitted into NumericsKernels.H on the
+                // same six-key face signature as numerical_flux, so it needs
+                // no printer change and no hand arithmetic here: the HLL
+                // two-wave average q* = (s_R q_R - s_L q_L - (F_R - F_L))
+                // / (s_R - s_L) from THIS solver's own wave speeds, with the
+                // depth row projected onto [0, max(h_L,0) + max(h_R,0)].
+                //
+                // The stage is UNCONDITIONAL — not gated on either side
+                // being wet — because the operator is TOTAL: h* >= 0 always,
+                // h* = 0 says the interface is dry, which is itself a valid
+                // stage.  There is therefore nothing to fall back TO.  See
+                // the commit message: wanting a guard here is the signal
+                // that something else is wrong, not a reason to add one.
+                //
+                // L = peer (SME), R = this column — the same ordering and
+                // the same into-domain nHat the flux call below uses, so the
+                // stage and the flux describe ONE Riemann problem.  qaux is
+                // zero for the same reason it is zero there: the interface
+                // RP kernels read no aux entry.
+                const auto qStarState =
+                    Numerics::star_state(qSwe, qVof, qaux, qaux, param, nHat);
+                hFill = qStarState[1][0];
+                if (imposeMode_ == "qstar")
+                {
+                    // The SAME star, as a full state, for the profile
+                    // reconstruction below: u = q0*/h* is then consistent
+                    // with the imposed h* by construction, on ANY face
+                    // normal (the operator takes nHat; the old hand-rolled
+                    // Q* was built from Model::flux_x and was x-normal only).
+                    List<scalar> qs(Model::n_dof_q);
+                    for (int i = 0; i < Model::n_dof_q; ++i)
+                        qs[i] = qStarState[i][0];
+                    col.winQStar = qs;
+                }
+            }
+            if (winFresh2_ && qSwe[1] > SMALL && qVof[1] > SMALL)
             {
                 // qstarMode=characteristic: evaluate the mass flux against the
                 // SAME characteristic ghost the SME's frozen mass row uses (see
@@ -752,53 +799,6 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     // adopted, because swePreciceCoupling is not built by the
                     // default wmake and nothing exercised it.
                     qStar = Fc[1][0] + Fl[1][1];
-                }
-                // half-Riemann star depth (two-rarefaction approximation,
-                // level-0 slots; L = peer, R = this column): the alpha fill
-                // target must respond to the INCOMING wave — filling to the
-                // receiving column's lagged depth makes the inlet act as a
-                // partially-closed gate during bore arrival (measured u−c
-                // reflection back into the SME domain).
-                const scalar gAcc = param[0];
-                if (imposeMode_ == "qstar")
-                {
-                    // CONSISTENT Rusanov star state Q* = 1/2(qL+qR)
-                    //                                  - 1/2 (F(qR)-F(qL))/amax.
-                    // For SME(0)=SWE there is NO non-conservative product, so the
-                    // physical flux flux_x is exact.  (NCP-inclusive Q* for
-                    // level>=1 needs the path-conservative intermediate state, a
-                    // separate treatment.)  h* and q0* from ONE solve → u=q0*/h*
-                    // consistent with the imposed height h*.
-                    // flux_x is the x-FLUX, so this star state is defined on an
-                    // x-normal face ONLY.  Stop loudly rather than build a star
-                    // state from the wrong flux direction — a silent wrong
-                    // answer of exactly the kind this re-sync exists to remove.
-                    if (Foam::mag(nHat.y()) > 1e-12)
-                        FatalErrorInFunction
-                            << "[swePreciceCoupling] imposeMode=qstar uses "
-                            << "Model::flux_x and is x-normal only; face normal "
-                            << nHat << " needs the normal flux."
-                            << Foam::exit(Foam::FatalError);
-                    const auto FL = Model::flux_x(qSwe, qaux, param);
-                    const auto FR = Model::flux_x(qVof, qaux, param);
-                    const scalar aL = Numerics::local_max_abs_eigenvalue(qSwe, qaux, param, nHat)[0];
-                    const scalar aR = Numerics::local_max_abs_eigenvalue(qVof, qaux, param, nHat)[0];
-                    const scalar amax = Foam::max(Foam::max(aL, aR), SMALL);
-                    List<scalar> qs(Model::n_dof_q);
-                    for (int i = 0; i < Model::n_dof_q; ++i)
-                        qs[i] = 0.5*(qSwe[i] + qVof[i]) - 0.5*(FR[i][0] - FL[i][0])/amax;
-                    // GUARD: only adopt Q* if h*>0 (a dry/negative star depth
-                    // would give u=q0*/h* -> FPE); else leave winQStar empty so
-                    // the column falls back to the peer profile + cS fill.
-                    if (qs[1] > SMALL) { hFill = qs[1]; col.winQStar = qs; }
-                }
-                else
-                {
-                    const scalar uL = qSwe[2]/qSwe[1], uR = qVof[2]/qVof[1];
-                    const scalar cS = 0.5*(Foam::sqrt(gAcc*qSwe[1])
-                                         + Foam::sqrt(gAcc*qVof[1]))
-                                    + 0.25*(uL - uR);
-                    if (cS > 0) hFill = cS*cS/gAcc;
                 }
             }
             if (winFresh2_) { col.winTarget = qStar; col.winHFill = hFill; }
