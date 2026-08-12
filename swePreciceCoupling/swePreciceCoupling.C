@@ -189,19 +189,39 @@ void Foam::functionObjects::swePreciceCoupling::setupPrecice()
     {
         buildColumns(I);
         const vectorField& cf = mesh_.boundary()[I.patchID].Cf();
-        // vertex = (streamwise, COLUMN KEY, water-relative sigma).  The
-        // transverse slot must be the column's transverse coordinate
-        // (constant within a column), NEVER the face's vertical position:
-        // a vertical coordinate there correlates with sigma and warps the
-        // peer's nearest-neighbour sampling of the profile (measured: the
-        // SME read sigma -> 0.86*sigma + 0.17, a 10% q* error in shear).
+        // vertex = (horizontal e1, horizontal e2, water-relative sigma), i.e.
+        // the face's true HORIZONTAL POSITION in the shared exchange basis.
+        // Neither horizontal slot may be the face's vertical position: a
+        // vertical coordinate there correlates with sigma and warps the peer's
+        // nearest-neighbour sampling of the profile (measured: the SME read
+        // sigma -> 0.86*sigma + 0.17, a 10% q* error in shear).  (eH1, eH2)
+        // are horizontal by construction, so that constraint still holds.
+        //
+        // WAS (cf.x, column sKey, sigma), and sKey = cf & tHat with
+        // tHat = gUp ^ nStream (buildColumns).  tHat INHERITS THE INTERFACE'S
+        // ORIENTATION, so sKey coincides with the SME's second coordinate only
+        // when nStream = +x: mirrored on a -x interface, and on a +y interface
+        // it is -cf.x, i.e. a DIFFERENT AXIS -- the two participants then
+        // register disjoint vertex clouds and preCICE's nearest-neighbour pairs
+        // each vertex with whatever happens to be closest in a space where one
+        // axis means two different things.  Measured on the confluence junction:
+        // offsets of 31.8-38.8 sigma-spacings on the +y branch and a +5.13%
+        // interface mass leak, per-interface mismatch 1.0000/1.2427/4.2980
+        // ordered exactly by how far each interface is from +x.
+        //
+        // The SME side registers (fc.x, fc.y, sigma) (PreciceManager.H); with
+        // gravity along -z, (cf & eH1, cf & eH2) reproduces that to rounding,
+        // so the map becomes the identity again -- which is what the exchange
+        // needs.  NOT a mapping-scheme problem: RBF was considered and rejected
+        // (it interpolates in the same mismatched space, and a 0.25 support
+        // radius against a 1.33-1.62 offset finds no donors at all).
+        //
+        // sKey stays as the COLUMN key (buildColumns, writeColumnsFile); only
+        // what is registered as the preCICE vertex changes.
         std::vector<double> coords; coords.reserve(cf.size()*3);
-        labelList colKey(cf.size(), -1);
-        forAll(I.columns, c)
-            for (const label f : I.columns[c].faces) colKey[f] = c;
         forAll(cf, f)
-        { coords.push_back(cf[f].x());
-          coords.push_back(I.columns[colKey[f]].sKey);
+        { coords.push_back(cf[f] & I.eH1);
+          coords.push_back(cf[f] & I.eH2);
           coords.push_back(I.sigmaF[f]); }
         I.vertexIDs.resize(cf.size());
         precice_->setMeshVertices(std::string(I.meshName), coords, I.vertexIDs);
