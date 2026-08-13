@@ -113,6 +113,10 @@ void Foam::functionObjects::swePreciceCoupling::buildColumns(Interface& I)
 {
     const fvPatch& p = mesh_.boundary()[I.patchID];
     const vectorField& cf = p.Cf();
+    // the patch faces' own VERTICES -- the bed/lid datum is read off these,
+    // never off a face-centre spacing.  See the column loop below.
+    const polyPatch& pp = p.patch();
+    const pointField& pts = pp.points();
 
     const vector nOut = gSum(p.Sf())/(gSum(p.magSf())+SMALL);
     I.nStream = -nOut/(mag(nOut)+SMALL);
@@ -148,13 +152,68 @@ void Foam::functionObjects::swePreciceCoupling::buildColumns(Interface& I)
         col.faces = tmp[c];
         Foam::sort(col.faces, [&cf,gUp](label a,label b){ return (cf[a]&gUp)<(cf[b]&gUp); });
         col.sKey = keys[c];
-        const scalar yLo = cf[col.faces.first()] & gUp;
-        const scalar yHi = cf[col.faces.last()]  & gUp;
-        const label nf = col.faces.size();
-        const scalar dy = (nf>1) ? (yHi-yLo)/(nf-1)
-                        : (I.heightDict>SMALL ? I.heightDict : (yHi-yLo+SMALL));
-        col.height = (I.heightDict>SMALL) ? I.heightDict : (yHi-yLo)+dy;
-        col.floorY = yLo - 0.5*dy;
+        // ── THE BED DATUM ────────────────────────────────────────────────
+        // b, and the sigma grid registered with preCICE, come from the
+        // column's OWN FACE VERTICES: floorY is the lowest vertex the
+        // coupling patch has in this column, i.e. the edge where the patch
+        // meets the bed face, and lidY the highest.  That is the mesh's own
+        // geometry, so it is exact on a graded stack and on a uniform one
+        // alike, which is the invariant this datum has to hold: on a column
+        // whose bed face sits at y_b, b == y_b.
+        //
+        // WAS  floorY = (lowest face CENTRE) - 0.5*dy,  dy = (yHi-yLo)/(nf-1),
+        // i.e. half the MEAN centre spacing.  Exact only when the column is
+        // uniform -- on a graded stack it is off by half the difference
+        // between the first layer's true thickness and the mean, and the FO
+        // then writes a PHANTOM BED to a peer whose bed is flat.  Measured on
+        // the confluence fast case (30 layers, 8x1.5 + 19x3 + 3x6 mm to
+        // z = 87 mm, bed at z = 0): yLo = 0.75 mm, yHi = 84 mm, dy = 2.87069
+        // mm, so b = -0.685345 mm against the SME arms' b = 0 exactly; the
+        // 20-layer variant reports +1.31579 mm.
+        //
+        // WHAT THAT COSTS.  With h_sme = h_vof and q = 0 -- where a consistent
+        // Riemann problem MUST return h unchanged -- Numerics::star_state,
+        // which is where imposeInflow gets hFill, returns h - db/2 EXACTLY:
+        // measured -0.3426725 mm at db = -0.685345 mm and -0.657895 mm at
+        // db = +1.31579 mm, identical on +x, -x and +y normals and at every
+        // depth, i.e. one-signed, level-independent and indifferent to the
+        // direction of information transfer.  At db = 0 the same call returns
+        // h to 1.4e-17 m.  End to end on the confluence fast case at rest
+        // (ramp removed, h = 45 mm, q = 0): the arms' spurious discharge drops
+        // from 2.8e-5 to 5.5e-19 in the first window and max|hFill - h| over
+        // the run from 0.571 mm to 0.0095 mm, i.e. under the VOF's own at-rest
+        // noise (0.017 mm).  On the moving case the junction-vs-arm slope k
+        // moves 1.019/1.475/1.091 -> 0.950/1.366/1.010 on the three cuts
+        // (db < 0 here, so k falls; on the 20-layer mesh db > 0 and it rises),
+        // and the L2 junction that diverged at t = 2.87 s runs clean.
+        //
+        // A face's own thickness would also do it (floorY = lowest centre -
+        // half the bottom face's extent along gUp), and agrees with this to
+        // rounding wherever the bed edge is level within one column; the
+        // vertices are preferred because they ARE the bed position rather
+        // than an inference from it, and they need no assumption about where
+        // the centroid sits inside the face.
+        //
+        // On a UNIFORM column the two forms agree to round-off (the vertex
+        // form is the more exact of the two: it reads a mesh point instead of
+        // differencing face centres), so every validated 1-D coupling case is
+        // unchanged.  heightDict still wins for the height when the dictionary
+        // gives one -- only the geometric FALLBACK moves, and it moves from
+        // (yHi-yLo)+dy, which carries the same mean-spacing error, to the
+        // measured lid-to-bed extent.
+        scalar yBed = GREAT, yLid = -GREAT;
+        for (const label f : col.faces)
+        {
+            const face& fv = pp[f];
+            forAll(fv, ip)
+            {
+                const scalar y = pts[fv[ip]] & gUp;
+                yBed = Foam::min(yBed, y);
+                yLid = Foam::max(yLid, y);
+            }
+        }
+        col.floorY = yBed;
+        col.height = (I.heightDict>SMALL) ? I.heightDict : (yLid - yBed);
         col.qFrozen = List<scalar>(Model::n_dof_q, 0.0);
     }
     I.sigmaF.setSize(cf.size(), 0.0);

@@ -40,8 +40,14 @@ class swePreciceCoupling
     {
         labelList faces;                 // patch-face indices, sorted ascending by (Cf & gUp)
         scalar    sKey   = 0;            // transverse coord (Cf & tHat)
-        scalar    floorY = 0;            // bed = lowest face-centre - half cell, along gUp
-        scalar    height = 0;            // domain height H along gUp
+        scalar    floorY = 0;            // bed = LOWEST PATCH VERTEX of the column along gUp
+                                         //  (the mesh's own bed face).  NOT a face centre
+                                         //  offset by half a MEAN spacing: that is exact on a
+                                         //  uniform stack only and writes a phantom bed on a
+                                         //  graded one -- see buildColumns.
+        scalar    height = 0;            // domain height H along gUp: heightDict when the
+                                         //  dictionary gives one, else the measured
+                                         //  lid-to-bed vertex extent
         List<scalar> qFrozen;           // reduced state of THIS column (for q*), length n_dof_q
         bool wbInit = false;
         //- exact-mass ledger: cumulative (imposed − realized) intake [m^2]
