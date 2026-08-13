@@ -36,6 +36,12 @@
 #include "Switch.H"
 #include "Model.H"
 #include "NumericsKernels.H"
+// The designated high-fidelity coupling model and its Riemann solver — the ONE
+// system both participants solve the interface problem in (Dahm-Giesselmann-
+// Helzel 2024 §4.3.1).  A namespace alias of Model/Numerics for a same-level
+// build, a real emitted header for an inter-level one; see CoupleModel.H.
+#include "CoupleModel.H"
+#include "CoupleNumericsKernels.H"
 
 namespace numerics
 {
@@ -114,6 +120,20 @@ public:
         massRow_ =
             mesh.time().controlDict().lookupOrDefault<Foam::word>(
                 "preciceMassRow", "shared");
+        // DESIGNATED HIGH-FIDELITY INTERFACE (controlDict `preciceCoupleHiFi`;
+        // Dahm-Giesselmann-Helzel 2024 §4.3.1).  BOTH participants must set
+        // it.  When on, the coupled face's ENTIRE assembled contribution — not
+        // just the mass row — is replaced by the face term of ONE Riemann
+        // problem posed in the designated high model's space (CoupleModel /
+        // CoupleNumerics) on the pair (own state lifted, peer column lifted),
+        // evaluated by each side with its OWN outward normal.  The two sides
+        // then hold exactly the D^- and D^+ halves of a single interior face,
+        // so the interface behaves as one face of the monolith and every
+        // SHARED row is exchanged consistently.  Supersedes `preciceMassRow`,
+        // which stays the mass-only interface when this is off.
+        coupleHiFi_ =
+            mesh.time().controlDict().lookupOrDefault<Foam::Switch>(
+                "preciceCoupleHiFi", false);
 
         // preCICE forbids a participant using the same (data,mesh) pair twice,
         // so the two coupling directions MUST carry distinct data names.  Each
@@ -368,11 +388,83 @@ public:
                     forAll(Q, i)
                         Q[i]->boundaryFieldRef()[b.patchI][f] = ghost[i];
 
+                    // ── DESIGNATED HIGH-FIDELITY INTERFACE (DGH 2024) ──────
+                    // One Riemann problem, posed in the RICHER of the two
+                    // models and solved identically by both participants.
+                    //
+                    //   ownHi  = P_hi( I_3d( own state ) )   round trip: the
+                    //            same interpolate->project quadrature the peer
+                    //            applied to its copy of us, so the two sides
+                    //            hold the SAME pair;
+                    //   peerHi = P_hi( exchanged column )    the low side's
+                    //            absent higher moments come out at zero — DGH's
+                    //            zero-pad embedding — and the high side's
+                    //            extra moments survive, so no fidelity is
+                    //            thrown away before the flux is formed.
+                    //
+                    // Each side writes the FULL face term its own assembly
+                    // would have written, (F + D^-)|Sf|, with its OWN outward
+                    // normal.  Because F is odd in the normal and the
+                    // fluctuation split obeys D^-(a,b,n) + D^-(b,a,-n) =
+                    // D^-(a,b,n) + D^+(a,b,n) = A_int (b-a), the two sides
+                    // hold precisely the owner and neighbour halves of ONE
+                    // interior face: rows with no non-conservative column (the
+                    // mass row) telescope to machine zero, and the rest carry
+                    // the same non-conservative product an interior face of
+                    // the monolith carries — not an interface defect.
+                    //
+                    // Rows beyond the LOCAL state (a level-1 arm facing a
+                    // level-2 interface) are simply not written: that
+                    // truncation is the coupling's model impedance, and it is
+                    // measured, never patched.
+                    //
+                    // WHAT THE GHOST STILL DOES.  It is no longer read by the
+                    // interface flux — this override replaces it — but it is
+                    // NOT inert: the boundary value feeds the aux-derivative
+                    // stencil (Model::update_aux_variables ->
+                    // compute_derivative), so it sets the gradients the source
+                    // term sees in the interface cell.  It therefore stays as
+                    // `preciceGhost` selects it.
+                    if (coupleHiFi_ && windowFresh_)
+                    {
+                        if (b.fzDmAll.size() != b.nFaces)
+                            b.fzDmAll.setSize(b.nFaces);
+                        const int nShared =
+                            (int(Model::n_dof_q) < int(CoupleModel::n_dof_q))
+                            ? int(Model::n_dof_q) : int(CoupleModel::n_dof_q);
+                        b.fzDmAll[f].setSize(nShared);
+                        const auto ownHi = CoupleModel::project_from_3d(
+                            Model::interpolate_to_3d(
+                                interior, interiorAux, p_, zcol), p_);
+                        // Before the peer has written (window 0 of an explicit
+                        // scheme) fall back to the own state on BOTH sides:
+                        // the Riemann problem is then trivial and the face
+                        // carries the interior flux, the same fallback the
+                        // ghost takes two lines above.
+                        const auto peerHi = zeroSample
+                            ? ownHi : CoupleModel::project_from_3d(column, p_);
+                        const auto auxOwn  =
+                            CoupleModel::pointwise_aux(ownHi,  p_);
+                        const auto auxPeer =
+                            CoupleModel::pointwise_aux(peerHi, p_);
+                        const auto Fh = CoupleNumerics::numerical_flux
+                            (ownHi, peerHi, auxOwn, auxPeer, p_, nOut);
+                        const auto FLh = CoupleNumerics::numerical_fluctuations
+                            (ownHi, peerHi, auxOwn, auxPeer, p_, nOut);
+                        const Foam::scalar magSf = Foam::mag(Sf[f]);
+                        for (int i = 0; i < nShared; ++i)
+                            b.fzDmAll[f][i] = (Fh[i][0] + FLh[1][i])*magSf;
+                    }
+
                     // Frozen mass row: evaluate the face kernel ONCE per
                     // window on the window-start pair (interior, ghost) —
                     // the same snapshot pair the peer holds, so both sides
                     // agree on the exchanged mass to machine precision.
-                    if (frozenMass_ && windowFresh_)
+                    // EXCLUSIVE with the high-fidelity interface above: that
+                    // one already fixes the mass row (as row 1 of the shared
+                    // face term), so evaluating this second, different mass
+                    // flux would only leave a discarded number in the log.
+                    if (frozenMass_ && !coupleHiFi_ && windowFresh_)
                     {
                         if (b.fzDp.size() != b.nFaces)
                         { b.fzDp.setSize(b.nFaces); b.fzDm.setSize(b.nFaces); }
@@ -476,24 +568,45 @@ public:
                     }
                 }
             }
-            if (frozenMass_) windowFresh_ = false;
+            if (frozenMass_ || coupleHiFi_) windowFresh_ = false;
         }
     }
 
-    //- Override the MASS row (state slot 1) of the assembled face terms at
-    //  every coupled face with the window-frozen values.  Call after the
-    //  flux assembly, before the divergence.  No-op unless enabled+active.
-    void applyFrozenMassRow
+    //- Write the window-evaluated coupled-face terms into the assembled face
+    //  fields.  Call after the flux assembly, before the divergence.  No-op
+    //  unless enabled+active.
+    //
+    //  `preciceCoupleHiFi` writes EVERY shared row — the face term of the one
+    //  Riemann problem both participants solved in the designated high model's
+    //  space.  Otherwise only the mass row (slot 1), the mass-only interface.
+    //
+    //  Dm alone, deliberately: `quasilinear_operator` integrates a BOUNDARY
+    //  face into its one adjacent cell through Dm only (Dp is read at internal
+    //  faces, for the neighbour), so Dm IS the whole contribution of a coupled
+    //  face and the peer's cell gets its half from the peer's own Dm.
+    void applyCoupledFaceFlux
     (
         Foam::List<Foam::surfaceScalarField*>& Dp,
         Foam::List<Foam::surfaceScalarField*>& Dm
     )
     {
-        if (!active_ || !frozenMass_) return;
+        if (!active_ || (!frozenMass_ && !coupleHiFi_)) return;
         if constexpr (Model::n_precice_patches > 0)
         {
             for (const Binding& b : bindings_)
             {
+                if (coupleHiFi_)
+                {
+                    if (b.fzDmAll.size() != b.nFaces) continue;
+                    for (Foam::label f = 0; f < b.nFaces; ++f)
+                    {
+                        const Foam::label nr = b.fzDmAll[f].size();
+                        for (Foam::label i = 0; i < nr; ++i)
+                            Dm[i]->boundaryFieldRef()[b.patchI][f] =
+                                b.fzDmAll[f][i];
+                    }
+                    continue;
+                }
                 if (b.fzDp.size() != b.nFaces) continue;   // not evaluated yet
                 for (Foam::label f = 0; f < b.nFaces; ++f)
                 {
@@ -744,6 +857,11 @@ private:
         //  face: Dp slot = (-F[1]+FL[0][1])*magSf, Dm slot = (F[1]+FL[1][1])*magSf
         Foam::List<Foam::scalar> fzDp;
         Foam::List<Foam::scalar> fzDm;
+        //- window-frozen ALL-shared-row face terms for the high-fidelity
+        //  interface (preciceCoupleHiFi): [face][row], row < min(local dof,
+        //  couple dof).  Rows the local model does not carry are absent, not
+        //  zeroed — the truncation is structural.
+        Foam::List<Foam::List<Foam::scalar>> fzDmAll;
     };
 
     //- Gather coupled-patch boundary Q/Qaux, lift to 3D, writeData all
@@ -820,6 +938,9 @@ private:
     bool frozenMass_ = false;
     //- frozen-mass-row pricing: shared | central | rp
     Foam::word massRow_ = "shared";
+    //- designated high-fidelity interface (DGH 2024 §4.3.1): freeze the FULL
+    //  face term of the shared Riemann problem for every shared row.
+    bool coupleHiFi_ = false;
     //- A new time window (or implicit re-iteration) began: re-evaluate the
     //  frozen mass row on the next read().  Starts true (first window).
     bool windowFresh_ = true;

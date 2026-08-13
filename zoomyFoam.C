@@ -320,7 +320,7 @@ int main(int argc, char *argv[])
             numerics::update_W_gradients(gradW, W);
             numerics::update_numerical_flux_o2
                 (Dp, Dm, Q, Qaux, W, gradW, p);
-            precice.applyFrozenMassRow(Dp, Dm);   // no-op unless enabled
+            precice.applyCoupledFaceFlux(Dp, Dm);  // no-op unless enabled
             // Cell-interior non-conservative integral — the intra-cell smooth
             // part of the bed-slope NCP, REQUIRED for well-balancing at order 2
             // (the face fluctuations carry only the inter-cell jump).
@@ -329,7 +329,7 @@ int main(int argc, char *argv[])
         else
         {
             numerics::update_numerical_flux(Dp, Dm, Q, Qaux, p);
-            precice.applyFrozenMassRow(Dp, Dm);   // no-op unless enabled
+            precice.applyCoupledFaceFlux(Dp, Dm);  // no-op unless enabled
             // Inert at 1st order (zero slope ⇒ zero cell-interior integral).
             forAll(NCcell, i) NCcell[i]->primitiveFieldRef() = 0.0;
         }

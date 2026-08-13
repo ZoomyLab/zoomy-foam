@@ -134,8 +134,40 @@ def build_system_model(level, outer="extrapolation", closure="none", bcs="coupli
             boundary_conditions=boundary))
 
 
+def emit_couple_headers(hi_level, out=HERE, *, outer="extrapolation",
+                        closure="none", bcs="coupling", q_in=1.0, h_out=1.0,
+                        project_nz=40):
+    """Emit the DESIGNATED HIGH-FIDELITY coupling model (Dahm-Giesselmann-Helzel
+    2024 §4.3.1) as ``CoupleModel.H`` / ``CoupleNumericsKernels.H``.
+
+    Both participants of an INTER-LEVEL pair carry these, at the SAME
+    ``hi_level``, so the interface Riemann problem is one problem in one space
+    and the two sides' face terms are the two halves of a single interior face.
+    A same-level pair needs no emission at all: the checked-in headers alias
+    ``CoupleModel``/``CoupleNumerics`` onto the build's own ``Model``/
+    ``Numerics``, which is the same statement with no duplicated physics.
+
+    The Riemann solver is deliberately the SAME family the bulk uses
+    (``PositiveNonconservativeRusanov``).  A Roe-family interface would have to
+    come with the bulk switched too: ``QuasilinearRoe`` moves the conservative
+    part inside the path integral and sets ``numerical_flux = 0``, so its face
+    term injected into a Rusanov-assembled mesh drops ``f(Q_own)`` and the run
+    blows up.  That is a whole-scheme choice, not an interface option.
+    """
+    sm_hi = build_system_model(hi_level, outer=outer, closure=closure, bcs=bcs,
+                               q_in=q_in, h_out=h_out, project_nz=project_nz)
+    num_hi = PositiveNonconservativeRusanov(model=sm_hi)
+    FoamSystemModelPrinter.write_code(sm_hi, out / "CoupleModel.H",
+                                      namespace_name="CoupleModel")
+    FoamNumericsPrinter.write_code(num_hi, out / "CoupleNumericsKernels.H",
+                                   namespace_name="CoupleNumerics",
+                                   model_header="CoupleModel.H")
+    print(f"emitted couple model SME(level={hi_level}) -> CoupleModel.H / "
+          f"CoupleNumericsKernels.H  state={[str(s) for s in sm_hi.state]}")
+
+
 def emit(level, out=HERE, outer="extrapolation", closure="none", bcs="coupling",
-         q_in=1.0, h_out=1.0):
+         q_in=1.0, h_out=1.0, couple_level=None):
     sm = build_system_model(level, outer=outer, closure=closure, bcs=bcs,
                             q_in=q_in, h_out=h_out)
     num = PositiveNonconservativeRusanov(model=sm)
@@ -152,11 +184,20 @@ def emit(level, out=HERE, outer="extrapolation", closure="none", bcs="coupling",
     write_march_constants(num, out / "MarchConstants.H")
     print(f"emitted SME(level={level}, closure={closure}, bcs={bcs}) -> {out}  "
           f"state={[str(s) for s in sm.state]}")
+    if couple_level is not None and couple_level != level:
+        emit_couple_headers(couple_level, out, outer=outer, closure=closure,
+                            bcs=bcs, q_in=q_in, h_out=h_out)
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--level", type=int, default=0)
+    ap.add_argument("--couple-level", type=int, default=None,
+                    help="designated high-fidelity level of the coupled "
+                         "interface (DGH 2024): emit CoupleModel/CoupleNumerics "
+                         "at this level.  Omit (or pass --level) for a "
+                         "same-level pair, where the checked-in alias headers "
+                         "already say CoupleModel == Model.")
     ap.add_argument("--out", type=Path, default=HERE)
     ap.add_argument("--outer", choices=["extrapolation", "wall"],
                     default="extrapolation")
@@ -175,4 +216,4 @@ if __name__ == "__main__":
                     q_in=a.q_in, h_out=a.h_out)
     else:
         emit(a.level, a.out, outer=a.outer, closure=a.closure, bcs=a.bcs,
-             q_in=a.q_in, h_out=a.h_out)
+             q_in=a.q_in, h_out=a.h_out, couple_level=a.couple_level)
