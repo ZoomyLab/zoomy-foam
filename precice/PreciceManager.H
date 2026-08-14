@@ -531,10 +531,17 @@ public:
                         bool superDone = false;
                         if (massRow_ == "rpsuper")
                         {
+                            // Build from the GHOST, not the raw peer: the `rp`
+                            // branch below pairs (rt, ghost) and the FO mirrors
+                            // (qSwe, qR=ghost).  Using `peer` here made the two
+                            // sides charge fluxes from different states, the
+                            // seam stopped telescoping and the SME went h < 0
+                            // (crash in Foam::pow) inside 46 windows.
+                            const Foam::scalar hRg = ghost[1], qRg = ghost[2];
                             const Foam::scalar cLw = Foam::sqrt
                                 (gAcc*Foam::max(hL, Foam::scalar(0)));
                             const Foam::scalar cRw = Foam::sqrt
-                                (gAcc*Foam::max(hR, Foam::scalar(0)));
+                                (gAcc*Foam::max(hRg, Foam::scalar(0)));
                             // MIND THE 1-D CONVENTION: qLn/qRn carry the normal
                             // projection only in 2-D; in 1-D the `*nUnit.x()`
                             // is applied separately (see the `shared` branch),
@@ -542,11 +549,11 @@ public:
                             const Foam::scalar FL =
                                 twoD ? qLn : qL*nUnit.x();
                             const Foam::scalar FR =
-                                twoD ? qRn : qR*nUnit.x();
+                                twoD ? qRn : qRg*nUnit.x();
                             const Foam::scalar uLw =
                                 (hL > 1e-10) ? FL/hL : Foam::scalar(0);
                             const Foam::scalar uRw =
-                                (hR > 1e-10) ? FR/hR : Foam::scalar(0);
+                                (hRg > 1e-10) ? FR/hRg : Foam::scalar(0);
                             const Foam::scalar sL =
                                 Foam::min(uLw - cLw, uRw - cRw);
                             const Foam::scalar sR =
