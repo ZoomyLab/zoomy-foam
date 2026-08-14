@@ -61,6 +61,7 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("maxAlphaCo", maxAlphaCo_);
     dict.readIfPresent("debtRepayWindows", debtRepay_);
     dict.readIfPresent("writeColumns", writeColumns_);
+    dict.readIfPresent("writePhi", writePhi_);
     if (dict.lookupOrDefault<Switch>("ledgerLog", false))
     {
         ledgerLog_.reset(new OFstream(
@@ -1525,7 +1526,13 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
         // phi[n-1]>).  Setting phi_f = U_f·S_f makes the same step's alpha
         // advection use the imposed flux -> realized[n] == imposed[n] to
         // roundoff (the strict per-window conservation invariant).
-        if (mesh_.foundObject<surfaceScalarField>("phi"))
+        // writePhi no: leave phi to the pressure solve.  The direct write was
+        // added to kill a one-window alpha-advection lag, but it bypasses the
+        // projection, and a PLAIN fixedValue inlet -- which does not write phi
+        // -- holds a uniform state to four decimals where this seam drifts
+        // +5 % on the VOF side and +13 % on the SME side.  This switch is how
+        // that trade is measured rather than argued.
+        if (writePhi_ && mesh_.foundObject<surfaceScalarField>("phi"))
         {
             surfaceScalarField& phiF =
                 mesh_.lookupObjectRef<surfaceScalarField>("phi");

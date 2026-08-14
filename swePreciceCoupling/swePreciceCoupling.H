@@ -138,6 +138,12 @@ class swePreciceCoupling
     bool   winFresh2_ = true;   // impose-side window-freeze flag
     scalar debtRepay_ = 20;   // ledger repayment horizon in windows
     bool writeColumns_ = false;   // persist exchanged columns at write times
+    //- write phi straight into the flux field (default), or leave it to the
+    //  pressure solve.  The direct write kills a one-window alpha-advection
+    //  lag but bypasses the projection; a PLAIN fixedValue inlet, which does
+    //  not write phi, holds a uniform state to four decimals where this seam
+    //  drifts.  The switch is how that trade gets measured.
+    bool writePhi_ = true;
     scalar Mprev_ = -GREAT;   // previous-step VOF water mass (per width)
     autoPtr<OFstream> ledgerLog_;   // optional per-step ledger diagnostics
     //- seam-row audit: the interface RP's mass AND momentum rows against what
