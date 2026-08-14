@@ -147,6 +147,9 @@ class swePreciceCoupling
     //- write U and alpha as patch VALUES (default), or impose only the flux
     //  and let flux-derived patch types recompute them.  See the write site.
     bool writeState_ = true;
+    //- scale the written column so its projection reproduces the flux the
+    //  patch actually passed.  See the write site: measured ratio 0.9999.
+    bool consistentWrite_ = false;
     scalar Mprev_ = -GREAT;   // previous-step VOF water mass (per width)
     autoPtr<OFstream> ledgerLog_;   // optional per-step ledger diagnostics
     //- seam-row audit: the interface RP's mass AND momentum rows against what

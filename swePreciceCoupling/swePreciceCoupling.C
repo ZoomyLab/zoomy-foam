@@ -68,6 +68,7 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("writeColumns", writeColumns_);
     dict.readIfPresent("writePhi", writePhi_);
     dict.readIfPresent("writeState", writeState_);
+    dict.readIfPresent("consistentWrite", consistentWrite_);
     dict.readIfPresent("fwaveDelta", gFwaveDelta);
     if (dict.lookupOrDefault<Switch>("ledgerLog", false))
     {
@@ -604,6 +605,26 @@ void Foam::functionObjects::swePreciceCoupling::writeBack()
                 wl << mesh_.time().value() << "," << c << "," << qReal << ","
                    << qw << "," << (Foam::mag(qw) > SMALL ? qReal/qw : 0.0)
                    << nl;
+
+                // CONSISTENT WRITE.  The measurement above gives ratio 0.9999
+                // -- the written column under-reports the flux the patch
+                // actually passed by 1e-4, consistently and with POSITIVE sign
+                // (so no flip).  Integrated over a run that is exactly the 1e-4
+                // mass residual the reduced-side tie stalls at, against 1e-16
+                // everywhere the peer is told the truth.  Scale the velocity
+                // samples so the projection reproduces what crossed.
+                if (consistentWrite_ && Foam::mag(qw) > SMALL)
+                {
+                    const scalar sc = qReal/qw;
+                    forAll(col.faces, j)
+                    {
+                        const label f = col.faces[j];
+                        out[2][f] *= sc; out[3][f] *= sc; out[4][f] *= sc;
+                        colProf[j][2] *= sc; colProf[j][3] *= sc;
+                        colProf[j][4] *= sc;
+                    }
+                    col.qFrozen = Model::project_from_3d(colProf, param);
+                }
             }
         }
         if (writeColumns_) I.lastOut = out;   // keep for writeColumnsFile()
