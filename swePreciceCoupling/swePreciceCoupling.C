@@ -886,6 +886,32 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     // adopted, because swePreciceCoupling is not built by the
                     // default wmake and nothing exercised it.
                     qStar = Fc[1][0] + Fl[1][1];
+                    // ── supercritical degeneracy ────────────────────────────
+                    // MUST MIRROR PreciceManager.H massRow `rpsuper` exactly:
+                    // if the two sides charge different fluxes at the same
+                    // face the seam stops telescoping, and that is the one
+                    // failure this whole case exists to rule out.  A
+                    // supercritical seam has no two-sided Riemann problem, so
+                    // the upwind side owns the flux (HLL degeneracy) and the
+                    // Rusanov dissipation is spurious -- 5.85 % on uniform
+                    // supercritical advection, whose exact answer is constant.
+                    if (qstarMode_ == "charsuper")
+                    {
+                        const scalar gA = param[0];
+                        const scalar hLs = qSwe[1], hRs = qR[1];
+                        const scalar FLs = oblique ? qLn : qSwe[2]*nHat.x();
+                        const scalar FRs = oblique ? qRn : qR[2]*nHat.x();
+                        const scalar cLs =
+                            Foam::sqrt(gA*Foam::max(hLs, scalar(0)));
+                        const scalar cRs =
+                            Foam::sqrt(gA*Foam::max(hRs, scalar(0)));
+                        const scalar uLs = (hLs > 1e-10) ? FLs/hLs : 0.0;
+                        const scalar uRs = (hRs > 1e-10) ? FRs/hRs : 0.0;
+                        const scalar sLs = Foam::min(uLs - cLs, uRs - cRs);
+                        const scalar sRs = Foam::max(uLs + cLs, uRs + cRs);
+                        if (sLs >= 0)      qStar = FLs;
+                        else if (sRs <= 0) qStar = FRs;
+                    }
                     // THE MOMENTUM ROW of the same interface RP.  Computed
                     // every window since this function object was written and
                     // discarded every window: nothing on either side imposes

@@ -514,7 +514,51 @@ public:
                                : peer[2]*nUnit.x() + peer[iy0]*nUnit.y()) : qR;
                         const Foam::scalar magS = Foam::mag(Sf[f]);
                         Foam::scalar Fstar = 0;
-                        if (massRow_ == "rp")
+                        // ── supercritical degeneracy, checked FIRST ─────────
+                        // A supercritical seam has no two-sided Riemann
+                        // problem: every characteristic runs the same way, so
+                        // the upwind side owns the flux outright and the
+                        // Rusanov dissipation -0.5*lam*(ghost - rt) is
+                        // spurious.  Measured on uniform supercritical
+                        // advection (exact solution constant): `rp` charges
+                        // -0.141652 where the pure upwind flux is -0.150412, a
+                        // 5.85 % deficit -- and imposeMode starstate then
+                        // renormalises the VOF to match it, so BOTH sides agree
+                        // exactly on a flux that is 5.85 % wrong.  That is why
+                        // R_h was machine-zero while h at the seam sat 10 %
+                        // high.  This is the textbook HLL degeneracy:
+                        // s_L >= 0 -> F(Q_L), s_R <= 0 -> F(Q_R).
+                        bool superDone = false;
+                        if (massRow_ == "rpsuper")
+                        {
+                            const Foam::scalar cLw = Foam::sqrt
+                                (gAcc*Foam::max(hL, Foam::scalar(0)));
+                            const Foam::scalar cRw = Foam::sqrt
+                                (gAcc*Foam::max(hR, Foam::scalar(0)));
+                            // MIND THE 1-D CONVENTION: qLn/qRn carry the normal
+                            // projection only in 2-D; in 1-D the `*nUnit.x()`
+                            // is applied separately (see the `shared` branch),
+                            // so the upwind flux must carry it here too.
+                            const Foam::scalar FL =
+                                twoD ? qLn : qL*nUnit.x();
+                            const Foam::scalar FR =
+                                twoD ? qRn : qR*nUnit.x();
+                            const Foam::scalar uLw =
+                                (hL > 1e-10) ? FL/hL : Foam::scalar(0);
+                            const Foam::scalar uRw =
+                                (hR > 1e-10) ? FR/hR : Foam::scalar(0);
+                            const Foam::scalar sL =
+                                Foam::min(uLw - cLw, uRw - cRw);
+                            const Foam::scalar sR =
+                                Foam::max(uLw + cLw, uRw + cRw);
+                            if (sL >= 0)      { Fstar = FL; superDone = true; }
+                            else if (sR <= 0) { Fstar = FR; superDone = true; }
+                        }
+                        if (superDone)
+                        {
+                            // upwind flux already set
+                        }
+                        else if (massRow_ == "rp" || massRow_ == "rpsuper")
                         {
                             // model's own RP mass row on (rt, ghost) — the
                             // characteristic-filtered pair: no raw-jump
