@@ -64,6 +64,10 @@ class swePreciceCoupling
         //  Never imposed — the VOF inlet takes a mass flux and a velocity
         //  profile.  Booked so the momentum the seam drops is measurable.
         scalar winFq0 = 0;
+        //- the same, for EVERY row the SME charges.  "How much momentum does
+        //  the seam keep" is a question about the linear and quadratic moments
+        //  as well, and only q_0 was ever booked.
+        List<scalar> winFq;
         scalar winScale = 1;             // starstate renormalisation factor
     };
 

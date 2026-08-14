@@ -79,7 +79,14 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
         starLog_.reset(new OFstream(mesh_.time().globalPath()/"seam_rows.csv"));
         starLog_().precision(17);
         starLog_() << "n,t,col,mode,F_h,q_imp,mass_resid,scale,"
-                      "F_q0,M_adv,M_prs,M_imp,dM" << nl;
+                      "F_q0,M_adv,M_prs,M_imp,dM";
+        // One CHARGED/CARRIED pair per moment row, appended so that every
+        // reader of the original thirteen columns keeps working.  State 2 is
+        // q_0, so the moment rows run 2 .. n_dof_q-1.
+        for (int k = 2; k < Model::n_dof_q; ++k)
+            starLog_() << ",Fq" << (k - 2) << "_charged,Fq" << (k - 2)
+                       << "_carried";
+        starLog_() << nl;
     }
     dict.readIfPresent("debtRepayWindows", debtRepay_);
     dict.readIfPresent("writeColumns", writeColumns_);
@@ -897,6 +904,13 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     // an -O3 build does not check -- it segfaults in
                     // imposeInflow on the FIRST execute().
                     col.winFq0 = Fc[2][0] + Fl[1][2];
+                    // ... and EVERY row on that same index convention, so the
+                    // linear and quadratic moments can be judged as well.  Fc
+                    // is (n_state, 1) and Fl is (2, n_state) -- the asymmetry
+                    // the comment above is about -- so the pairing is written
+                    // once here rather than re-derived per row.
+                    col.winFq.setSize(Fc.size(), scalar(0));
+                    forAll(col.winFq, k) col.winFq[k] = Fc[k][0] + Fl[1][k];
                     if (imposeMode_ == "starstate")
                     {
                         // THE STAR STATE.  Rusanov IS HLL with s_L = -lam_max
@@ -1218,12 +1232,48 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     mAdv += alphaIn[f]*un*un*dzC;
                 }
                 const scalar mPrs = 0.5*param[0]*hFill*hFill;
+                // ── every row, not just q_0 ────────────────────────────────
+                // What the inlet CARRIES, expressed in the same rows the SME
+                // charged: project the column that was actually written and
+                // evaluate the model's own physical flux on it.  Going through
+                // project_from_3d keeps this basis-agnostic -- a hand-rolled
+                // phi_k would have to guess the basis and would be wrong the
+                // moment the model changes.  Rusanov with both sides equal has
+                // no dissipation, so numerical_flux(Q,Q) IS F(Q).
+                List<List<scalar>> impProf
+                    (col.faces.size(), List<scalar>(NF, scalar(0)));
+                forAll(col.faces, j)
+                {
+                    const label f = col.faces[j];
+                    impProf[j][0] = col.floorY;
+                    impProf[j][1] = hFill;
+                    impProf[j][2] = Uin[f] & I.eH1;
+                    impProf[j][3] = Uin[f] & I.eH2;
+                    impProf[j][4] = Uin[f] & I.gUp;
+                }
+                List<scalar> carried;
+                if (hFill > SMALL)
+                {
+                    const List<scalar> qC =
+                        Model::project_from_3d(impProf, param);
+                    const auto Fi = Numerics::numerical_flux
+                        (qC, qC, qaux, qaux, param, nHat);
+                    carried.setSize(Fi.size(), scalar(0));
+                    forAll(carried, k) carried[k] = Fi[k][0];
+                }
+                const label nR = col.winFq.size();
                 starLog_() << winIdx_ << "," << mesh_.time().value() << ","
                     << c << "," << imposeMode_ << "," << col.curTarget << ","
                     << qImp << "," << (qImp - col.curRate) << ","
                     << col.winScale << "," << col.winFq0 << "," << mAdv << ","
                     << mPrs << "," << (mAdv + mPrs) << ","
-                    << (col.winFq0 - mAdv - mPrs) << nl;
+                    << (col.winFq0 - mAdv - mPrs);
+                for (label k = 2; k < nR; ++k)
+                {
+                    const scalar cq = (k < carried.size()) ? carried[k] : 0.0;
+                    starLog_() << "," << col.winFq[k] << "," << cq;
+                }
+                starLog_() << nl;
             }
         }
         // implicit under-relaxation of the imposed velocity (standard FSI
