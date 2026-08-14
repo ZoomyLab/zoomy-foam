@@ -529,7 +529,63 @@ public:
                         // high.  This is the textbook HLL degeneracy:
                         // s_L >= 0 -> F(Q_L), s_R <= 0 -> F(Q_R).
                         bool superDone = false;
-                        if (massRow_ == "rpsuper")
+                        if (massRow_ == "hlle")
+                        {
+                            // ── HLLE on the mass row ────────────────────────
+                            // Einfeldt speeds, so the supercritical degeneracy
+                            // is STRUCTURAL rather than a special case, and the
+                            // solver is positivity-preserving -- which matters
+                            // here because every failure this seam has shown
+                            // was a thin or drying column (6 mm at dy = 20 mm).
+                            // No R^-1 and no entropy fix, unlike Roe.
+                            // The mass row is conservative, so it carries no
+                            // fluctuation term.
+                            const Foam::scalar hRg = ghost[1], qRg = ghost[2];
+                            const Foam::scalar FLh = twoD ? qLn : qL*nUnit.x();
+                            const Foam::scalar FRh = twoD ? qRn : qRg*nUnit.x();
+                            const Foam::scalar uLh =
+                                (hL  > 1e-10) ? FLh/hL  : Foam::scalar(0);
+                            const Foam::scalar uRh =
+                                (hRg > 1e-10) ? FRh/hRg : Foam::scalar(0);
+                            const Foam::scalar cLh = Foam::sqrt
+                                (gAcc*Foam::max(hL,  Foam::scalar(0)));
+                            const Foam::scalar cRh = Foam::sqrt
+                                (gAcc*Foam::max(hRg, Foam::scalar(0)));
+                            // Roe average for the Einfeldt estimate, with a dry
+                            // guard: sqrt(h) -> 0 makes utl 0/0, so fall back to
+                            // the Davis speeds when either side is dry.
+                            const Foam::scalar rL = Foam::sqrt
+                                (Foam::max(hL,  Foam::scalar(0)));
+                            const Foam::scalar rR = Foam::sqrt
+                                (Foam::max(hRg, Foam::scalar(0)));
+                            Foam::scalar sL, sR;
+                            if (rL + rR > 1e-10)
+                            {
+                                const Foam::scalar ut =
+                                    (rL*uLh + rR*uRh)/(rL + rR);
+                                const Foam::scalar ct = Foam::sqrt
+                                    (gAcc*Foam::max(Foam::scalar(0.5)*(hL + hRg),
+                                                    Foam::scalar(0)));
+                                sL = Foam::min(uLh - cLh, ut - ct);
+                                sR = Foam::max(uRh + cRh, ut + ct);
+                            }
+                            else
+                            {
+                                sL = Foam::min(uLh - cLh, uRh - cRh);
+                                sR = Foam::max(uLh + cLh, uRh + cRh);
+                            }
+                            if (sL >= 0)      Fstar = FLh;
+                            else if (sR <= 0) Fstar = FRh;
+                            else
+                            {
+                                const Foam::scalar den = sR - sL;
+                                Fstar = (den > 1e-30)
+                                    ? (sR*FLh - sL*FRh + sL*sR*(hRg - hL))/den
+                                    : Foam::scalar(0.5)*(FLh + FRh);
+                            }
+                            superDone = true;
+                        }
+                        else if (massRow_ == "rpsuper")
                         {
                             // Build from the GHOST, not the raw peer: the `rp`
                             // branch below pairs (rt, ghost) and the FO mirrors

@@ -895,7 +895,56 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     // the upwind side owns the flux (HLL degeneracy) and the
                     // Rusanov dissipation is spurious -- 5.85 % on uniform
                     // supercritical advection, whose exact answer is constant.
-                    if (qstarMode_ == "charsuper")
+                    if (qstarMode_ == "hlle")
+                    {
+                        // ── HLLE, MIRRORING PreciceManager.H massRow hlle ───
+                        // Bit-for-bit, or the two sides charge different fluxes
+                        // at the same face and the seam stops telescoping.
+                        // Einfeldt speeds: the supercritical degeneracy is
+                        // structural (sL>=0 -> F_L, sR<=0 -> F_R) and the
+                        // solver is positivity-preserving, which the thin/dry
+                        // seams here need.  Mass row is conservative -> no
+                        // fluctuation term.
+                        const scalar gA = param[0];
+                        const scalar hLh = qSwe[1], hRh = qR[1];
+                        const scalar FLh = oblique ? qLn : qSwe[2]*nHat.x();
+                        const scalar FRh = oblique ? qRn : qR[2]*nHat.x();
+                        const scalar uLh = (hLh > 1e-10) ? FLh/hLh : 0.0;
+                        const scalar uRh = (hRh > 1e-10) ? FRh/hRh : 0.0;
+                        const scalar cLh =
+                            Foam::sqrt(gA*Foam::max(hLh, scalar(0)));
+                        const scalar cRh =
+                            Foam::sqrt(gA*Foam::max(hRh, scalar(0)));
+                        const scalar rL =
+                            Foam::sqrt(Foam::max(hLh, scalar(0)));
+                        const scalar rR =
+                            Foam::sqrt(Foam::max(hRh, scalar(0)));
+                        scalar sL, sR;
+                        if (rL + rR > 1e-10)
+                        {
+                            const scalar ut = (rL*uLh + rR*uRh)/(rL + rR);
+                            const scalar ct = Foam::sqrt
+                                (gA*Foam::max(scalar(0.5)*(hLh + hRh),
+                                              scalar(0)));
+                            sL = Foam::min(uLh - cLh, ut - ct);
+                            sR = Foam::max(uRh + cRh, ut + ct);
+                        }
+                        else
+                        {
+                            sL = Foam::min(uLh - cLh, uRh - cRh);
+                            sR = Foam::max(uLh + cLh, uRh + cRh);
+                        }
+                        if (sL >= 0)      qStar = FLh;
+                        else if (sR <= 0) qStar = FRh;
+                        else
+                        {
+                            const scalar den = sR - sL;
+                            qStar = (den > 1e-30)
+                                ? (sR*FLh - sL*FRh + sL*sR*(hRh - hLh))/den
+                                : 0.5*(FLh + FRh);
+                        }
+                    }
+                    else if (qstarMode_ == "charsuper")
                     {
                         const scalar gA = param[0];
                         const scalar hLs = qSwe[1], hRs = qR[1];
