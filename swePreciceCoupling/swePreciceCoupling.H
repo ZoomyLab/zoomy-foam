@@ -69,6 +69,12 @@ class swePreciceCoupling
         //  as well, and only q_0 was ever booked.
         List<scalar> winFq;
         scalar winScale = 1;             // starstate renormalisation factor
+        //- imposeMode charswitch: the column Froude the regime was chosen on,
+        //  and the branch it took (-1 supercritical out, 0 subcritical,
+        //  +1 supercritical in).  Logged, because a regime switch that fires
+        //  on the wrong side is invisible in the fields it writes.
+        scalar winFr = 0;
+        label  winRegime = 0;
     };
 
     struct Interface

@@ -79,7 +79,7 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
         starLog_.reset(new OFstream(mesh_.time().globalPath()/"seam_rows.csv"));
         starLog_().precision(17);
         starLog_() << "n,t,col,mode,F_h,q_imp,mass_resid,scale,"
-                      "F_q0,M_adv,M_prs,M_imp,dM";
+                      "F_q0,M_adv,M_prs,M_imp,dM,Fr,regime";
         // One CHARGED/CARRIED pair per moment row, appended so that every
         // reader of the original thirteen columns keeps working.  State 2 is
         // q_0, so the moment rows run 2 .. n_dof_q-1.
@@ -950,7 +950,99 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                      << "," << qVof[1] << "," << qVof[2] << "," << qStar << ","
                      << hFill << Foam::endl;
             }
-            if (imposeMode_ == "starstate")
+            // ══ CHARACTERISTIC REGIME SWITCH (imposeMode charswitch) ════════
+            // A star state is the answer to a TWO-SIDED Riemann problem, and a
+            // supercritical seam does not have one: every characteristic runs
+            // the same way, so one side owns the answer outright.  Imposing a
+            // star state there writes the SME's reconstructed profile onto a
+            // boundary that should be free -- measured on uniform supercritical
+            // advection, whose exact solution is a constant: starstate holds
+            // 21.3 % of the bulk momentum as residual against statebc's 8.4 %,
+            // and the imposed profile is curved where the exact one is flat
+            // (-1.442 .. -1.605 against a uniform -1.5).  The curvature is NOT
+            // the SME's friction; it is bit-identical at nu = 0.
+            //
+            // So let the eigenvalues choose, on the VOF column's OWN state:
+            //   Fr <= -1  supercritical OUT of the VOF -> impose nothing,
+            //             zero Neumann on every field; the interior owns it.
+            //   Fr >= +1  supercritical INTO the VOF   -> impose everything
+            //             from the peer; nothing propagates back out.
+            //   |Fr| < 1  subcritical -> the star state, which is what it is
+            //             for.
+            scalar FrCol = 0.0;
+            if (imposeMode_ == "charswitch")
+            {
+                scalar uBar = 0.0, aSum = 0.0;
+                forAll(col.faces, j)
+                {
+                    const label f = col.faces[j];
+                    uBar += (uPif[f] & I.nStream)*aPif[f];
+                    aSum += aPif[f];
+                }
+                uBar = (aSum > SMALL) ? uBar/aSum : 0.0;
+                const scalar cW =
+                    Foam::sqrt(Foam::max(param[0]*hFill, scalar(SMALL)));
+                FrCol = uBar/cW;
+            }
+            const bool superOut = (imposeMode_ == "charswitch" && FrCol <= -1.0);
+            const bool superIn  = (imposeMode_ == "charswitch" && FrCol >= 1.0);
+            col.winFr = FrCol;
+            col.winRegime = superOut ? -1 : (superIn ? 1 : 0);
+
+            if (superOut)
+            {
+                // Zero Neumann on everything.  A fixedValue patch carrying the
+                // INTERIOR value is zero-gradient behaviour, and phi is left
+                // alone so the solver's own outflow flux stands.
+                forAll(col.faces, j)
+                {
+                    const label f = col.faces[j];
+                    Uin[f] = uPif[f];
+                    alphaIn[f] = aPif[f];
+                }
+                col.curTarget = qStar;
+                col.curRate = qStar;
+            }
+            else if (superIn)
+            {
+                // Everything from the peer, unrenormalised: with all
+                // characteristics entering, the peer state IS the answer and a
+                // mass correction would be over-determination.
+                const label nfS = col.faces.size();
+                const scalar dzS = col.height/Foam::max(1, nfS);
+                // peer profile on ITS unit grid, then read at each face's
+                // WATER-relative zeta -- the same remap the statebc path does,
+                // built locally because that path's copy is scoped to it.
+                List<scalar> zS(nfS), uSp(nfS), vSp(nfS), wSp(nfS);
+                forAll(col.faces, j)
+                {
+                    const label f = col.faces[j];
+                    const List<scalar>& pf = I.peerF[f];
+                    const vector ug =
+                        pf[2]*I.eH1 + pf[3]*I.eH2 + pf[4]*I.gUp;
+                    zS[j]  = I.sigmaF[f];
+                    uSp[j] = ug & I.nStream;
+                    vSp[j] = ug & I.tHat;
+                    wSp[j] = ug & I.gUp;
+                }
+                forAll(col.faces, j)
+                {
+                    const label f = col.faces[j];
+                    const scalar yLo =
+                        col.floorY + I.sigmaF[f]*col.height - 0.5*dzS;
+                    alphaIn[f] = Foam::max(scalar(0), Foam::min(scalar(1),
+                        (col.floorY + hFill - yLo)/dzS));
+                    const scalar zw = (hFill > SMALL)
+                        ? Foam::min(I.sigmaF[f]*col.height/hFill, scalar(1))
+                        : 0.0;
+                    Uin[f] = interpProfile(zS, uSp, zw)*I.nStream
+                           + interpProfile(zS, vSp, zw)*I.tHat
+                           + interpProfile(zS, wSp, zw)*I.gUp;
+                }
+                col.curTarget = qStar;
+                col.curRate = qStar;
+            }
+            else if (imposeMode_ == "starstate" || imposeMode_ == "charswitch")
             {
                 // ══ STAR-STATE IMPOSITION ═══════════════════════════════════
                 // ONE independent quantity per face: the face flux phi_f.  U_f
@@ -1267,7 +1359,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     << qImp << "," << (qImp - col.curRate) << ","
                     << col.winScale << "," << col.winFq0 << "," << mAdv << ","
                     << mPrs << "," << (mAdv + mPrs) << ","
-                    << (col.winFq0 - mAdv - mPrs);
+                    << (col.winFq0 - mAdv - mPrs) << "," << col.winFr
+                    << "," << col.winRegime;
                 for (label k = 2; k < nR; ++k)
                 {
                     const scalar cq = (k < carried.size()) ? carried[k] : 0.0;
