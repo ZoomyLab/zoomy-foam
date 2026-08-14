@@ -568,10 +568,24 @@ public:
                             {
                                 const Eigen::Matrix<double, nq, 1> bq =
                                     luq.solve(dFq);
+                                // Harten entropy fix, MIRRORING
+                                // swePreciceCoupling::fwaveFlux bit for bit.
+                                // The sharp sign split has no dissipation at a
+                                // sonic point and f-waves are not
+                                // positivity-preserving; smoothing over
+                                // |lam| < delta restores a floor exactly where
+                                // the sign is ambiguous.
+                                double lmx = 0.0;
+                                for (int pw = 0; pw < nq; ++pw)
+                                    lmx = Foam::max(lmx, Foam::mag(lm(pw)));
+                                const double dl = Foam::max(1e-12, 0.2*lmx);
                                 double acc = FLm[1][0];
                                 for (int pw = 0; pw < nq; ++pw)
-                                    if (lm(pw)*nUnit.x() < 0)
-                                        acc += bq(pw)*Rr(1, pw);
+                                {
+                                    const double sg = Foam::max(-1.0,
+                                        Foam::min(1.0, lm(pw)*nUnit.x()/dl));
+                                    acc += 0.5*(1.0 - sg)*bq(pw)*Rr(1, pw);
+                                }
                                 Fstar = acc;
                             }
                             superDone = true;

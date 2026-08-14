@@ -1,3 +1,4 @@
+#include <cmath>
 #include "swePreciceCoupling.H"
 #include "addToRunTimeSelectionTable.H"
 #include "uniformDimensionedFields.H"
@@ -704,12 +705,27 @@ Foam::List<Foam::scalar> fwaveFlux(
     }
     const Eigen::Matrix<double, n, 1> beta = lu.solve(dF);
 
+    // ENTROPY FIX (Harten), as a smoothed wave split.  A sharp
+    //     frac_left = (1 - sign(lam n))/2
+    // has no dissipation at a sonic point, and f-waves are not
+    // positivity-preserving: measured, the sharp split is SHARPER than Rusanov
+    // early (window 2 gives -0.05018 against an exact -0.05, 0.36 % versus
+    // Rusanov's 2.76 %) and then blows up -- |F_h| reached 0.29 and the inlet
+    // dt collapsed to 4e-10.  Smoothing the split over |lam| < delta restores a
+    // dissipation floor exactly where the sign is ambiguous and nowhere else.
     const double nx = nHat.x();
+    double lmax = 0.0;
+    for (int pw = 0; pw < n; ++pw) lmax = std::max(lmax, std::abs(lam(pw)));
+    const double delta = std::max(1e-12, 0.2*lmax);
     for (int i = 0; i < n; ++i)
     {
         double acc = FLm[i][0];
         for (int pw = 0; pw < n; ++pw)
-            if (lam(pw)*nx < 0) acc += beta(pw)*R(i, pw);
+        {
+            const double sgn =
+                std::max(-1.0, std::min(1.0, lam(pw)*nx/delta));
+            acc += 0.5*(1.0 - sgn)*beta(pw)*R(i, pw);
+        }
         Fs[i] = acc;
     }
     return Fs;
