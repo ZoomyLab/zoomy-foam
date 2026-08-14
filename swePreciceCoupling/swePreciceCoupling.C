@@ -1117,7 +1117,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 col.curTarget = qStar;
                 col.curRate = qStar;
             }
-            else if (imposeMode_ == "starstate" || imposeMode_ == "charswitch")
+            else if (imposeMode_ == "starstate" || imposeMode_ == "charswitch"
+                  || imposeMode_ == "momentum")
             {
                 // ══ STAR-STATE IMPOSITION ═══════════════════════════════════
                 // ONE independent quantity per face: the face flux phi_f.  U_f
@@ -1209,7 +1210,31 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 // the profile, and the count is reported at the end of the run.
                 const scalar tiny = 1e-12*Foam::max(wetMeas*uMag, SMALL);
                 scalar sFac = 1.0;
-                if (Foam::mag(intake0) > tiny)
+                if (imposeMode_ == "momentum")
+                {
+                    // DIAGNOSTIC MODE, NOT A PRODUCTION PATH.  Renormalise the
+                    // shape so the imposed MOMENTUM row matches what the SME
+                    // charged, instead of the mass row.  This deliberately
+                    // breaks mass conservation; its only purpose is to answer
+                    // one question cheaply -- is the seam's state error
+                    // sensitive to the momentum deficit at all?  If it is not,
+                    // a momentum SOURCE TERM in the seam cells (the only way
+                    // to supply momentum without over-determining the pressure
+                    // BC) is not worth building.
+                    //
+                    // Only the ADVECTIVE part scales with the shape; the
+                    // hydrostatic part is fixed by h* and is untouched:
+                    //     M(s) = s^2 * sum(u^2 alpha dz) + g h*^2 / 2
+                    scalar mAdv0 = 0.0;
+                    forAll(col.faces, j)
+                        mAdv0 += uS[j]*uS[j]*aCol[j]*dz;
+                    const scalar mPrs0 = 0.5*param[0]*hFill*hFill;
+                    const scalar want = col.winFq0 - mPrs0;
+                    sFac = (mAdv0 > tiny && want > 0.0)
+                        ? Foam::sqrt(want/mAdv0)
+                        : ((Foam::mag(intake0) > tiny) ? qEff/intake0 : 1.0);
+                }
+                else if (Foam::mag(intake0) > tiny)
                 {
                     sFac = qEff/intake0;
                 }
@@ -1242,8 +1267,11 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 // not on the intermediate it was built from.  Roundoff only;
                 // anything larger is a defect and must stop the run rather
                 // than be absorbed by the debt ledger.
+                // imposeMode momentum renormalises on the MOMENTUM row, so the
+                // mass identity below is expected NOT to hold there -- that is
+                // the point of the diagnostic, not a defect.
                 const scalar resid = intake - qEff;
-                if (Foam::mag(resid)
+                if (imposeMode_ != "momentum" && Foam::mag(resid)
                   > 1e-10*Foam::max(Foam::mag(qEff), SMALL) + 1e-18)
                 {
                     FatalErrorInFunction
