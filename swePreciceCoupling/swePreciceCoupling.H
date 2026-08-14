@@ -60,6 +60,11 @@ class swePreciceCoupling
         scalar winTarget = 0;            // window-frozen target + fill
         scalar winHFill = 0;
         List<scalar> winQStar;           // window-frozen Riemann star state Q* (imposeMode=qstar)
+        //- window-frozen MOMENTUM row of the interface RP, Fc[2][0]+Fl[2][1].
+        //  Never imposed — the VOF inlet takes a mass flux and a velocity
+        //  profile.  Booked so the momentum the seam drops is measurable.
+        scalar winFq0 = 0;
+        scalar winScale = 1;             // starstate renormalisation factor
     };
 
     struct Interface
@@ -87,9 +92,13 @@ class swePreciceCoupling
 
     // shared
     scalar relax_;
-    //- inflow imposition: "statebc" (default, cS-height + qStar-discharge) or
-    //  "qstar" (consistent Rusanov star state Q*: h* and q0* from ONE solve,
-    //  so u = q0*/h* by construction — no separate cS/dU rescale).
+    //- inflow imposition: "statebc" (default, cS-height + qStar-discharge),
+    //  "qstar" (Rusanov star state Q* for the stage and the profile, no
+    //  rescale), or "starstate" (the star state of the SAME Riemann problem
+    //  the mass row is priced from, reconstructed through the model's own
+    //  basis, distributed over the faces and RENORMALISED so the column's
+    //  intake equals the mass row exactly — mass conservation by
+    //  construction, with phi as the single imposed quantity per face).
     word imposeMode_ = "statebc";
     //- window mass-flux target:
     //  "shared" (DEFAULT): the level-invariant two-point Rusanov mass flux on
@@ -121,6 +130,12 @@ class swePreciceCoupling
     bool writeColumns_ = false;   // persist exchanged columns at write times
     scalar Mprev_ = -GREAT;   // previous-step VOF water mass (per width)
     autoPtr<OFstream> ledgerLog_;   // optional per-step ledger diagnostics
+    //- seam-row audit: the interface RP's mass AND momentum rows against what
+    //  the imposed inlet actually carries.  Written on every imposition path.
+    autoPtr<OFstream> starLog_;
+    //- columns whose reconstructed shape carried no mass to rescale
+    //  (imposeMode=starstate).  Reported, never hidden.
+    label nDegenShape_ = 0;
     long winIdx_ = 0;               // completed-window counter
     scalar outInterval_;
     scalar lastWrite_;

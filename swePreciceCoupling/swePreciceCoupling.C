@@ -37,6 +37,14 @@ Foam::functionObjects::swePreciceCoupling::swePreciceCoupling
 
 Foam::functionObjects::swePreciceCoupling::~swePreciceCoupling()
 {
+    if (nDegenShape_ > 0)
+    {
+        WarningInFunction << nl
+            << "[starstate] " << nDegenShape_ << " column-window(s) had a "
+            << "reconstructed shape carrying no mass to renormalise and fell "
+            << "back to the shape-free uniform profile.  Mass is still exact "
+            << "there; the PROFILE is not the star state's." << endl;
+    }
     if (precice_ && !finalized_) precice_->finalize();
 }
 
@@ -59,6 +67,19 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
             mesh_.time().globalPath()/"ledger.csv"));
         ledgerLog_().precision(17);
         ledgerLog_() << "n,t,target,imposed,realized,debt,dMdt,engaged" << nl;
+        // The seam's OTHER rows.  F_h is the mass row and it is imposed; F_q0
+        // is the momentum row of the SAME Riemann problem and it is not, on
+        // any path — the VOF inlet takes a mass flux and a velocity profile.
+        // M_imp is the momentum flux the imposed inlet does carry, advective
+        // + hydrostatic, in the model's own units and against the model's own
+        // datum (F_q0 = h(u0^2 + u1^2/3 + u2^2/5) + g h^2/2), so dM = F_q0 -
+        // M_imp is the momentum the seam drops.  q_imp/mass_resid are read
+        // off the WRITTEN boundary fields, not off the intermediates they
+        // were built from, so the renormalisation is checked and not claimed.
+        starLog_.reset(new OFstream(mesh_.time().globalPath()/"seam_rows.csv"));
+        starLog_().precision(17);
+        starLog_() << "n,t,col,mode,F_h,q_imp,mass_resid,scale,"
+                      "F_q0,M_adv,M_prs,M_imp,dM" << nl;
     }
     dict.readIfPresent("debtRepayWindows", debtRepay_);
     dict.readIfPresent("writeColumns", writeColumns_);
@@ -858,6 +879,52 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     // adopted, because swePreciceCoupling is not built by the
                     // default wmake and nothing exercised it.
                     qStar = Fc[1][0] + Fl[1][1];
+                    // THE MOMENTUM ROW of the same interface RP.  Computed
+                    // every window since this function object was written and
+                    // discarded every window: nothing on either side imposes
+                    // it.  Booked here so it can be measured (seam_rows.csv).
+                    //
+                    // MIND THE TWO ABIs.  numerical_flux returns
+                    // (n_state, 1) -- state first -- while
+                    // numerical_fluctuations returns (2, n_state) -- SIDE
+                    // first, row 0 the minus/left fluctuation and row 1 the
+                    // plus/right one, which is the side this inlet is.  The
+                    // mass row above reads Fc[1][0] + Fl[1][1] and the two
+                    // index pairs LOOK transposable there only because h is
+                    // state 1 and the right side is side 1.  It is state 2
+                    // here, so the momentum row is Fc[2][0] + Fl[1][2];
+                    // Fl[2][1] is a read past the end of a 2-row List, which
+                    // an -O3 build does not check -- it segfaults in
+                    // imposeInflow on the FIRST execute().
+                    col.winFq0 = Fc[2][0] + Fl[1][2];
+                    if (imposeMode_ == "starstate")
+                    {
+                        // THE STAR STATE.  Rusanov IS HLL with s_L = -lam_max
+                        // and s_R = +lam_max, so its resolved middle state is
+                        //     q* = (q_L+q_R)/2 + (F_L-F_R)/(2 lam_max),
+                        // which is exactly what the registered operator
+                        // Numerics::star_state emits, from THIS solver's own
+                        // wave speed and on the same six-key face signature as
+                        // numerical_flux.  Rusanov has no star state of its
+                        // own; this HLL-consistent definition is the honest
+                        // one and is stated as such rather than presented as
+                        // Rusanov's.
+                        //
+                        // The pair is (qSwe, qR) — the SAME pair, ghost
+                        // included, the mass row above is priced from, so the
+                        // stage, the shape and the flux are ONE Riemann
+                        // problem.  imposeMode=qstar instead takes its stage
+                        // from star_state on the RAW pair while pricing mass
+                        // from the ghost pair: two Riemann problems at one
+                        // face.
+                        const auto S = Numerics::star_state
+                            (qSwe, qR, qaux, qaux, param, nHat);
+                        List<scalar> qs(Model::n_dof_q);
+                        for (int i = 0; i < Model::n_dof_q; ++i)
+                            qs[i] = S[i][0];
+                        col.winQStar = qs;
+                        hFill = S[1][0];
+                    }
                 }
             }
             if (winFresh2_) { col.winTarget = qStar; col.winHFill = hFill; }
@@ -869,126 +936,294 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                      << "," << qVof[1] << "," << qVof[2] << "," << qStar << ","
                      << hFill << Foam::endl;
             }
-            // ζ-column contract impose, cell-wise direction switch
-            // (inletOutlet pattern): a face whose INTERIOR streamwise
-            // velocity points out of the VOF domain is an outflow face —
-            // shape = interior value (zero-gradient behaviour), alpha =
-            // interior fill; otherwise inflow — shape = peer u(ζ), alpha =
-            // geometric fill to the column depth.  ONE additive column
-            // shift then makes the wetted-column integral exactly q*:
-            // exact mass by construction, well-conditioned at flow
-            // reversal (no q*/qProf division, no clamp, no global
-            // direction branch).  A flat peer profile under pure inflow
-            // reduces to the original uniform u = q*/hVof identically.
-            const label nf = col.faces.size();
-            const scalar dz = col.height/Foam::max(1, nf);
+            if (imposeMode_ == "starstate")
+            {
+                // ══ STAR-STATE IMPOSITION ═══════════════════════════════════
+                // ONE independent quantity per face: the face flux phi_f.  U_f
+                // is DERIVED from it, because phi_f == U_f & Sf_f identically —
+                // imposing a state and a flux independently would set the same
+                // thing twice with two different values.
+                //
+                //   q*   the HLL-consistent Rusanov star state (above)
+                //   u(ζ) reconstructed from q*'s MOMENTS through the model's
+                //        own basis (Model::interpolate_to_3d is STATE-specific;
+                //        a flux vector has no ζ-expansion — F_h and F_q0 are
+                //        fluxes of DIFFERENT equations with different
+                //        dimensions)
+                //   φ_j  distributed by that shape and RENORMALISED so the
+                //        column's water intake is EXACTLY the mass row.  Mass
+                //        conservation then holds BY CONSTRUCTION, independent
+                //        of the reconstruction: shape error moves water
+                //        vertically inside the column and never changes how
+                //        much crosses.
+                //   α    from q*'s own depth h*.
+                const label nf = col.faces.size();
+                const scalar dz = col.height/Foam::max(1, nf);
+                const scalarField& magSfP = mesh_.boundary()[I.patchID].magSf();
+                const vectorField& SfP = mesh_.boundary()[I.patchID].Sf();
 
-            // peer profile source points on the unit zeta grid.  The peer
-            // sends [u,v,w] in the EXCHANGE basis; reconstruct the mesh-
-            // frame vector, then split into the impose basis (streamwise
-            // scalar for the mass constraint, transverse/vertical riding
-            // along for the full-vector impose).
-            // qstar: reconstruct the inflow profile from the CONSISTENT star
-            // state Q* (interpolate_to_3d), so the imposed velocity u = q0*/h*
-            // is consistent with the imposed height h* = winHFill.  Otherwise
-            // use the raw peer profile.
-            const bool useQStar =
-                (imposeMode_ == "qstar" && col.winQStar.size() == Model::n_dof_q);
-            List<List<scalar>> profStar;
-            if (useQStar)
-            {
-                List<scalar> zList(nf);
-                forAll(col.faces, j) zList[j] = I.sigmaF[col.faces[j]];
-                profStar = Model::interpolate_to_3d(col.winQStar, qaux, param, zList);
-            }
-            List<scalar> zP(nf), uP(nf), vP(nf), wP(nf);
-            forAll(col.faces, j)
-            {
-                const List<scalar>& pf = useQStar ? profStar[j] : I.peerF[col.faces[j]];
-                const vector ug = pf[2]*I.eH1 + pf[3]*I.eH2 + pf[4]*I.gUp;
-                zP[j] = I.sigmaF[col.faces[j]];
-                uP[j] = ug & I.nStream;
-                vP[j] = ug & I.tHat;
-                wP[j] = ug & I.gUp;
-            }
-            sortProfile(zP, uP, vP, wP);
+                // the ledger contract, identical to the statebc path: the
+                // ledger books against the TARGET and imposes the repaid rate.
+                const scalar qEff = qStar
+                    + ((winW_ > SMALL) ? col.debt/(debtRepay_*winW_) : 0.0);
+                col.curTarget = qStar;
+                col.curRate = qEff;
 
-            // The cell-wise rule applies to WETTED faces only.  Dry (air)
-            // faces above the waterline get the bounded bulk velocity
-            // q*/hVof (the old anchored recipe): a copy-interior Dirichlet
-            // on the air phase is a positive feedback loop — nothing
-            // anchors the inlet air column and it accelerates without
-            // bound (seen: -0.08 -> -90 m/s within 0.1 s at the L2
-            // reflected-bore re-entry, shredding the water column).
-            // wetted faces carry the FULL velocity vector: outflow = the
-            // interior vector (zero-gradient behaviour in all components),
-            // inflow = the peer's (u,v,w) profile.  Only the streamwise
-            // component enters the mass constraint; transverse/vertical
-            // ride along so the impose is genuinely full-field (a
-            // streamwise-only impose zeroes transverse shear at the inlet).
-            List<scalar> uMix(nf, scalar(0)), vMix(nf, scalar(0)),
-                         wMix(nf, scalar(0));
-            boolList wet(nf, false);
-            scalar qMix = 0.0, wWet = 0.0;
-            forAll(col.faces, j)
-            {
-                const label f = col.faces[j];
-                const scalar sInt = uPif[f] & I.nStream;
-                const bool out = (sInt < 0);
-                const scalar zAbs = col.floorY + I.sigmaF[f]*col.height;
-                const scalar yLo  = zAbs - 0.5*dz;
-                const scalar aFill = out
-                    ? aPif[f]
-                    : Foam::max(0.0, Foam::min(1.0, (col.floorY + hFill - yLo)/dz));
-                alphaIn[f] = aFill;
-                wet[j] = (aFill > 1e-3);
-                if (!wet[j]) continue;
-                const scalar zw =
-                    (hFill > SMALL) ? I.sigmaF[f]*col.height/hFill : 0.0;
-                const scalar zc = Foam::min(zw, scalar(1));
-                uMix[j] = out ? sInt : interpProfile(zP, uP, zc);
-                vMix[j] = out ? (uPif[f] & I.tHat) : interpProfile(zP, vP, zc);
-                wMix[j] = out ? (uPif[f] & I.gUp)  : interpProfile(zP, wP, zc);
-                qMix += uMix[j]*aFill*dz;
-                wWet += aFill*dz;
+                // ── the shape, on each face's WATER-relative ζ ──────────────
+                // interpolate_to_3d expects ζ ∈ [0,1] over the WATER column,
+                // not domain σ: a face above the waterline is not at ζ > 1 of
+                // the profile, it is out of the water.
+                List<scalar> zW(nf, scalar(0));
+                forAll(col.faces, j)
+                {
+                    const scalar zw = (hFill > SMALL)
+                        ? I.sigmaF[col.faces[j]]*col.height/hFill : 0.0;
+                    zW[j] = Foam::min(Foam::max(zw, scalar(0)), scalar(1));
+                }
+                List<scalar> uS(nf, scalar(0)), vS(nf, scalar(0)),
+                             wS(nf, scalar(0));
+                if (hFill > SMALL && col.winQStar.size() == Model::n_dof_q)
+                {
+                    const List<List<scalar>> prof = Model::interpolate_to_3d
+                        (col.winQStar, qaux, param, zW);
+                    forAll(col.faces, j)
+                    {
+                        const vector ug = prof[j][2]*I.eH1 + prof[j][3]*I.eH2
+                                        + prof[j][4]*I.gUp;
+                        uS[j] = ug & I.nStream;
+                        vS[j] = ug & I.tHat;
+                        wS[j] = ug & I.gUp;
+                    }
+                }
+
+                // ── α from h*, and the shape's own intake ───────────────────
+                // EVERY face counts, including the partially wet one at the
+                // waterline: the statebc path sums only faces over an
+                // `aFill > 1e-3` test but writes velocity and α to all of
+                // them, so the intake of the excluded faces is outside its
+                // accounting.  Here the accounting IS the imposition.
+                scalarField aCol(nf, scalar(0));
+                scalar intake0 = 0.0, wetMeas = 0.0, uMag = 0.0;
+                forAll(col.faces, j)
+                {
+                    const label f = col.faces[j];
+                    const scalar yLo =
+                        col.floorY + I.sigmaF[f]*col.height - 0.5*dz;
+                    aCol[j] = Foam::max(scalar(0), Foam::min(scalar(1),
+                        (col.floorY + hFill - yLo)/dz));
+                    alphaIn[f] = aCol[j];
+                    intake0 += uS[j]*aCol[j]*dz;
+                    wetMeas += aCol[j]*dz;
+                    uMag = Foam::max(uMag, Foam::mag(uS[j]));
+                }
+
+                // ── RENORMALISE ────────────────────────────────────────────
+                // A UNIFORM rescale: it preserves the shape exactly (an
+                // additive shift does not) and makes the column integral hit
+                // the target identically.  It is also the one step that can
+                // fail — a shape whose own intake vanishes carries no mass to
+                // rescale.  That is DETECTED and COUNTED, never floored: the
+                // degenerate column falls back to the shape-free uniform
+                // profile, which is still mass-exact but says nothing about
+                // the profile, and the count is reported at the end of the run.
+                const scalar tiny = 1e-12*Foam::max(wetMeas*uMag, SMALL);
+                scalar sFac = 1.0;
+                if (Foam::mag(intake0) > tiny)
+                {
+                    sFac = qEff/intake0;
+                }
+                else
+                {
+                    ++nDegenShape_;
+                    const scalar uUni = (wetMeas > SMALL) ? qEff/wetMeas : 0.0;
+                    forAll(col.faces, j)
+                    { uS[j] = uUni; vS[j] = 0.0; wS[j] = 0.0; }
+                }
+                col.winScale = sFac;
+
+                // ── φ first, U from φ ──────────────────────────────────────
+                // Sf is OUTWARD, so an inflow face carries φ < 0.  The
+                // tangential part is projected perpendicular to Sf, so it
+                // rides along in the full-vector impose without disturbing φ.
+                scalar intake = 0.0;
+                forAll(col.faces, j)
+                {
+                    const label f = col.faces[j];
+                    const scalar aSf = Foam::max(magSfP[f], SMALL);
+                    const vector nF = SfP[f]/aSf;
+                    const scalar phiF = -sFac*uS[j]*aSf;
+                    vector Ut = sFac*(vS[j]*I.tHat + wS[j]*I.gUp);
+                    Ut -= (Ut & nF)*nF;
+                    Uin[f] = (phiF/aSf)*nF + Ut;
+                    intake += -aCol[j]*(Uin[f] & SfP[f])*dz/aSf;
+                }
+                // THE ASSERTION, on the field that was actually written and
+                // not on the intermediate it was built from.  Roundoff only;
+                // anything larger is a defect and must stop the run rather
+                // than be absorbed by the debt ledger.
+                const scalar resid = intake - qEff;
+                if (Foam::mag(resid)
+                  > 1e-10*Foam::max(Foam::mag(qEff), SMALL) + 1e-18)
+                {
+                    FatalErrorInFunction
+                        << "[starstate] renormalisation did not hold: imposed "
+                        << intake << " against target " << qEff << " (residual "
+                        << resid << ", scale " << sFac << ", shape intake "
+                        << intake0 << ")"
+                        << Foam::exit(Foam::FatalError);
+                }
             }
-            // exact-mass ledger: repay the cumulative (imposed − realized)
-            // intake debt over debtRepay_ windows.  One-window (deadbeat)
-            // repayment spikes the imposed velocity at bore arrival and
-            // blows the inlet up; a horizon keeps the correction gentle while
-            // the ledger still telescopes (debt is bounded and fully repaid).
-            const scalar qEff =
-                qStar + ((winW_ > SMALL) ? col.debt/(debtRepay_*winW_) : 0.0);
-            col.curTarget = qStar;   // ledger books against the TARGET, not
-            col.curRate = qEff;      // the repayment-boosted imposed rate —
-                                     // else the debt never decays and the
-                                     // boost pumps spurious mass forever.
-            // qstar: NO additive rescale — the Q* profile already carries
-            // q0* over the h* column (u=q0*/h* consistent).  statebc: shift to
-            // hit qEff over the wetted column.
-            const scalar dU = useQStar ? 0.0
-                            : ((wWet > SMALL) ? (qEff - qMix)/wWet : 0.0);
-            if (ledgerLog_.valid())
+            else
             {
-                // correction-shift log: one row per imposeInflow call
-                // (t, q* target, qEff incl. ledger repay, raw-profile qMix,
-                //  wetted measure, the applied shift dU, ledger debt)
-                static Foam::OFstream dulog(
-                    mesh_.time().globalPath()/"du_dbg.csv");
-                static bool hdr = false;
-                if (!hdr) { dulog << "t,qStar,qEff,qMix,wWet,dU,debt" << Foam::nl;
-                            dulog.precision(12); hdr = true; }
-                dulog << mesh_.time().value() << "," << qStar << "," << qEff
-                      << "," << qMix << "," << wWet << "," << dU << ","
-                      << col.debt << Foam::nl;
+                // ζ-column contract impose, cell-wise direction switch
+                // (inletOutlet pattern): a face whose INTERIOR streamwise
+                // velocity points out of the VOF domain is an outflow face —
+                // shape = interior value (zero-gradient behaviour), alpha =
+                // interior fill; otherwise inflow — shape = peer u(ζ), alpha =
+                // geometric fill to the column depth.  ONE additive column
+                // shift then makes the wetted-column integral exactly q*:
+                // exact mass by construction, well-conditioned at flow
+                // reversal (no q*/qProf division, no clamp, no global
+                // direction branch).  A flat peer profile under pure inflow
+                // reduces to the original uniform u = q*/hVof identically.
+                const label nf = col.faces.size();
+                const scalar dz = col.height/Foam::max(1, nf);
+
+                // peer profile source points on the unit zeta grid.  The peer
+                // sends [u,v,w] in the EXCHANGE basis; reconstruct the mesh-
+                // frame vector, then split into the impose basis (streamwise
+                // scalar for the mass constraint, transverse/vertical riding
+                // along for the full-vector impose).
+                // qstar: reconstruct the inflow profile from the CONSISTENT star
+                // state Q* (interpolate_to_3d), so the imposed velocity u = q0*/h*
+                // is consistent with the imposed height h* = winHFill.  Otherwise
+                // use the raw peer profile.
+                const bool useQStar =
+                    (imposeMode_ == "qstar" && col.winQStar.size() == Model::n_dof_q);
+                List<List<scalar>> profStar;
+                if (useQStar)
+                {
+                    List<scalar> zList(nf);
+                    forAll(col.faces, j) zList[j] = I.sigmaF[col.faces[j]];
+                    profStar = Model::interpolate_to_3d(col.winQStar, qaux, param, zList);
+                }
+                List<scalar> zP(nf), uP(nf), vP(nf), wP(nf);
+                forAll(col.faces, j)
+                {
+                    const List<scalar>& pf = useQStar ? profStar[j] : I.peerF[col.faces[j]];
+                    const vector ug = pf[2]*I.eH1 + pf[3]*I.eH2 + pf[4]*I.gUp;
+                    zP[j] = I.sigmaF[col.faces[j]];
+                    uP[j] = ug & I.nStream;
+                    vP[j] = ug & I.tHat;
+                    wP[j] = ug & I.gUp;
+                }
+                sortProfile(zP, uP, vP, wP);
+
+                // The cell-wise rule applies to WETTED faces only.  Dry (air)
+                // faces above the waterline get the bounded bulk velocity
+                // q*/hVof (the old anchored recipe): a copy-interior Dirichlet
+                // on the air phase is a positive feedback loop — nothing
+                // anchors the inlet air column and it accelerates without
+                // bound (seen: -0.08 -> -90 m/s within 0.1 s at the L2
+                // reflected-bore re-entry, shredding the water column).
+                // wetted faces carry the FULL velocity vector: outflow = the
+                // interior vector (zero-gradient behaviour in all components),
+                // inflow = the peer's (u,v,w) profile.  Only the streamwise
+                // component enters the mass constraint; transverse/vertical
+                // ride along so the impose is genuinely full-field (a
+                // streamwise-only impose zeroes transverse shear at the inlet).
+                List<scalar> uMix(nf, scalar(0)), vMix(nf, scalar(0)),
+                             wMix(nf, scalar(0));
+                boolList wet(nf, false);
+                scalar qMix = 0.0, wWet = 0.0;
+                forAll(col.faces, j)
+                {
+                    const label f = col.faces[j];
+                    const scalar sInt = uPif[f] & I.nStream;
+                    const bool out = (sInt < 0);
+                    const scalar zAbs = col.floorY + I.sigmaF[f]*col.height;
+                    const scalar yLo  = zAbs - 0.5*dz;
+                    const scalar aFill = out
+                        ? aPif[f]
+                        : Foam::max(0.0, Foam::min(1.0, (col.floorY + hFill - yLo)/dz));
+                    alphaIn[f] = aFill;
+                    wet[j] = (aFill > 1e-3);
+                    if (!wet[j]) continue;
+                    const scalar zw =
+                        (hFill > SMALL) ? I.sigmaF[f]*col.height/hFill : 0.0;
+                    const scalar zc = Foam::min(zw, scalar(1));
+                    uMix[j] = out ? sInt : interpProfile(zP, uP, zc);
+                    vMix[j] = out ? (uPif[f] & I.tHat) : interpProfile(zP, vP, zc);
+                    wMix[j] = out ? (uPif[f] & I.gUp)  : interpProfile(zP, wP, zc);
+                    qMix += uMix[j]*aFill*dz;
+                    wWet += aFill*dz;
+                }
+                // exact-mass ledger: repay the cumulative (imposed − realized)
+                // intake debt over debtRepay_ windows.  One-window (deadbeat)
+                // repayment spikes the imposed velocity at bore arrival and
+                // blows the inlet up; a horizon keeps the correction gentle while
+                // the ledger still telescopes (debt is bounded and fully repaid).
+                const scalar qEff =
+                    qStar + ((winW_ > SMALL) ? col.debt/(debtRepay_*winW_) : 0.0);
+                col.curTarget = qStar;   // ledger books against the TARGET, not
+                col.curRate = qEff;      // the repayment-boosted imposed rate —
+                                         // else the debt never decays and the
+                                         // boost pumps spurious mass forever.
+                // qstar: NO additive rescale — the Q* profile already carries
+                // q0* over the h* column (u=q0*/h* consistent).  statebc: shift to
+                // hit qEff over the wetted column.
+                const scalar dU = useQStar ? 0.0
+                                : ((wWet > SMALL) ? (qEff - qMix)/wWet : 0.0);
+                if (ledgerLog_.valid())
+                {
+                    // correction-shift log: one row per imposeInflow call
+                    // (t, q* target, qEff incl. ledger repay, raw-profile qMix,
+                    //  wetted measure, the applied shift dU, ledger debt)
+                    static Foam::OFstream dulog(
+                        mesh_.time().globalPath()/"du_dbg.csv");
+                    static bool hdr = false;
+                    if (!hdr) { dulog << "t,qStar,qEff,qMix,wWet,dU,debt" << Foam::nl;
+                                dulog.precision(12); hdr = true; }
+                    dulog << mesh_.time().value() << "," << qStar << "," << qEff
+                          << "," << qMix << "," << wWet << "," << dU << ","
+                          << col.debt << Foam::nl;
+                }
+                const scalar uAir = (hFill > SMALL) ? qEff/hFill : 0.0;
+                forAll(col.faces, j)
+                {
+                    Uin[col.faces[j]] = wet[j]
+                        ? (uMix[j] + dU)*I.nStream + vMix[j]*I.tHat
+                                                   + wMix[j]*I.gUp
+                        : uAir*I.nStream;
+                }
             }
-            const scalar uAir = (hFill > SMALL) ? qEff/hFill : 0.0;
-            forAll(col.faces, j)
+            // ── THE SEAM'S ROWS, read off the WRITTEN boundary fields ───────
+            // Same code on every imposition path, so the paths are comparable
+            // in one file.  q_imp is what the inlet will actually take in
+            // (Σ α_j u_j Δz over ALL faces, the sub-threshold ones included),
+            // mass_resid = q_imp - imposed rate is the exactness of the
+            // imposition, and dM = F_q0 - M_imp is the momentum row of the
+            // interface Riemann problem against the momentum the inlet
+            // carries — the number nobody has measured, because nothing on
+            // either side imposes it.
+            if (starLog_.valid())
             {
-                Uin[col.faces[j]] = wet[j]
-                    ? (uMix[j] + dU)*I.nStream + vMix[j]*I.tHat
-                                               + wMix[j]*I.gUp
-                    : uAir*I.nStream;
+                const scalar dzC = col.height/Foam::max(1, col.faces.size());
+                scalar qImp = 0.0, mAdv = 0.0;
+                forAll(col.faces, j)
+                {
+                    const label f = col.faces[j];
+                    const scalar un = Uin[f] & I.nStream;
+                    qImp += alphaIn[f]*un*dzC;
+                    mAdv += alphaIn[f]*un*un*dzC;
+                }
+                const scalar mPrs = 0.5*param[0]*hFill*hFill;
+                starLog_() << winIdx_ << "," << mesh_.time().value() << ","
+                    << c << "," << imposeMode_ << "," << col.curTarget << ","
+                    << qImp << "," << (qImp - col.curRate) << ","
+                    << col.winScale << "," << col.winFq0 << "," << mAdv << ","
+                    << mPrs << "," << (mAdv + mPrs) << ","
+                    << (col.winFq0 - mAdv - mPrs) << nl;
             }
         }
         // implicit under-relaxation of the imposed velocity (standard FSI
