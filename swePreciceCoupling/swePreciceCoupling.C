@@ -1676,6 +1676,16 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 // no dissipation, so numerical_flux(Q,Q) IS F(Q).
                 List<List<scalar>> impProf
                     (col.faces.size(), List<scalar>(NF, scalar(0)));
+                // h is a COLUMN depth -- one number for the whole column, the
+                // integral of the fill -- not a per-face alpha*height.  Getting
+                // that wrong inflates every moment row at once.
+                scalar hAct = hFill;
+                if (!writeState_)
+                {
+                    hAct = 0.0;
+                    forAll(col.faces, j)
+                        hAct += alpha.boundaryField()[I.patchID][col.faces[j]]*dz;
+                }
                 forAll(col.faces, j)
                 {
                     const label f = col.faces[j];
@@ -1692,7 +1702,7 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                         ? alphaIn[f]
                         : alpha.boundaryField()[I.patchID][f];
                     impProf[j][0] = col.floorY;
-                    impProf[j][1] = writeState_ ? hFill : (aAct*col.height);
+                    impProf[j][1] = hAct;
                     impProf[j][2] = uAct & I.eH1;
                     impProf[j][3] = uAct & I.eH2;
                     impProf[j][4] = uAct & I.gUp;
