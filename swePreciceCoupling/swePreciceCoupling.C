@@ -1683,8 +1683,11 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 if (!writeState_)
                 {
                     hAct = 0.0;
+                    const scalar dzA =
+                        col.height/Foam::max(1, col.faces.size());
                     forAll(col.faces, j)
-                        hAct += alpha.boundaryField()[I.patchID][col.faces[j]]*dz;
+                        hAct +=
+                            alpha.boundaryField()[I.patchID][col.faces[j]]*dzA;
                 }
                 forAll(col.faces, j)
                 {
