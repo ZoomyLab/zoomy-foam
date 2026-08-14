@@ -873,10 +873,18 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 }
                 else
                 {
+                    // imposeMode rawflux: the RAW exchanged peer state, no
+                    // characteristic ghost.  A flux-coupled seam charges
+                    // RP(Q_local, Q_peer) exactly as the SME|SME pair does;
+                    // filtering the peer through charGhostLocal first makes the
+                    // charged flux depend on a boundary-condition construction,
+                    // which is the thing a flux coupling is supposed to replace.
                     const List<scalar> qR =
-                        (qstarMode_ == "characteristic")
-                            ? charGhostLocal(qSwe, qauxRP, qVof, nHat, param)
-                            : qVof;
+                        (imposeMode_ == "rawflux")
+                            ? qVof
+                            : ((qstarMode_ == "characteristic")
+                                ? charGhostLocal(qSwe, qauxRP, qVof, nHat, param)
+                                : qVof);
                     const auto Fc = Numerics::numerical_flux       (qSwe, qR, qaux, qaux, param, nHat);
                     const auto Fl = Numerics::numerical_fluctuations(qSwe, qR, qaux, qaux, param, nHat);
                     // Fc is List<List<scalar>> under the v6 (n_state, 1) flux
@@ -1119,7 +1127,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
             }
             else if (imposeMode_ == "starstate" || imposeMode_ == "charswitch"
                   || imposeMode_ == "momentum"
-                  || imposeMode_ == "fluxonly")
+                  || imposeMode_ == "fluxonly"
+                  || imposeMode_ == "rawflux")
             {
                 // ══ STAR-STATE IMPOSITION ═══════════════════════════════════
                 // ONE independent quantity per face: the face flux phi_f.  U_f
@@ -1165,7 +1174,22 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 }
                 List<scalar> uS(nf, scalar(0)), vS(nf, scalar(0)),
                              wS(nf, scalar(0));
-                if (hFill > SMALL && col.winQStar.size() == Model::n_dof_q)
+                if (imposeMode_ == "rawflux")
+                {
+                    // NO STAR STATE.  The Riemann problem sets the MAGNITUDE of
+                    // the seam flux; the interior sets its SHAPE.  Lifting the
+                    // star state here is what put a curved profile on a seam
+                    // whose exact profile is flat -- bit-identical at nu = 0,
+                    // so it was manufactured by the lift and not by physics.
+                    forAll(col.faces, j)
+                    {
+                        const label f = col.faces[j];
+                        uS[j] = uPif[f] & I.nStream;
+                        vS[j] = uPif[f] & I.tHat;
+                        wS[j] = uPif[f] & I.gUp;
+                    }
+                }
+                else if (hFill > SMALL && col.winQStar.size() == Model::n_dof_q)
                 {
                     const List<List<scalar>> prof = Model::interpolate_to_3d
                         (col.winQStar, qaux, param, zW);
@@ -1202,7 +1226,7 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     // flux imposed together, the mixture Godlewski-Raviart
                     // warn about.  Here alpha is taken FROM the interior
                     // (zero-gradient) and only the flux is imposed.
-                    aCol[j] = (imposeMode_ == "fluxonly")
+                    aCol[j] = (imposeMode_ == "fluxonly" || imposeMode_ == "rawflux")
                         ? aPif[f]
                         : Foam::max(scalar(0), Foam::min(scalar(1),
                             (col.floorY + hFill - yLo)/dz));
