@@ -144,6 +144,9 @@ class swePreciceCoupling
     //  not write phi, holds a uniform state to four decimals where this seam
     //  drifts.  The switch is how that trade gets measured.
     bool writePhi_ = true;
+    //- write U and alpha as patch VALUES (default), or impose only the flux
+    //  and let flux-derived patch types recompute them.  See the write site.
+    bool writeState_ = true;
     scalar Mprev_ = -GREAT;   // previous-step VOF water mass (per width)
     autoPtr<OFstream> ledgerLog_;   // optional per-step ledger diagnostics
     //- seam-row audit: the interface RP's mass AND momentum rows against what

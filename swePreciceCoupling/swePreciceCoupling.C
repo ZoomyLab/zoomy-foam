@@ -62,6 +62,7 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("debtRepayWindows", debtRepay_);
     dict.readIfPresent("writeColumns", writeColumns_);
     dict.readIfPresent("writePhi", writePhi_);
+    dict.readIfPresent("writeState", writeState_);
     if (dict.lookupOrDefault<Switch>("ledgerLog", false))
     {
         ledgerLog_.reset(new OFstream(
@@ -1518,8 +1519,19 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
             const vectorField Uprev(U.boundaryField()[I.patchID]);
             Uin = relax_*Uin + (1.0 - relax_)*Uprev;
         }
-        U.boundaryFieldRef()[I.patchID] == Uin;
-        alpha.boundaryFieldRef()[I.patchID] == alphaIn;
+        // writeState no: impose ONLY the flux, and let the patch types derive
+        // the values from it -- U as `fluxCorrectedVelocity`
+        //     U_p = U_c - n(n.U_c) + n phi_p/|Sf|
+        // (tangential from the interior, normal FROM THE FLUX) and alpha as
+        // `inletOutlet` (zero gradient out, inlet value in).  Writing U and
+        // alpha as fixedValue instead imposes 40 numbers per column where a
+        // subcritical face admits ONE, and the values come from lifting the
+        // star state -- which is what puts a curved profile on a flat flow.
+        if (writeState_)
+        {
+            U.boundaryFieldRef()[I.patchID] == Uin;
+            alpha.boundaryFieldRef()[I.patchID] == alphaIn;
+        }
         // impose the FACE FLUX too: the segregated VoF advects alpha with
         // the PREVIOUS step's phi, so without this the imposed velocity
         // moves water one window late (measured: realized[n] = <alpha[n],
