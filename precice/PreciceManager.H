@@ -529,7 +529,54 @@ public:
                         // high.  This is the textbook HLL degeneracy:
                         // s_L >= 0 -> F(Q_L), s_R <= 0 -> F(Q_R).
                         bool superDone = false;
-                        if (massRow_ == "hlle")
+                        if (massRow_ == "fwave")
+                        {
+                            // ── f-WAVE, MIRRORING swePreciceCoupling::fwaveFlux
+                            // BIT FOR BIT.  Decompose the FLUX DIFFERENCE:
+                            //   beta = R^{-1}(F_R - F_L),
+                            //   F* = F_L + sum_{lam n < 0} beta_p r_p
+                            // Conservative by construction, no Roe condition,
+                            // and the upwind flux falls out when every lam
+                            // shares a sign -- no regime switch.
+                            constexpr int nq = Model::n_dof_q;
+                            const auto FLm = Numerics::numerical_flux
+                                (rt, rt, interiorAux, interiorAux, p_, nUnit);
+                            const auto FRm = Numerics::numerical_flux
+                                (ghost, ghost, interiorAux, interiorAux, p_, nUnit);
+                            Foam::List<Foam::scalar> qAvg(nq);
+                            for (int i = 0; i < nq; ++i)
+                                qAvg[i] = 0.5*(rt[i] + ghost[i]);
+                            const auto Am =
+                                Model::quasilinear_matrix_x(qAvg, interiorAux, p_);
+                            Eigen::Matrix<double, nq, nq> Aq;
+                            for (int i = 0; i < nq; ++i)
+                                for (int j = 0; j < nq; ++j) Aq(i, j) = Am[i][j];
+                            Eigen::EigenSolver<Eigen::Matrix<double, nq, nq>> es(Aq);
+                            const Eigen::Matrix<double, nq, nq> Rr =
+                                es.eigenvectors().real();
+                            const Eigen::Matrix<double, nq, 1> lm =
+                                es.eigenvalues().real();
+                            Eigen::Matrix<double, nq, 1> dFq;
+                            for (int i = 0; i < nq; ++i)
+                                dFq(i) = FRm[i][0] - FLm[i][0];
+                            Eigen::FullPivLU<Eigen::Matrix<double, nq, nq>> luq(Rr);
+                            if (!luq.isInvertible())
+                            {
+                                Fstar = 0.5*(FLm[1][0] + FRm[1][0]);
+                            }
+                            else
+                            {
+                                const Eigen::Matrix<double, nq, 1> bq =
+                                    luq.solve(dFq);
+                                double acc = FLm[1][0];
+                                for (int pw = 0; pw < nq; ++pw)
+                                    if (lm(pw)*nUnit.x() < 0)
+                                        acc += bq(pw)*Rr(1, pw);
+                                Fstar = acc;
+                            }
+                            superDone = true;
+                        }
+                        else if (massRow_ == "hlle")
                         {
                             // ── HLLE on the mass row ────────────────────────
                             // Einfeldt speeds, so the supercritical degeneracy

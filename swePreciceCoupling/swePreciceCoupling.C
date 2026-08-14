@@ -645,6 +645,77 @@ Foam::List<Foam::scalar> charGhostLocalX(
 //  so ONE rotation per pair covers the whole hierarchy.  x-normal faces take
 //  the legacy path unchanged (bit-compatible with every validated 1-D
 //  coupling case).
+// ── f-WAVE INTERFACE FLUX ───────────────────────────────────────────────────
+// Bale, LeVeque, Mitran & Rossmanith.  Decompose the FLUX DIFFERENCE, not the
+// state jump:
+//
+//   F(Q_R) - F(Q_L) = sum_p Z^p,  Z^p = beta_p r_p,  beta = R^{-1}(F_R - F_L)
+//   F* = F_L + sum_{lam_p n < 0} Z^p  ==  F_R - sum_{lam_p n >= 0} Z^p
+//
+// Three properties this seam needs, and which no construction tried here has
+// had all of at once:
+//   * CONSERVATIVE BY CONSTRUCTION -- the two forms of F* agree identically, so
+//     both sides charge the same number with no renormalisation to fake it.
+//   * NO ROE CONDITION.  A true Roe matrix for a non-conservative moment system
+//     needs the path-conservative (DLM) generalisation, and this codebase's
+//     eigenbasis can be defective -- the eigensystem leaf silently falls back
+//     to a pseudo-inverse.  f-waves never require A(Q_R-Q_L) = F_R-F_L.
+//   * REGIME-AGNOSTIC.  If every lam shares a sign the corresponding sum is
+//     empty and F* IS the upwind flux: no Froude switch, no counting how many
+//     conditions the face admits.
+//
+// The eigenbasis is taken at the arithmetic mean; f-waves do not depend on that
+// choice for conservation, only for accuracy.
+Foam::List<Foam::scalar> fwaveFlux(
+    const Foam::List<Foam::scalar>& qL,
+    const Foam::List<Foam::scalar>& qR,
+    const Foam::List<Foam::scalar>& qaux,
+    const Foam::List<Foam::scalar>& p,
+    const Foam::vector& nHat)
+{
+    constexpr int n = Model::n_dof_q;
+    Foam::List<Foam::scalar> Fs(n, Foam::scalar(0));
+
+    // physical flux: Rusanov with both states equal carries no dissipation
+    const auto FLm = Numerics::numerical_flux(qL, qL, qaux, qaux, p, nHat);
+    const auto FRm = Numerics::numerical_flux(qR, qR, qaux, qaux, p, nHat);
+
+    Foam::List<Foam::scalar> qAvg(n);
+    for (int i = 0; i < n; ++i) qAvg[i] = 0.5*(qL[i] + qR[i]);
+
+    const auto Am = Model::quasilinear_matrix_x(qAvg, qaux, p);
+    Eigen::Matrix<double, n, n> A;
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j) A(i, j) = Am[i][j];
+    Eigen::EigenSolver<Eigen::Matrix<double, n, n>> es(A);
+    const Eigen::Matrix<double, n, n> R = es.eigenvectors().real();
+    const Eigen::Matrix<double, n, 1> lam = es.eigenvalues().real();
+
+    Eigen::Matrix<double, n, 1> dF;
+    for (int i = 0; i < n; ++i) dF(i) = FRm[i][0] - FLm[i][0];
+
+    Eigen::FullPivLU<Eigen::Matrix<double, n, n>> lu(R);
+    if (!lu.isInvertible())
+    {
+        // Defective eigenbasis: take the central flux rather than silently
+        // pseudo-inverting, which would put a wrong decomposition on the seam.
+        for (int i = 0; i < n; ++i) Fs[i] = 0.5*(FLm[i][0] + FRm[i][0]);
+        return Fs;
+    }
+    const Eigen::Matrix<double, n, 1> beta = lu.solve(dF);
+
+    const double nx = nHat.x();
+    for (int i = 0; i < n; ++i)
+    {
+        double acc = FLm[i][0];
+        for (int pw = 0; pw < n; ++pw)
+            if (lam(pw)*nx < 0) acc += beta(pw)*R(i, pw);
+        Fs[i] = acc;
+    }
+    return Fs;
+}
+
+
 Foam::List<Foam::scalar> charGhostLocal(
     const Foam::List<Foam::scalar>& q,
     const Foam::List<Foam::scalar>& qaux,
@@ -896,6 +967,20 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     // adopted, because swePreciceCoupling is not built by the
                     // default wmake and nothing exercised it.
                     qStar = Fc[1][0] + Fl[1][1];
+                    // ── f-WAVE SEAM ─────────────────────────────────────────
+                    // Charge the f-wave flux on EVERY row.  Unlike the star
+                    // state this needs no ghost, no renormalisation and no
+                    // regime switch: conservation is structural because both
+                    // sides evaluate the same decomposition of F_R - F_L.
+                    if (qstarMode_ == "fwave")
+                    {
+                        const List<scalar> Fw =
+                            fwaveFlux(qSwe, qVof, qaux, param, nHat);
+                        qStar = Fw[1];
+                        col.winFq.setSize(Fw.size(), scalar(0));
+                        forAll(col.winFq, k) col.winFq[k] = Fw[k];
+                        col.winFq0 = Fw[2];
+                    }
                     // ── supercritical degeneracy ────────────────────────────
                     // MUST MIRROR PreciceManager.H massRow `rpsuper` exactly:
                     // if the two sides charge different fluxes at the same
