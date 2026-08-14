@@ -120,6 +120,10 @@ public:
         massRow_ =
             mesh.time().controlDict().lookupOrDefault<Foam::word>(
                 "preciceMassRow", "shared");
+        // which fluctuation row this participant takes (see the use site)
+        fluctSide_ =
+            mesh.time().controlDict().lookupOrDefault<Foam::label>(
+                "preciceFluctSide", 1);
         // DESIGNATED HIGH-FIDELITY INTERFACE (controlDict `preciceCoupleHiFi`;
         // Dahm-Giesselmann-Helzel 2024 §4.3.1).  BOTH participants must set
         // it.  When on, the coupled face's ENTIRE assembled contribution — not
@@ -694,7 +698,17 @@ public:
                                 (rt, ghost, interiorAux, interiorAux, p_, nUnit);
                             // Ff is (n_state, 1): row = equation, single column.
                             // Row 1 is the mass equation; [0] takes its scalar.
-                            Fstar = Ff[1][0] + FLf[1][1];
+                            // PATH-CONSERVATIVE SIDE.  Q_i = Q_i - dt/dx
+                            // [ D+_{i-1/2} + D-_{i+1/2} ], so a cell takes D-
+                            // from its RIGHT face and D+ from its LEFT face.
+                            // The SME is the LEFT cell here, so the interface
+                            // is its RIGHT face and the correct row is D- (0);
+                            // the VOF FO, being the right cell, takes D+ (1).
+                            // Both sides taking row 1 makes them AGREE on the
+                            // wrong number -- mass telescopes to 1e-16 while
+                            // the charged flux is systematically short, which
+                            // is the measured 2-6 % discharge throttle.
+                            Fstar = Ff[1][0] + FLf[fluctSide_][1];
                         }
                         else if (massRow_ == "central")
                         {
@@ -1106,6 +1120,7 @@ private:
     bool frozenMass_ = false;
     //- frozen-mass-row pricing: shared | central | rp
     Foam::word massRow_ = "shared";
+    Foam::label fluctSide_ = 1;   // 0 = D- (left cell), 1 = D+ (right cell)
     //- designated high-fidelity interface (DGH 2024 §4.3.1): freeze the FULL
     //  face term of the shared Riemann problem for every shared row.
     bool coupleHiFi_ = false;
