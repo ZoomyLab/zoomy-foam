@@ -8,6 +8,10 @@
 #include "fvcSurfaceIntegrate.H"
 #include "OSspecific.H"   // Foam::mkDir
 
+// f-wave entropy width as a fraction of lam_max; read from the FO dict.
+// File scope so both read() and fwaveFlux see it, and declared BEFORE read().
+static Foam::scalar gFwaveDelta = 0.2;
+
 namespace Foam
 {
 namespace functionObjects
@@ -668,8 +672,6 @@ Foam::List<Foam::scalar> charGhostLocalX(
 //
 // The eigenbasis is taken at the arithmetic mean; f-waves do not depend on that
 // choice for conservation, only for accuracy.
-Foam::scalar gFwaveDelta = 0.2;   // entropy width, fraction of lam_max
-
 Foam::List<Foam::scalar> fwaveFlux(
     const Foam::List<Foam::scalar>& qL,
     const Foam::List<Foam::scalar>& qR,
