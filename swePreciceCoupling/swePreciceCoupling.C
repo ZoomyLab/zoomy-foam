@@ -692,8 +692,25 @@ Foam::List<Foam::scalar> fwaveFlux(
     const Eigen::Matrix<double, n, n> R = es.eigenvectors().real();
     const Eigen::Matrix<double, n, 1> lam = es.eigenvalues().real();
 
+    // PATH-CONSERVATIVE JUMP (Dal Maso-LeFloch-Murat).  The SME carries a
+    // non-conservative product B(Q) dQ/dx, so the quantity that must be
+    // decomposed into waves is NOT F_R - F_L alone but
+    //     Delta = (F_R - F_L) + integral_0^1 B(psi(s)) psi'(s) ds
+    // and along a straight path psi(s) = Q_L + s (Q_R - Q_L) that integral is
+    // B(Qbar) (Q_R - Q_L) to second order.  Decomposing only F_R - F_L drops
+    // the B contribution entirely, which is why the plain f-wave charged the
+    // same number on both sides and gained nothing from the fluctuation-row
+    // correction: it never used the fluctuation rows at all.
     Eigen::Matrix<double, n, 1> dF;
-    for (int i = 0; i < n; ++i) dF(i) = FRm[i][0] - FLm[i][0];
+    {
+        const auto Bm = Model::nonconservative_matrix_x(qAvg, qaux, p);
+        for (int i = 0; i < n; ++i)
+        {
+            double bdq = 0.0;
+            for (int j = 0; j < n; ++j) bdq += Bm[i][j]*(qR[j] - qL[j]);
+            dF(i) = (FRm[i][0] - FLm[i][0]) + bdq;
+        }
+    }
 
     Eigen::FullPivLU<Eigen::Matrix<double, n, n>> lu(R);
     if (!lu.isInvertible())
