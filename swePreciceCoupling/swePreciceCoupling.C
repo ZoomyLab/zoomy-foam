@@ -686,8 +686,32 @@ Foam::List<Foam::scalar> fwaveFlux(
     const auto FLm = Numerics::numerical_flux(qL, qL, qaux, qaux, p, nHat);
     const auto FRm = Numerics::numerical_flux(qR, qR, qaux, qaux, p, nHat);
 
+    // EIGENBASIS STATE.  The arithmetic mean is the cheap choice and f-waves do
+    // not need more for CONSERVATION, but the wave SPEEDS it produces are wrong
+    // when the depths differ, and wrong speeds put waves on the wrong side of
+    // the split.  The shallow-water Roe average weights velocity by sqrt(h),
+    // and the moment generalisation applies the same weight to every u_k =
+    // q_k/h.  Measured motivation: the f-wave seam runs consistently more
+    // subcritical than the driving (0.80 against a target 1.10), i.e. it
+    // decelerates more than Rusanov does.
     Foam::List<Foam::scalar> qAvg(n);
-    for (int i = 0; i < n; ++i) qAvg[i] = 0.5*(qL[i] + qR[i]);
+    {
+        const double hL = qL[1], hR = qR[1];
+        const double rL = std::sqrt(std::max(0.0, hL));
+        const double rR = std::sqrt(std::max(0.0, hR));
+        const double rs = rL + rR;
+        qAvg[0] = 0.5*(qL[0] + qR[0]);          // bed
+        qAvg[1] = 0.5*(hL + hR);                // depth
+        for (int k = 2; k < n; ++k)
+        {
+            if (rs > 1e-10 && hL > 1e-10 && hR > 1e-10)
+            {
+                const double ukL = qL[k]/hL, ukR = qR[k]/hR;
+                qAvg[k] = qAvg[1]*(rL*ukL + rR*ukR)/rs;
+            }
+            else qAvg[k] = 0.5*(qL[k] + qR[k]);
+        }
+    }
 
     const auto Am = Model::quasilinear_matrix_x(qAvg, qaux, p);
     Eigen::Matrix<double, n, n> A;
