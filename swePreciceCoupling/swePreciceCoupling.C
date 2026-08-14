@@ -1118,7 +1118,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 col.curRate = qStar;
             }
             else if (imposeMode_ == "starstate" || imposeMode_ == "charswitch"
-                  || imposeMode_ == "momentum")
+                  || imposeMode_ == "momentum"
+                  || imposeMode_ == "fluxonly")
             {
                 // ══ STAR-STATE IMPOSITION ═══════════════════════════════════
                 // ONE independent quantity per face: the face flux phi_f.  U_f
@@ -1191,8 +1192,20 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     const label f = col.faces[j];
                     const scalar yLo =
                         col.floorY + I.sigmaF[f]*col.height - 0.5*dz;
-                    aCol[j] = Foam::max(scalar(0), Foam::min(scalar(1),
-                        (col.floorY + hFill - yLo)/dz));
+                    // imposeMode fluxonly: DO NOT set where the free surface
+                    // sits.  Per face we otherwise specify two numbers -- alpha
+                    // (the surface position) and phi (the volumetric flux) --
+                    // while the physically meaningful quantity is the WATER
+                    // flux alpha*phi, which is one.  The renormalisation forces
+                    // only their SUM to F_h, so the distribution is
+                    // over-determined and fights the interior: a state and a
+                    // flux imposed together, the mixture Godlewski-Raviart
+                    // warn about.  Here alpha is taken FROM the interior
+                    // (zero-gradient) and only the flux is imposed.
+                    aCol[j] = (imposeMode_ == "fluxonly")
+                        ? aPif[f]
+                        : Foam::max(scalar(0), Foam::min(scalar(1),
+                            (col.floorY + hFill - yLo)/dz));
                     alphaIn[f] = aCol[j];
                     intake0 += uS[j]*aCol[j]*dz;
                     wetMeas += aCol[j]*dz;
