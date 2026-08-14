@@ -1679,11 +1679,23 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 forAll(col.faces, j)
                 {
                     const label f = col.faces[j];
+                    // Read the field the run ACTUALLY used.  Uin is what we
+                    // computed; under writeState=no it is never imposed, and
+                    // the patch carries a zeroGradient value instead.
+                    // Measuring Uin there reports a field the run never saw --
+                    // which is the shape of the ~55 % that all three moment
+                    // rows showed at once.
+                    const vector uAct = writeState_
+                        ? Uin[f]
+                        : U.boundaryField()[I.patchID][f];
+                    const scalar aAct = writeState_
+                        ? alphaIn[f]
+                        : alpha.boundaryField()[I.patchID][f];
                     impProf[j][0] = col.floorY;
-                    impProf[j][1] = hFill;
-                    impProf[j][2] = Uin[f] & I.eH1;
-                    impProf[j][3] = Uin[f] & I.eH2;
-                    impProf[j][4] = Uin[f] & I.gUp;
+                    impProf[j][1] = writeState_ ? hFill : (aAct*col.height);
+                    impProf[j][2] = uAct & I.eH1;
+                    impProf[j][3] = uAct & I.eH2;
+                    impProf[j][4] = uAct & I.gUp;
                 }
                 List<scalar> carried;
                 if (hFill > SMALL)
