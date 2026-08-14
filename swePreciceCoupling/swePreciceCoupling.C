@@ -64,6 +64,7 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("writeColumns", writeColumns_);
     dict.readIfPresent("writePhi", writePhi_);
     dict.readIfPresent("writeState", writeState_);
+    dict.readIfPresent("fwaveDelta", gFwaveDelta);
     if (dict.lookupOrDefault<Switch>("ledgerLog", false))
     {
         ledgerLog_.reset(new OFstream(
@@ -667,6 +668,8 @@ Foam::List<Foam::scalar> charGhostLocalX(
 //
 // The eigenbasis is taken at the arithmetic mean; f-waves do not depend on that
 // choice for conservation, only for accuracy.
+Foam::scalar gFwaveDelta = 0.2;   // entropy width, fraction of lam_max
+
 Foam::List<Foam::scalar> fwaveFlux(
     const Foam::List<Foam::scalar>& qL,
     const Foam::List<Foam::scalar>& qR,
@@ -733,7 +736,7 @@ Foam::List<Foam::scalar> fwaveFlux(
     const double nx = nHat.x();
     double lmax = 0.0;
     for (int pw = 0; pw < n; ++pw) lmax = std::max(lmax, std::abs(lam(pw)));
-    const double delta = std::max(1e-12, 0.2*lmax);
+    const double delta = std::max(1e-12, gFwaveDelta*lmax);
     for (int i = 0; i < n; ++i)
     {
         double acc = FLm[i][0];
