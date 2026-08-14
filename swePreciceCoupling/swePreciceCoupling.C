@@ -573,6 +573,38 @@ void Foam::functionObjects::swePreciceCoupling::writeBack()
             // colProf is sampled on the interface cell centres, which now == the
             // model's baked projection grid, so project_from_3d is exact here.
             col.qFrozen = Model::project_from_3d(colProf, param);
+
+            // DIAGNOSTIC ONLY -- changes nothing.  The peer charges a flux
+            // reconstructed from this written column; the patch meanwhile
+            // passed whatever its own boundary fields say.  If those two
+            // disagree, mass cannot close to machine precision no matter what
+            // the peer does with the column.  Log both before attempting any
+            // correction, so the SIGN convention is established by measurement
+            // rather than assumed.
+            if (starLog_.valid())
+            {
+                const volScalarField& alphaW =
+                    mesh_.lookupObject<volScalarField>("alpha.water");
+                const scalarField& aB = alphaW.boundaryField()[I.patchID];
+                const vectorField& uB = U.boundaryField()[I.patchID];
+                const scalar dzc =
+                    col.height/Foam::max(1, col.faces.size());
+                scalar qReal = 0.0;
+                forAll(col.faces, j)
+                {
+                    const label f = col.faces[j];
+                    qReal += aB[f]*(uB[f] & I.nStream)*dzc;
+                }
+                static Foam::OFstream wl(
+                    mesh_.time().globalPath()/"write_consistency.csv");
+                static bool wh = false;
+                if (!wh) { wl << "t,col,q_real,q_written,ratio" << nl;
+                           wl.precision(17); wh = true; }
+                const scalar qw = col.qFrozen[2];
+                wl << mesh_.time().value() << "," << c << "," << qReal << ","
+                   << qw << "," << (Foam::mag(qw) > SMALL ? qReal/qw : 0.0)
+                   << nl;
+            }
         }
         if (writeColumns_) I.lastOut = out;   // keep for writeColumnsFile()
         for (int d=0; d<NF; ++d)
