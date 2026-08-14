@@ -32,8 +32,7 @@ Foam::functionObjects::swePreciceCoupling::swePreciceCoupling
     fixedDt_ = mesh_.time().deltaTValue();
     setupPrecice();
     Info<< "[swePreciceCoupling] FULL-FACE two-way over " << interfaces_.size()
-        << " interface(s), preciceSchedule "
-        << (legacySchedule_ ? "legacy (DEPRECATED)" : "aligned") << "." << endl;
+        << " interface(s)." << endl;
 }
 
 Foam::functionObjects::swePreciceCoupling::~swePreciceCoupling()
@@ -49,57 +48,6 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("relax", relax_);
     dict.readIfPresent("imposeMode", imposeMode_);
     dict.readIfPresent("qstarMode", qstarMode_);
-    // ── coupling schedule ───────────────────────────────────────────────────
-    // Named and explicit, NOT the generic `executeAtStart`: the schedule
-    // decides whether the case's numbers carry a one-window seam offset, so
-    // every controlDict must state on its face which one produced them.
-    if (dict.found("executeAtStart"))
-    {
-        FatalIOErrorInFunction(dict)
-            << "swePreciceCoupling owns its coupling schedule; the generic "
-               "'executeAtStart' entry is not honoured here.  Write one of\n"
-            << "    preciceSchedule aligned;   // default, correct\n"
-            << "    preciceSchedule legacy;    // pre-fix, reproduction only\n"
-            << "so that the case dictionary records the schedule its numbers "
-               "were produced with." << exit(FatalIOError);
-    }
-    {
-        word sched("aligned");
-        dict.readIfPresent("preciceSchedule", sched);
-        if (sched != "aligned" && sched != "legacy")
-        {
-            FatalIOErrorInFunction(dict)
-                << "unknown preciceSchedule '" << sched
-                << "'; expected 'aligned' (default) or 'legacy'."
-                << exit(FatalIOError);
-        }
-        legacySchedule_ = (sched == "legacy");
-    }
-    if (legacySchedule_)
-    {
-        WarningInFunction << nl
-            << "**** preciceSchedule legacy — DEPRECATED, KNOWN-WRONG ****" << nl
-            << "  One full coupling cycle runs at t = 0 with nothing solved, so"
-            << nl
-            << "  its advance() closes a coupling window this participant never"
-            << nl
-            << "  ran.  From then on the preCICE clock leads the physical clock"
-            << nl
-            << "  by one window: both arms price the SAME interface Riemann"
-            << nl
-            << "  problem and spend it one window apart, and the coupled system"
-            << nl
-            << "  loses exactly one window of seam flux, drift = q*(t)*W per"
-            << nl
-            << "  unit width (measured 1.363 mL vs 8.30e-03 mL with 'aligned'"
-            << nl
-            << "  on sme_vof_overshoot, a factor 164).  This schedule exists"
-            << nl
-            << "  ONLY to reproduce results published before the fix; it is not"
-            << nl
-            << "  a modelling alternative.  Use 'preciceSchedule aligned'." << nl
-            << endl;
-    }
     dict.readIfPresent("outputInterval", outInterval_);
     dict.readIfPresent("maxCo", maxCo_);
     dict.readIfPresent("maxAlphaCo", maxAlphaCo_);
@@ -154,14 +102,6 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
         add(patch, mesh, H);
     }
     return true;
-}
-
-bool Foam::functionObjects::swePreciceCoupling::executeAtStart() const
-{
-    // execute() is the whole coupling cycle and is valid only after a solver
-    // step; setupPrecice() has already done the pre-first-step work (preCICE
-    // initialize, checkpoint, peer read, inlet impose).  See legacySchedule_.
-    return legacySchedule_;
 }
 
 Foam::wordList Foam::functionObjects::swePreciceCoupling::fields() const
@@ -350,20 +290,6 @@ void Foam::functionObjects::swePreciceCoupling::setupPrecice()
     precice_->initialize();
     const_cast<Time&>(mesh_.time()).setEndTime(GREAT);
     setupCheckpointing();
-    // Seed the realised-intake reference HERE, not on the first execute():
-    // with preciceSchedule=aligned the first execute() is at t = W, so without
-    // this the step [0, W] would be booked with haveM0 == false, i.e. realised
-    // intake 0 against a nonzero target — one step of fabricated debt on any
-    // seam that already carries flux at t = 0.  legacy keeps the old capture
-    // inside execute() so that its numbers reproduce bit-for-bit.
-    if (!legacySchedule_)
-    {
-        const volScalarField& a0 =
-            mesh_.lookupObject<volScalarField>("alpha.water");
-        const scalar thick0 =
-            mesh_.bounds().max().z() - mesh_.bounds().min().z();
-        Mprev_ = gSum(a0.primitiveField()*mesh_.V())/Foam::max(thick0, SMALL);
-    }
     if (precice_->requiresWritingCheckpoint()) writeCheckpoint();
     adjustAndRead();
     Info<< "[swePreciceCoupling] preCICE init: " << total << " face-vertices." << endl;

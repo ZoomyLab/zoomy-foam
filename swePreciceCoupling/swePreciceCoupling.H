@@ -102,26 +102,6 @@ class swePreciceCoupling
     //  "riemann": full-state RP flux F(qSwe,qVof) — pair with
     //    preciceGhost=fullstate for benchmarking only.
     word qstarMode_ = "characteristic";
-    //- coupling SCHEDULE, dictionary entry `preciceSchedule`.
-    //  execute() is the WHOLE coupling cycle — book the completed step,
-    //  writeBack, precice advance, read the peer, impose the inlet for the next
-    //  step — so it is meaningful only AFTER a solver step has been taken.
-    //  "aligned" (DEFAULT, correct): the cycle starts with the first SOLVED
-    //    step.  executeAtStart() is false, and the realised-intake reference
-    //    Mprev_ is seeded in setupPrecice() instead of on the first execute().
-    //  "legacy" (A BUG, kept ONLY to reproduce results published before the
-    //    fix — NOT a modelling alternative): OpenFOAM's generic
-    //    executeAtStart defaults to true, so one full cycle runs at t = 0 with
-    //    nothing solved and its advance() CLOSES A COUPLING WINDOW THIS
-    //    PARTICIPANT NEVER RAN.  The preCICE clock then leads the physical
-    //    clock by one window for the rest of the case: both arms price the
-    //    SAME interface Riemann problem from the SAME state pair and spend it
-    //    over physical windows one apart, so the closed system is short
-    //    exactly one window of seam flux, drift = q*(t)·W per unit width.
-    //    Measured on thesis/cases/applications/sme_vof_overshoot: 1.363 mL
-    //    against 8.30e-03 mL with "aligned" (164x), lag fit tau = 1.00
-    //    windows, r = 0.9999.
-    bool legacySchedule_ = false;
     fileName configPath_;
     word participantName_;
     std::array<std::string, NF> readFields_;
@@ -173,8 +153,6 @@ public:
     virtual ~swePreciceCoupling();
 
     virtual bool read(const dictionary& dict);
-    //- false unless `preciceSchedule legacy` — see legacySchedule_.
-    virtual bool executeAtStart() const;
     virtual wordList fields() const;
     virtual bool execute();
     virtual bool write();
