@@ -80,8 +80,13 @@ Foam::functionObjects::swePreciceCoupling::~swePreciceCoupling()
         Info<< "[fluxnewton] F(q) = F* converged on " << nNewtonOk_
             << ", STALLED OFF THE MANIFOLD on " << nNewtonStall_
             << ", rejected on " << nNewtonFail_ << " column-window(s)." << nl
-            << "   mean relative distance to the nearest reachable flux: "
+            << "   relative residual on a COMMON scale (max_k |F*_k|):" << nl
+            << "      at the star state (Newton start): "
+            << ((nRelRes_ > 0) ? sumRel0_/nRelRes_ : 0.0) << nl
+            << "      where Newton stops             : "
             << ((nRelRes_ > 0) ? sumRelRes_/nRelRes_ : 0.0) << nl
+            << "   IF THESE ARE EQUAL Newton is not moving and the residual is"
+            << " not shown to be irreducible -- only unreduced." << nl
             << "   signed residual F(q)-F* per row, mean over iterates:" << nl;
         for (int k = 1; k < Model::n_dof_q && k < 8; ++k)
         {
@@ -1377,10 +1382,12 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                                 // decides that, so it is recorded.
                                 for (int k = 1; k < NQ && k < 8; ++k)
                                 {
-                                    resSum_[k] += r(k-1)
-                                        /Foam::max(Foam::mag(Ft[k]), SMALL);
-                                    resAbs_[k] += Foam::mag(r(k-1))
-                                        /Foam::max(Foam::mag(Ft[k]), SMALL);
+                                    // COMMON scale.  Dividing a near-zero
+                                    // row by itself reports 183 % and means
+                                    // nothing.
+                                    resSum_[k] += r(k-1)/Foam::max(sc, SMALL);
+                                    resAbs_[k] +=
+                                        Foam::mag(r(k-1))/Foam::max(sc, SMALL);
                                 }
                                 ++nResRow_;
                                 if (relN <= 1e-10) { ok = true; break; }
@@ -1417,7 +1424,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                                 col.winQStar = qN;
                                 hFill = qN[1];
                                 if (ok) ++nNewtonOk_; else ++nNewtonStall_;
-                                sumRelRes_ += relN; ++nRelRes_;
+                                sumRelRes_ += relN; sumRel0_ += rel0;
+                                ++nRelRes_;
                             }
                             else { ++nNewtonFail_; }
                         }
