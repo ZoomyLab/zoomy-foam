@@ -135,6 +135,8 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("fitTarget", fitTarget_);
     dict.readIfPresent("fitBound", fitBound_);
     dict.readIfPresent("fitBase", fitBase_);
+    dict.readIfPresent("extrapOrder", extrapOrder_);
+    dict.readIfPresent("extrapLimit", extrapLimit_);
     dict.readIfPresent("fitSign", fitSign_);
     dict.readIfPresent("outputInterval", outInterval_);
     dict.readIfPresent("maxCo", maxCo_);
@@ -1606,7 +1608,37 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     }
                 }
             }
-            if (winFresh2_) { col.winTarget = qStar; col.winHFill = hFill; }
+            if (winFresh2_)
+            {
+                col.winTarget = qStar;          // mass row: NEVER extrapolated
+                // ── AB2 on the DEPTH and the PROFILE ───────────────────────
+                // x* = 2 x^n - x^(n-1).  Limited: an unlimited linear
+                // extrapolation of a depth can go negative at a bore front,
+                // and a negative depth is not a slow solve, it is a different
+                // problem.  The limit is a fraction of the current depth.
+                scalar hUse = hFill;
+                if (extrapOrder_ >= 1 && col.winHasPrev && hFill > SMALL)
+                {
+                    const scalar dh = hFill - col.winHFillPrev;
+                    const scalar cap = extrapLimit_*hFill;
+                    hUse = hFill + Foam::max(-cap, Foam::min(cap, dh));
+                    if (hUse < SMALL) hUse = hFill;
+                    if (col.winQStar.size() == col.winQStarPrev.size())
+                        forAll(col.winQStar, k)
+                        {
+                            const scalar dq =
+                                col.winQStar[k] - col.winQStarPrev[k];
+                            const scalar qc = extrapLimit_
+                                *Foam::mag(col.winQStar[k]);
+                            col.winQStar[k] += Foam::max(-qc,
+                                               Foam::min(qc, dq));
+                        }
+                }
+                col.winHFillPrev = hFill;
+                col.winQStarPrev = col.winQStar;
+                col.winHasPrev = true;
+                col.winHFill = hUse;
+            }
             if (winFresh2_ && ledgerLog_.valid())
             {
                 static Foam::OFstream ilog(mesh_.time().globalPath()/"impose_dbg.csv");

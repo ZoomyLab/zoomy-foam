@@ -86,6 +86,17 @@ class swePreciceCoupling
         scalar winSrcQ = 0;
         scalar winSrcM = 0;
         scalar winWidth = 0;             // w_c = (sum magSf)/height [m]
+        //- previous window's interface state, for AB2 extrapolation.  The
+        //  window freeze is a ZEROTH-ORDER hold: exact for a steady state and
+        //  worst for a fast-changing one, which is precisely where the seam
+        //  error lives (zero for 0.20 s, then -15 % once the bore arrives).
+        //  NOTE the mass row is deliberately NOT extrapolated -- both
+        //  participants must charge the identical number or the 1e-16 ledger
+        //  breaks, and the mass row is already exact.  Only the DEPTH and the
+        //  PROFILE, which is what the measured 8-11 % shallowness is.
+        scalar winHFillPrev = 0;
+        List<scalar> winQStarPrev;
+        bool winHasPrev = false;
         //- fluxmatch: the hydrostatic part to subtract from the momentum row,
         //  built the SAME two-point way the row itself is.  The row is a flux
         //  of the PAIR (q_L,q_R); g h*^2/2 is a flux of the star state, which
@@ -157,6 +168,11 @@ class swePreciceCoupling
     //- fluxmodes base: "interior" = the VOF's own column
     //  P(u_vof), admissible by construction; "star" = the lift.
     word fitBase_ = "interior";
+    //- interface-state extrapolation order: 0 = the zeroth-order
+    //  window hold (delivered), 1 = Adams-Bashforth 2, x* = 2x^n - x^(n-1).
+    label extrapOrder_ = 0;
+    //- how far AB2 may move the depth, as a fraction of it.
+    scalar extrapLimit_ = 0.25;
     bool fitSign_ = false;
     fileName configPath_;
     word participantName_;
