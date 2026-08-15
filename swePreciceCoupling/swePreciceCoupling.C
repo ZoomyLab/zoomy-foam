@@ -1320,7 +1320,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                      || imposeMode_ == "fluxmatch"
                      || imposeMode_ == "fluxshift"
                      || imposeMode_ == "fluxnewton"
-                     || imposeMode_ == "fluxfit")
+                     || imposeMode_ == "fluxfit"
+                     || imposeMode_ == "nsfit")
                     {
                         // THE STAR STATE.  Rusanov IS HLL with s_L = -lam_max
                         // and s_R = +lam_max, so its resolved middle state is
@@ -1685,7 +1686,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                   || imposeMode_ == "fluxmatch"
                   || imposeMode_ == "fluxshift"
                   || imposeMode_ == "fluxnewton"
-                  || imposeMode_ == "fluxfit")
+                  || imposeMode_ == "fluxfit"
+                  || imposeMode_ == "nsfit")
             {
                 // ══ STAR-STATE IMPOSITION ═══════════════════════════════════
                 // ONE independent quantity per face: the face flux phi_f.  U_f
@@ -1851,7 +1853,135 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 // reported, never floored: the run falls back to the pure
                 // renormalisation and says so.
                 bool fmDone = false;
-                if (imposeMode_ == "fluxshift")
+                if (imposeMode_ == "nsfit")
+                {
+                    // ══ FIT THE NAVIER-STOKES FLUX, NOT THE MODEL FLUX ══════
+                    // D is the flux the reduced side wants the resolved side
+                    // to use.  The VOF has no mechanism that accepts a
+                    // fluctuation, so find the profile whose OWN NS flux
+                    // through the patch is closest to it.
+                    //
+                    // The distinction from every earlier attempt: the flux is
+                    // assembled from the RESOLVED face data and only then
+                    // expressed in the moment basis --
+                    //
+                    //     F_k(u) = h sum_j c_kj ( u_j^2 + p_j/rho ),
+                    //
+                    // the SAME weights c_kj the model uses to project a state,
+                    // applied to the flux integrand instead of to the state.
+                    // Projecting the state first and evaluating the reduced
+                    // flux (what fluxfit does) re-derives int u^2 dz through
+                    // the SME closure and discards whatever the profile
+                    // carries outside that basis.  Here nothing does.
+                    //
+                    // c_kj is READ OFF the generated kernel by projecting unit
+                    // profiles, so no basis is assumed here and the code stays
+                    // correct if the model changes.
+                    //
+                    // Gravity is never named: it enters through p_j on this
+                    // side and through D on the other, and cancels in the
+                    // residual.  That is what makes this well conditioned
+                    // where subtracting g h^2/2 was not -- the hydrostatic
+                    // part is 89-97 % of the row.
+                    const label nfF = col.faces.size();
+                    List<List<scalar>> Cw(Model::n_dof_q,
+                                          List<scalar>(nfF, scalar(0)));
+                    {
+                        List<List<scalar>> unit(nfF, List<scalar>(NF, scalar(0)));
+                        forAll(col.faces, j)
+                        { unit[j][0] = col.floorY; unit[j][1] = 1.0; }
+                        for (label j = 0; j < nfF; ++j)
+                        {
+                            unit[j][2] = 1.0;
+                            const List<scalar> pj =
+                                Model::project_from_3d(unit, param);
+                            for (int k = 2; k < Model::n_dof_q; ++k)
+                                Cw[k][j] = pj[k];
+                            unit[j][2] = 0.0;
+                        }
+                    }
+                    // the NS flux integrand per face, and its residual
+                    auto nsFlux = [&](const List<scalar>& uu, int k)
+                    {
+                        scalar acc = 0.0;
+                        forAll(col.faces, j)
+                        {
+                            const label f = col.faces[j];
+                            acc += Cw[k][j]*(uu[j]*uu[j]
+                                 + pPif[f]/Foam::max(rhoWater_, SMALL));
+                        }
+                        return hFill*acc;
+                    };
+                    const int NR = Model::n_dof_q - 2;
+                    List<scalar> uFit(uS);
+                    auto rnorm = [&](const List<scalar>& uu)
+                    {
+                        scalar n2 = 0.0;
+                        for (int k = 2; k < Model::n_dof_q; ++k)
+                        {
+                            const scalar t = (fitTarget_ == "fluct")
+                                ? ((k < col.winFl.size()) ? col.winFl[k] : 0.0)
+                                : ((k < col.winFq.size()) ? col.winFq[k] : 0.0);
+                            const scalar d = nsFlux(uu, k) - t;
+                            n2 += d*d;
+                        }
+                        return Foam::sqrt(n2);
+                    };
+                    const scalar r00 = rnorm(uFit);
+                    // Gauss-Newton in the SPAN OF THE MODEL BASIS: the
+                    // correction that the Lagrange conditions put there
+                    // anyway, u = u* + sum_m c_m phi_m, so NR unknowns rather
+                    // than one per face.  Steepest descent on the residual
+                    // norm with a backtracking line search -- the problem is
+                    // small and this cannot diverge.
+                    for (label it = 0; it < 30; ++it)
+                    {
+                        List<scalar> g(NR, scalar(0));
+                        const scalar rc = rnorm(uFit);
+                        for (int m = 0; m < NR; ++m)
+                        {
+                            List<scalar> up(uFit);
+                            const scalar eps = 1e-7
+                                *Foam::max(Foam::mag(uMag), scalar(1e-6));
+                            forAll(col.faces, j)
+                                up[j] += eps*Cw[m+2][j]*nfF;
+                            g[m] = (rnorm(up) - rc)/eps;
+                        }
+                        scalar gn = 0.0;
+                        for (int m = 0; m < NR; ++m) gn += g[m]*g[m];
+                        if (gn < SMALL) break;
+                        scalar step = rc/gn, best = rc; bool moved = false;
+                        for (int t = 0; t < 20; ++t)
+                        {
+                            List<scalar> ut(uFit);
+                            forAll(col.faces, j)
+                                for (int m = 0; m < NR; ++m)
+                                    ut[j] -= step*g[m]*Cw[m+2][j]*nfF;
+                            const scalar rt = rnorm(ut);
+                            if (rt < best) { uFit = ut; best = rt; moved = true; break; }
+                            step *= 0.5;
+                        }
+                        if (!moved) break;
+                    }
+                    // EXACT MASS on top, as a pure shift: it changes the mean
+                    // and not the shape, so it costs the fit the least.
+                    scalar Wm = 0.0, S1m = 0.0;
+                    forAll(col.faces, j)
+                    { const scalar w = aCol[j]*dz; Wm += w; S1m += w*uFit[j]; }
+                    if (Wm > SMALL)
+                    {
+                        const scalar B = (qEff - S1m)/Wm;
+                        forAll(col.faces, j) uFit[j] += B;
+                    }
+                    forAll(col.faces, j) uS[j] = uFit[j];
+                    sumRel0_ += r00; sumRelRes_ += rnorm(uFit); ++nRelRes_;
+                    if (rnorm(uFit) < 0.999*r00) ++nNewtonOk_;
+                    else ++nNewtonStall_;
+                    col.winScale = 1.0;
+                    fmDone = true;
+                    sFac = 1.0;
+                }
+                else if (imposeMode_ == "fluxshift")
                 {
                     // THE SHIFT, not the scale.  Subtracting g h^2/2 from the
                     // momentum row to get F_conv is catastrophic cancellation:
