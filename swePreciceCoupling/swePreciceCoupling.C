@@ -1323,6 +1323,14 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     // once here rather than re-derived per row.
                     col.winFq.setSize(Fc.size(), scalar(0));
                     forAll(col.winFq, k) col.winFq[k] = Fc[k][0] + Fl[1][k];
+                    // ...and the two halves apart.  `charged` is the
+                    // conservative flux PLUS the fluctuation while `_patch` is
+                    // the conservative flux ALONE, so the headline metric
+                    // compares two different objects unless Fl is small.
+                    col.winFc.setSize(Fc.size(), scalar(0));
+                    col.winFl.setSize(Fc.size(), scalar(0));
+                    forAll(col.winFc, k)
+                    { col.winFc[k] = Fc[k][0]; col.winFl[k] = Fl[1][k]; }
                     // the hydrostatic part OF THAT ROW, on the same pair
                     col.winPrs = 0.25*param[0]*(qSwe[1]*qSwe[1]
                                               + qVof[1]*qVof[1]);
@@ -2479,6 +2487,13 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     const scalar pq =
                         (k < carriedPatch.size()) ? carriedPatch[k] : 0.0;
                     starLog_() << "," << pq;
+                }
+                for (label k = 2; k < nR; ++k)
+                {
+                    starLog_() << ","
+                        << ((k < col.winFc.size()) ? col.winFc[k] : 0.0)
+                        << ","
+                        << ((k < col.winFl.size()) ? col.winFl[k] : 0.0);
                 }
                 starLog_() << nl;
             }
