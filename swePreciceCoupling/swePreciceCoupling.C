@@ -2,6 +2,7 @@
 #include "swePreciceCoupling.H"
 #include "addToRunTimeSelectionTable.H"
 #include "uniformDimensionedFields.H"
+#include "mixedFvPatchFields.H"
 #include "numerics.H"   // runtime numerics:: (compute_derivative) referenced by
                         // Model.H's update_aux_variables (parsed even if unused)
 #include "Numerics.H"   // generated Model:: + Numerics::
@@ -158,6 +159,7 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("imposeVertical", imposeVertical_);
     dict.readIfPresent("dryFacesInterior", dryFacesInterior_);
     dict.readIfPresent("nuEff", nuEff_);
+    dict.readIfPresent("mixedU", mixedU_);
     dict.readIfPresent("writePressure", writePressure_);
     dict.readIfPresent("rhoWater", rhoWater_);
     dict.readIfPresent("consistentWrite", consistentWrite_);
@@ -1874,6 +1876,17 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     // +7.99 %, because it re-imposes a full Dirichlet profile on
                     // exactly the boundary his scheme leaves to the pressure.
                     const bool enrich = (qEff > 0.0);
+                // record the regime for the `mixed` write: 1 where we
+                // enrich (cases a/b), 0 where the pressure owns the
+                // boundary (cases c/d).  Per FACE, because the panel is
+                // the unit of his switch and one patch carries many.
+                if (mixedU_)
+                {
+                    if (mgFrac_.size() != alphaIn.size())
+                        mgFrac_.setSize(alphaIn.size(), scalar(0));
+                    forAll(col.faces, jj)
+                        mgFrac_[col.faces[jj]] = enrich ? 1.0 : 0.0;
+                }
                     forAll(col.faces, j)
                     {
                         if (!enrich)
@@ -2902,7 +2915,42 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
         // alpha as fixedValue instead imposes 40 numbers per column where a
         // subcritical face admits ONE, and the values come from lifting the
         // star state -- which is what puts a curved profile on a flat flow.
-        if (writeState_)
+        if (imposeMode_ == "mintgen" && mixedU_)
+        {
+            // MINTGEN'S PER-PANEL SWITCH, expressed as OpenFOAM's `mixed`.
+            // His regime is decided per panel and can differ column to column
+            // on ONE patch, so Dirichlet-vs-Neumann cannot be a patch TYPE
+            // chosen at generation time.  valueFraction is exactly the missing
+            // degree of freedom:
+            //
+            //   f = 1  ->  refValue      (cases a/b: u_i = f_u(q_i,h))
+            //   f = 0  ->  refGradient=0 (cases c/d: du_i/dn = 0)
+            //
+            // Assigning the whole field and hoping to "skip" some faces does
+            // not work: `== Uin` writes every face, so a skipped face imposes a
+            // STALE Uin rather than nothing.  Measured: -69.4 % throttle and a
+            // mass residual of 1.0.  The fraction is the only honest way.
+            auto& Ub = U.boundaryFieldRef()[I.patchID];
+            if (isA<mixedFvPatchField<vector>>(Ub))
+            {
+                auto& m = refCast<mixedFvPatchField<vector>>(Ub);
+                m.refValue() = Uin;
+                m.refGrad() = vector::zero;
+                m.valueFraction() = mgFrac_;
+                m.evaluate();
+            }
+            else
+            {
+                FatalErrorInFunction
+                    << "imposeMode mintgen with mixedU needs patch "
+                    << mesh_.boundary()[I.patchID].name()
+                    << " of U to be type `mixed`; it is `" << Ub.type()
+                    << "'.  Regenerate the case with FLUXBC=mintgenmix."
+                    << exit(FatalError);
+            }
+            alpha.boundaryFieldRef()[I.patchID] == alphaIn;
+        }
+        else if (writeState_)
         {
             U.boundaryFieldRef()[I.patchID] == Uin;
             alpha.boundaryFieldRef()[I.patchID] == alphaIn;

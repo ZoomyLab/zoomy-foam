@@ -275,6 +275,13 @@ class swePreciceCoupling
     //  wall friction there is no log layer to impose.  Never substitute a
     //  nominal u* to keep the shape.
     scalar nuEff_ = 0.0;
+    //- mintgen: express the per-panel regime switch as OpenFOAM's `mixed`
+    //  valueFraction.  1 = Dirichlet f_u (cases a/b, flow INTO the resolved
+    //  domain), 0 = zero-gradient (cases c/d, where p_d is the only datum).
+    //  The patch must be declared `mixed`; see the write site for why the
+    //  fraction and not a skipped write is the only honest realisation.
+    bool mixedU_ = false;
+    scalarField mgFrac_;
     //- how the gate above actually resolved, counted PER IMPOSITION CALL and
     //  not per coupling window.  seam_rows.csv logs once a window and shows
     //  q_imp < 0 in 299 of 299 of them, yet gated and ungated runs that are
