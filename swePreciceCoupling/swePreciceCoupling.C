@@ -1266,8 +1266,16 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
             //             from the peer; nothing propagates back out.
             //   |Fr| < 1  subcritical -> the star state, which is what it is
             //             for.
+            // Computed in EVERY mode, not only where it is acted on.  It used
+            // to be inside the `charswitch` branch, which left the `Fr` and
+            // `regime` columns of seam_rows.csv identically zero in every other
+            // mode -- including `starstate`, the delivered one.  A diagnostic
+            // that silently reads 0.000 for a whole run is worse than an absent
+            // one: it was read at face value and had to be recomputed from the
+            // exchanged columns to find that the delivered seams actually run
+            // at Fr 0.12-0.26.  The SWITCH below stays conditional; only the
+            // measurement is unconditional.
             scalar FrCol = 0.0;
-            if (imposeMode_ == "charswitch")
             {
                 scalar uBar = 0.0, aSum = 0.0;
                 forAll(col.faces, j)
