@@ -250,6 +250,11 @@ class swePreciceCoupling
     label nNewtonStall_ = 0;
     scalar sumRelRes_ = 0;
     label nRelRes_ = 0;
+    //- signed / absolute residual per flux row, accumulated over
+    //  every Newton iterate.  The SIGN is the diagnostic.
+    scalar resSum_[8] = {0,0,0,0,0,0,0,0};
+    scalar resAbs_[8] = {0,0,0,0,0,0,0,0};
+    label nResRow_ = 0;
     long winIdx_ = 0;               // completed-window counter
     scalar outInterval_;
     scalar lastWrite_;

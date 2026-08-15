@@ -82,6 +82,16 @@ Foam::functionObjects::swePreciceCoupling::~swePreciceCoupling()
             << ", rejected on " << nNewtonFail_ << " column-window(s)." << nl
             << "   mean relative distance to the nearest reachable flux: "
             << ((nRelRes_ > 0) ? sumRelRes_/nRelRes_ : 0.0) << nl
+            << "   signed residual F(q)-F* per row, mean over iterates:" << nl;
+        for (int k = 1; k < Model::n_dof_q && k < 8; ++k)
+        {
+            Info<< "      row " << k << ":  signed "
+                << ((nResRow_ > 0) ? resSum_[k]/nResRow_ : 0.0)
+                << "   |.| " << ((nResRow_ > 0) ? resAbs_[k]/nResRow_ : 0.0)
+                << nl;
+        }
+        Info<< "   sign < 0 on a row means F(q) sits BELOW the target there."
+            << nl
             << "   a nonzero distance means the charged flux is NOT F(q) for "
             << "any single state -- it is a two-state numerical flux, and no "
             << "boundary condition that imposes ONE state can carry it."
@@ -1357,6 +1367,22 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                                 }
                                 relN = rn/Foam::max(sc, SMALL);
                                 if (rel0 < 0) rel0 = relN;
+                                // SIGNED, per row.  "Unreachable" can mean two
+                                // very different things: the target sits off to
+                                // one side of the reachable set, in which case
+                                // more degrees of freedom in q would reach it,
+                                // or it sits BELOW a floor, in which case they
+                                // cannot -- every extra moment enters F_q0
+                                // squared and can only add momentum.  The sign
+                                // decides that, so it is recorded.
+                                for (int k = 1; k < NQ && k < 8; ++k)
+                                {
+                                    resSum_[k] += r(k-1)
+                                        /Foam::max(Foam::mag(Ft[k]), SMALL);
+                                    resAbs_[k] += Foam::mag(r(k-1))
+                                        /Foam::max(Foam::mag(Ft[k]), SMALL);
+                                }
+                                ++nResRow_;
                                 if (relN <= 1e-10) { ok = true; break; }
                                 const auto Am =
                                     Model::quasilinear_matrix_x(qN, qaux, param);
