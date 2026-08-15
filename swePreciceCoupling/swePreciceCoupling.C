@@ -1897,17 +1897,43 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     List<List<scalar>> Cw(Model::n_dof_q,
                                           List<scalar>(nfF, scalar(0)));
                     {
+                        // project_from_3d samples the WATER column on
+                        // zeta in [0,1].  The patch faces span the whole
+                        // DOMAIN, 0.4 m against a water depth of ~0.11 m, so
+                        // indexing its weights by raw face index integrates
+                        // over the wrong extent -- the first version did that
+                        // and started 28 % off before a single iteration.
+                        //
+                        // The weights are therefore built on the water grid
+                        // and mapped BACK to the faces through the same zW[]
+                        // remap the imposition uses, with dry faces carrying
+                        // no weight at all.
                         List<List<scalar>> unit(nfF, List<scalar>(NF, scalar(0)));
                         forAll(col.faces, j)
                         { unit[j][0] = col.floorY; unit[j][1] = 1.0; }
+                        List<List<scalar>> Cz(Model::n_dof_q,
+                                              List<scalar>(nfF, scalar(0)));
                         for (label j = 0; j < nfF; ++j)
                         {
                             unit[j][2] = 1.0;
                             const List<scalar> pj =
                                 Model::project_from_3d(unit, param);
                             for (int k = 2; k < Model::n_dof_q; ++k)
-                                Cw[k][j] = pj[k];
+                                Cz[k][j] = pj[k];
                             unit[j][2] = 0.0;
+                        }
+                        // zW[j] is the face's water-relative zeta; the kernel's
+                        // own sample points are j/(nfF-1).  Nearest-node map,
+                        // which is exact when the grids coincide and is the
+                        // same lossy step the exchange mapping already makes.
+                        forAll(col.faces, j)
+                        {
+                            if (aCol[j] <= SMALL) continue;   // dry: no weight
+                            const label jz = Foam::min
+                                (nfF - 1, Foam::max(label(0),
+                                 label(Foam::round(zW[j]*(nfF - 1)))));
+                            for (int k = 2; k < Model::n_dof_q; ++k)
+                                Cw[k][j] = Cz[k][jz];
                         }
                     }
                     // the NS flux integrand per face, and its residual
