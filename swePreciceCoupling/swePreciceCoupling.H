@@ -267,6 +267,15 @@ class swePreciceCoupling
     //  both dam-break directions -- the uniform instrument alone never decides
     //  a configuration.
     bool dryFacesInterior_ = false;
+    //- how the gate above actually resolved, counted PER IMPOSITION CALL and
+    //  not per coupling window.  seam_rows.csv logs once a window and shows
+    //  q_imp < 0 in 299 of 299 of them, yet gated and ungated runs that are
+    //  byte-identical apart from their name disagree on the uniform outflow
+    //  instrument -- so the sign the gate sees cannot be the sign the window
+    //  log records.  imposeInflow() runs every time step; these two counters
+    //  are the only way to see the calls the window log cannot.
+    label nGateOut_ = 0;
+    label nGateIn_ = 0;
     bool writePressure_ = false;
     //- water density for that condition; p_rgh here carries [1 -1 -2] (real
     //  pressure), not the kinematic form, so rho is needed explicitly.

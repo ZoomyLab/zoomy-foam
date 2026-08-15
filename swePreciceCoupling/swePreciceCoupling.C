@@ -75,6 +75,14 @@ Foam::functionObjects::swePreciceCoupling::~swePreciceCoupling()
             << "back to the shape-free uniform profile.  Mass is still exact "
             << "there; the PROFILE is not the star state's." << endl;
     }
+    if (nGateOut_ + nGateIn_ > 0)
+    {
+        Info<< "[dryFacesInterior] imposition calls: " << nGateOut_
+            << " outflow (air left to the interior), " << nGateIn_
+            << " inflow (dry faces driven).  Counted per CALL, not per"
+            << " window -- seam_rows.csv cannot see the intra-window ones."
+            << endl;
+    }
     if (nNewtonOk_ + nNewtonFail_ + nNewtonStall_ > 0)
     {
         Info<< "[fluxnewton] F(q) = F* converged on " << nNewtonOk_
@@ -2477,6 +2485,7 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                         Uin[f] = uPif[f];
                     }
                 }
+                if (dryFacesInterior_) { qEff < 0.0 ? ++nGateOut_ : ++nGateIn_; }
                 // THE ASSERTION, on the field that was actually written and
                 // not on the intermediate it was built from.  Roundoff only;
                 // anything larger is a defect and must stop the run rather
