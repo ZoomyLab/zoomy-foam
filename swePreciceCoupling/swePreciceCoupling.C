@@ -95,6 +95,18 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
         for (int k = 2; k < Model::n_dof_q; ++k)
             starLog_() << ",Fq" << (k - 2) << "_charged,Fq" << (k - 2)
                        << "_carried";
+        // A THIRD number per row, always read off the PATCH FIELD whatever
+        // `writeState` is.  `_carried` cannot be compared BETWEEN
+        // configurations: this diagnostic runs BEFORE the imposition, so with
+        // writeState=yes it reads `Uin` (the state about to be imposed, i.e.
+        // current) and with writeState=no it reads the patch (last window's
+        // state).  Each is the best available in its own configuration, but
+        // they are different references -- and a trade-off was quoted across
+        // them, q_0 0.32 % against 26.78 %, as though it were like for like.
+        // `_patch` uses the same reference everywhere, so it is the comparable
+        // one.  Appended, so every existing reader keeps working.
+        for (int k = 2; k < Model::n_dof_q; ++k)
+            starLog_() << ",Fq" << (k - 2) << "_patch";
         starLog_() << nl;
     }
     dict.readIfPresent("debtRepayWindows", debtRepay_);
@@ -1720,6 +1732,43 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     carried.setSize(Fi.size(), scalar(0));
                     forAll(carried, k) carried[k] = Fi[k][0];
                 }
+                // The same quantity built ALWAYS from the patch field, so the
+                // configurations can be compared against one reference.  Under
+                // writeState=no this repeats `carried` exactly; under
+                // writeState=yes it is the genuinely independent number, and
+                // the difference between the two is the size of the reporting
+                // artefact rather than of any physical loss.
+                List<scalar> carriedPatch;
+                {
+                    List<List<scalar>> patProf
+                        (col.faces.size(), List<scalar>(NF, scalar(0)));
+                    const scalar dzP =
+                        col.height/Foam::max(1, col.faces.size());
+                    scalar hPat = 0.0;
+                    forAll(col.faces, j)
+                        hPat +=
+                            alpha.boundaryField()[I.patchID][col.faces[j]]*dzP;
+                    if (hPat > SMALL)
+                    {
+                        forAll(col.faces, j)
+                        {
+                            const label f = col.faces[j];
+                            const vector uP =
+                                U.boundaryField()[I.patchID][f];
+                            patProf[j][0] = col.floorY;
+                            patProf[j][1] = hPat;
+                            patProf[j][2] = uP & I.eH1;
+                            patProf[j][3] = uP & I.eH2;
+                            patProf[j][4] = uP & I.gUp;
+                        }
+                        const List<scalar> qP =
+                            Model::project_from_3d(patProf, param);
+                        const auto Fp = Numerics::numerical_flux
+                            (qP, qP, qaux, qaux, param, nHat);
+                        carriedPatch.setSize(Fp.size(), scalar(0));
+                        forAll(carriedPatch, k) carriedPatch[k] = Fp[k][0];
+                    }
+                }
                 const label nR = col.winFq.size();
                 starLog_() << winIdx_ << "," << mesh_.time().value() << ","
                     << c << "," << imposeMode_ << "," << col.curTarget << ","
@@ -1732,6 +1781,12 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 {
                     const scalar cq = (k < carried.size()) ? carried[k] : 0.0;
                     starLog_() << "," << col.winFq[k] << "," << cq;
+                }
+                for (label k = 2; k < nR; ++k)
+                {
+                    const scalar pq =
+                        (k < carriedPatch.size()) ? carriedPatch[k] : 0.0;
+                    starLog_() << "," << pq;
                 }
                 starLog_() << nl;
             }
