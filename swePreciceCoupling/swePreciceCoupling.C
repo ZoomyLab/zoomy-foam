@@ -1861,8 +1861,30 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                         uStar = Foam::sqrt(nuEff_
                               *Foam::mag(uPif[f0] & I.nStream)/dzB);
                     }
+                    // THE REGIME SWITCH, table 5.2's Gamma_3D column.  f_u is
+                    // the condition for cases a and b ONLY -- flow INTO the
+                    // resolved domain.  In cases c and d the velocity is
+                    // zero-gradient and the single datum is p_d.  qEff > 0 is
+                    // an inflow column (uS is projected on nStream, the
+                    // into-domain direction).
+                    //
+                    // Applying f_u in BOTH directions is not a small error: on
+                    // the uniform instrument it takes the outflow throttle from
+                    // -0.308 % to -4.825 % and the seam depth from +0.10 % to
+                    // +7.99 %, because it re-imposes a full Dirichlet profile on
+                    // exactly the boundary his scheme leaves to the pressure.
+                    const bool enrich = (qEff > 0.0);
                     forAll(col.faces, j)
                     {
+                        if (!enrich)
+                        {
+                            // cases c/d: zero-gradient, the interior value.
+                            const label f = col.faces[j];
+                            uS[j] = uPif[f] & I.nStream;
+                            vS[j] = uPif[f] & I.tHat;
+                            wS[j] = uPif[f] & I.gUp;
+                            continue;
+                        }
                         // z_rel/h^2D is exactly the water-relative zeta already
                         // built above; ln(0) at the floor is clipped at the
                         // first face centre, which is where his z_f sits anyway.
