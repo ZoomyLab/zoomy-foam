@@ -85,6 +85,8 @@ Foam::functionObjects::swePreciceCoupling::~swePreciceCoupling()
             << ((nRelRes_ > 0) ? sumRel0_/nRelRes_ : 0.0) << nl
             << "      where Newton stops             : "
             << ((nRelRes_ > 0) ? sumRelRes_/nRelRes_ : 0.0) << nl
+            << "   stopped: singular Jacobian " << nExitSingular_
+            << ", h -> 0 " << nExitDry_ << nl
             << "   IF THESE ARE EQUAL Newton is not moving and the residual is"
             << " not shown to be irreducible -- only unreduced." << nl
             << "   signed residual F(q)-F* per row, mean over iterates:" << nl;
@@ -1546,15 +1548,27 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                                 }
                                 ++nResRow_;
                                 if (relN <= 1e-10) { ok = true; break; }
+                                // dF/dQ = A - NCP.  VERIFIED empirically that
+                                // Numerics::numerical_flux carries g h^2/2
+                                // (Fc/(M_adv+M_prs) = 1.0000) even though
+                                // Model::flux_x does not, so A is the Jacobian
+                                // of exactly the function evaluated above.
+                                // NCP is nonzero only in the BED column here,
+                                // which this submatrix already drops -- kept
+                                // explicit so the identity is on the record and
+                                // stays right if the model changes.
                                 const auto Am =
                                     Model::quasilinear_matrix_x(qN, qaux, param);
+                                const auto Bm =
+                                    Model::nonconservative_matrix_x(qN, qaux, param);
                                 Eigen::Matrix<double, NQ-1, NQ-1> J;
                                 for (int a2 = 1; a2 < NQ; ++a2)
                                     for (int b2 = 1; b2 < NQ; ++b2)
-                                        J(a2-1, b2-1) = Am[a2][b2];
+                                        J(a2-1, b2-1) = Am[a2][b2] - Bm[a2][b2];
                                 Eigen::FullPivLU
                                     <Eigen::Matrix<double, NQ-1, NQ-1>> lu(J);
-                                if (!lu.isInvertible()) break;
+                                if (!lu.isInvertible())
+                                { ++nExitSingular_; break; }
                                 const Eigen::Matrix<double, NQ-1, 1> dq =
                                     lu.solve(-r);
                                 // damped: a full step can drive h negative,
@@ -1568,7 +1582,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                                 }
                                 for (int k = 1; k < NQ; ++k)
                                     qN[k] += w*dq(k-1);
-                                if (qN[1] <= 1e-9) break;
+                                if (qN[1] <= 1e-9)
+                                { ++nExitDry_; break; }
                             }
                             if (qN[1] > 1e-9 && relN >= 0
                              && relN <= Foam::max(rel0, scalar(0)))

@@ -257,6 +257,9 @@ class swePreciceCoupling
     scalar sumRelRes_ = 0;
     label nRelRes_ = 0;
     scalar sumRel0_ = 0;
+    //- fluxnewton: WHY the iteration stopped, counted not guessed.
+    label nExitSingular_ = 0;
+    label nExitDry_ = 0;
     //- signed / absolute residual per flux row, accumulated over
     //  every Newton iterate.  The SIGN is the diagnostic.
     scalar resSum_[8] = {0,0,0,0,0,0,0,0};
