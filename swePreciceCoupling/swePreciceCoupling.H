@@ -267,6 +267,14 @@ class swePreciceCoupling
     //  both dam-break directions -- the uniform instrument alone never decides
     //  a configuration.
     bool dryFacesInterior_ = false;
+    //- kinematic viscosity used to estimate the RESOLVED side's friction
+    //  velocity for Mintgen's f_u (his eq. 5.18 takes u* from the 3D solver's
+    //  own bottom wall shear).  Zero -- the default, and what BOTTOM=slip or an
+    //  inviscid run actually means -- collapses the log profile to the block
+    //  profile u == u^2D.  That is the correct limit, not a defect: with no
+    //  wall friction there is no log layer to impose.  Never substitute a
+    //  nominal u* to keep the shape.
+    scalar nuEff_ = 0.0;
     //- how the gate above actually resolved, counted PER IMPOSITION CALL and
     //  not per coupling window.  seam_rows.csv logs once a window and shows
     //  q_imp < 0 in 299 of 299 of them, yet gated and ungated runs that are

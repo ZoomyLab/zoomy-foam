@@ -157,6 +157,7 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("alphaDirSwitch", alphaDirSwitch_);
     dict.readIfPresent("imposeVertical", imposeVertical_);
     dict.readIfPresent("dryFacesInterior", dryFacesInterior_);
+    dict.readIfPresent("nuEff", nuEff_);
     dict.readIfPresent("writePressure", writePressure_);
     dict.readIfPresent("rhoWater", rhoWater_);
     dict.readIfPresent("consistentWrite", consistentWrite_);
@@ -1766,7 +1767,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                   || imposeMode_ == "fluxnewton"
                   || imposeMode_ == "fluxfit"
                   || imposeMode_ == "nsfit"
-                  || imposeMode_ == "fluxmodes")
+                  || imposeMode_ == "fluxmodes"
+                  || imposeMode_ == "mintgen")
             {
                 // ══ STAR-STATE IMPOSITION ═══════════════════════════════════
                 // ONE independent quantity per face: the face flux phi_f.  U_f
@@ -1792,6 +1794,18 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 const scalarField& magSfP = mesh_.boundary()[I.patchID].magSf();
                 const vectorField& SfP = mesh_.boundary()[I.patchID].Sf();
 
+                // MINTGEN: the enrichment datum is the PEER's depth-averaged
+                // state, not a Riemann star.  His eq. (5.17) is u^2D = q^2D/h^2D
+                // with both taken from Omega_2D^loc, and the whole point of the
+                // scheme is that whichever side the information flows FROM owns
+                // the discharge.  Reading a star state here would put OUR
+                // authority back in through the target -- the same contamination
+                // that (with writePhi) made every earlier mintgen run diverge.
+                if (imposeMode_ == "mintgen" && qSwe.size() > 2)
+                {
+                    hFill = Foam::max(qSwe[1], scalar(0));
+                    qStar = qSwe[2];
+                }
                 // the ledger contract, identical to the statebc path: the
                 // ledger books against the TARGET and imposes the repaid rate.
                 const scalar qEff = qStar
@@ -1812,7 +1826,57 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 }
                 List<scalar> uS(nf, scalar(0)), vS(nf, scalar(0)),
                              wS(nf, scalar(0));
-                if (imposeMode_ == "rawflux")
+                if (imposeMode_ == "mintgen")
+                {
+                    // MINTGEN (2018) eq. (5.18): f_u, the enrichment profile
+                    // for cases a and b, flow INTO the resolved domain.
+                    //
+                    //   u(z) = u^2D + (u*/kappa) (1 + ln(z_rel/h^2D))
+                    //
+                    // Deliberately logarithmic and not a block profile: a block
+                    // profile implies a very high near-bed gradient, over-states
+                    // the wall shear, and the extra energy needed to hold the
+                    // discharge raises the water level (his §5.5).
+                    //
+                    // u* is the RESOLVED side's own friction velocity, taken
+                    // from its bottom wall shear -- a solution variable, not a
+                    // model.  Our floor may be slip (BOTTOM=slip) or inviscid,
+                    // in which case tau_b = 0 and the profile collapses to the
+                    // block profile u == u^2D.  That is the correct limit: with
+                    // no wall friction there is no log layer to impose, and it
+                    // is reported rather than faked with a nominal u*.
+                    //
+                    // Basing the profile on u^2D and not on u* alone is what he
+                    // records as the stabilising choice.
+                    const scalar h2D = Foam::max(hFill, SMALL);
+                    const scalar u2D = qEff/h2D;
+                    const scalar kappa = 0.41;
+                    scalar uStar = 0.0;
+                    if (nuEff_ > 0)
+                    {
+                        // tau_b/rho = nu du/dz at the first wet face above the
+                        // floor; u* = sqrt(|tau_b/rho|).
+                        const label f0 = col.faces[0];
+                        const scalar dzB = Foam::max(0.5*dz, SMALL);
+                        uStar = Foam::sqrt(nuEff_
+                              *Foam::mag(uPif[f0] & I.nStream)/dzB);
+                    }
+                    forAll(col.faces, j)
+                    {
+                        // z_rel/h^2D is exactly the water-relative zeta already
+                        // built above; ln(0) at the floor is clipped at the
+                        // first face centre, which is where his z_f sits anyway.
+                        const scalar zr = Foam::max(zW[j], scalar(1e-3));
+                        uS[j] = u2D + (uStar/kappa)*(1.0 + Foam::log(zr));
+                        vS[j] = 0.0;
+                        wS[j] = 0.0;
+                    }
+                    // eq. (5.20)-(5.22): the beta mass corrector.  The
+                    // renormalisation further down is s = qEff/intake0, which is
+                    // the SAME uniform rescale, so beta is applied there and not
+                    // twice here.
+                }
+                else if (imposeMode_ == "rawflux")
                 {
                     // NO STAR STATE.  The Riemann problem sets the MAGNITUDE of
                     // the seam flux; the interior sets its SHAPE.  Lifting the
