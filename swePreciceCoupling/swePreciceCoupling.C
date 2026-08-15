@@ -2460,7 +2460,19 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     // is exactly why this cost nothing on any mass measurement
                     // while it was expelling four fifths of the patch volume as
                     // air.  Overwrite AFTER the accounting, never before.
-                    if (dryFacesInterior_ && aCol[j] <= SMALL)
+                    //
+                    // DIRECTIONAL, and it has to be.  qEff > 0 is an inflow
+                    // column (uS is projected on nStream, the into-domain
+                    // direction, so intake0 and qEff are positive going in).
+                    // At an INFLOW the dry faces are a legitimate datum -- we
+                    // are saying what enters -- and the uniform instrument in
+                    // that direction is already exact: throttle +0.001 %, seam
+                    // depth +0.12 %, moment rows 0.02/0.00/0.00 %.  Handing
+                    // those faces to the interior there costs +0.31 %.  It is
+                    // the OUTFLOW column that a full Dirichlet profile
+                    // over-determines (-2.346 %), which is precisely what
+                    // sweep_direction.sh predicted for incompressible NS.
+                    if (dryFacesInterior_ && aCol[j] <= SMALL && qEff < 0.0)
                     {
                         Uin[f] = uPif[f];
                     }
