@@ -147,6 +147,9 @@ class swePreciceCoupling
     //  the two-point average subtracts MORE and drives F_conv further below
     //  the floor -- infeasible windows went 89 -> 341 of 499.  Default "star".
     word pSub_ = "star";
+    //- fluxfit target: "charged" (Fc+Fl, what the results
+    //  measure) or "fluct" (the bare VOF-side fluctuation D).
+    word fitTarget_ = "charged";
     fileName configPath_;
     word participantName_;
     std::array<std::string, NF> readFields_;

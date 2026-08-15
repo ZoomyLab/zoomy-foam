@@ -130,6 +130,7 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("imposeMode", imposeMode_);
     dict.readIfPresent("qstarMode", qstarMode_);
     dict.readIfPresent("pSub", pSub_);
+    dict.readIfPresent("fitTarget", fitTarget_);
     dict.readIfPresent("outputInterval", outInterval_);
     dict.readIfPresent("maxCo", maxCo_);
     dict.readIfPresent("maxAlphaCo", maxAlphaCo_);
@@ -1294,7 +1295,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     if (imposeMode_ == "starstate" || imposeMode_ == "starsrc"
                      || imposeMode_ == "fluxmatch"
                      || imposeMode_ == "fluxshift"
-                     || imposeMode_ == "fluxnewton")
+                     || imposeMode_ == "fluxnewton"
+                     || imposeMode_ == "fluxfit")
                     {
                         // THE STAR STATE.  Rusanov IS HLL with s_L = -lam_max
                         // and s_R = +lam_max, so its resolved middle state is
@@ -1321,7 +1323,111 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                             qs[i] = S[i][0];
                         col.winQStar = qs;
                         hFill = S[1][0];
-                        if (imposeMode_ == "fluxnewton")
+                        if (imposeMode_ == "fluxfit")
+                        {
+                            // ── FIT THE PROFILE TO THE FLUCTUATION ──────────
+                            // D- is the flux the reduced side wants the VOF to
+                            // use.  The VOF has no mechanism that takes a
+                            // fluctuation, so instead find the boundary state
+                            // whose OWN moment flux is as close to it as
+                            // possible, measured exactly the way the results
+                            // measure it.
+                            //
+                            // Three things this does differently from the
+                            // fluxnewton attempt, each of which was a defect
+                            // there:
+                            //   * LEAST SQUARES, not a root find.  The target
+                            //     need not be reachable; Gauss-Newton still
+                            //     moves and still reduces.
+                            //   * the Jacobian is a FINITE DIFFERENCE OF THE
+                            //     RESIDUAL ITSELF, so residual and Jacobian
+                            //     cannot disagree.  quasilinear_matrix_x is
+                            //     dF/dQ + B and is NOT the Jacobian of
+                            //     flux_x; using it there is why Newton never
+                            //     took a step.
+                            //   * gravity is never subtracted.  It sits inside
+                            //     the flux on both sides of the residual and
+                            //     cancels there, instead of being formed as a
+                            //     difference of two numbers 97 % of whose
+                            //     magnitude is common.
+                            //
+                            // q_0 is NOT free: it is the mass row, and exact
+                            // mass is the one property worth keeping.  h, q_1,
+                            // q_2 are.
+                            constexpr int NQ = Model::n_dof_q;
+                            constexpr int NX = NQ - 2;      // h, q_1 .. q_N
+                            List<scalar> qF = qs;
+                            qF[2] = qStar;                  // mass row, exact
+                            auto resid = [&](const List<scalar>& qq,
+                                             Eigen::Matrix<double, NQ-2, 1>& rr)
+                            {
+                                const auto Fq = Numerics::numerical_flux
+                                    (qq, qq, qaux, qaux, param, nHat);
+                                // TARGET.  fitTarget=charged (default) is
+                                // Fc + Fl, the row the results are measured
+                                // against; fitTarget=fluct is the bare
+                                // fluctuation D on the VOF side.  Neither is
+                                // decomposed: gravity sits inside the model's
+                                // own flux on both sides of the residual and
+                                // cancels there.
+                                for (int k = 2; k < NQ; ++k)
+                                    rr(k-2) = Fq[k][0]
+                                        - ((fitTarget_ == "fluct")
+                                          ? col.winFl[k] : col.winFq[k]);
+                            };
+                            Eigen::Matrix<double, NQ-2, 1> r0;
+                            resid(qF, r0);
+                            const double n0 = r0.norm();
+                            for (label it = 0; it < 20; ++it)
+                            {
+                                Eigen::Matrix<double, NQ-2, NX> J;
+                                for (int c2 = 0; c2 < NX; ++c2)
+                                {
+                                    const int idx = (c2 == 0) ? 1 : (c2 + 2);
+                                    List<scalar> qp = qF;
+                                    const scalar dh = 1e-7*Foam::max
+                                        (Foam::mag(qF[idx]), scalar(1e-6));
+                                    qp[idx] += dh;
+                                    Eigen::Matrix<double, NQ-2, 1> rp;
+                                    resid(qp, rp);
+                                    J.col(c2) = (rp - r0)/dh;
+                                }
+                                const Eigen::Matrix<double, NX, 1> dx =
+                                    J.colPivHouseholderQr().solve(-r0);
+                                if (!dx.allFinite()) break;
+                                // backtrack on the residual norm AND on h > 0
+                                scalar w = 1.0; bool moved = false;
+                                for (int t = 0; t < 12; ++t)
+                                {
+                                    List<scalar> qt = qF;
+                                    qt[1] += w*dx(0);
+                                    for (int c2 = 1; c2 < NX; ++c2)
+                                        qt[c2+2] += w*dx(c2);
+                                    if (qt[1] > 1e-9)
+                                    {
+                                        Eigen::Matrix<double, NQ-2, 1> rt;
+                                        resid(qt, rt);
+                                        if (rt.norm() < r0.norm())
+                                        { qF = qt; r0 = rt; moved = true; break; }
+                                    }
+                                    w *= 0.5;
+                                }
+                                if (!moved) break;
+                                if (r0.norm() <= 1e-12*Foam::max(n0, SMALL))
+                                    break;
+                            }
+                            if (qF[1] > 1e-9 && r0.norm() <= n0)
+                            {
+                                col.winQStar = qF;
+                                hFill = qF[1];
+                                sumRel0_ += n0; sumRelRes_ += r0.norm();
+                                ++nRelRes_;
+                                if (r0.norm() < 0.999*n0) ++nNewtonOk_;
+                                else ++nNewtonStall_;
+                            }
+                            else { ++nNewtonFail_; }
+                        }
+                        else if (imposeMode_ == "fluxnewton")
                         {
                             // ── SOLVE FOR THE STATE, NOT THE PROFILE ────────
                             // Every profile reweighting -- scale, shift, the
@@ -1554,7 +1660,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                   || imposeMode_ == "starsrc"
                   || imposeMode_ == "fluxmatch"
                   || imposeMode_ == "fluxshift"
-                  || imposeMode_ == "fluxnewton")
+                  || imposeMode_ == "fluxnewton"
+                  || imposeMode_ == "fluxfit")
             {
                 // ══ STAR-STATE IMPOSITION ═══════════════════════════════════
                 // ONE independent quantity per face: the face flux phi_f.  U_f
