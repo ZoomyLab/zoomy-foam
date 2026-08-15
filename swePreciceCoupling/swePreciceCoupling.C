@@ -75,6 +75,12 @@ Foam::functionObjects::swePreciceCoupling::~swePreciceCoupling()
             << "back to the shape-free uniform profile.  Mass is still exact "
             << "there; the PROFILE is not the star state's." << endl;
     }
+    if (nNewtonOk_ + nNewtonFail_ > 0)
+    {
+        Info<< "[fluxnewton] F(q) = F* solved on " << nNewtonOk_
+            << " column-window(s), failed on " << nNewtonFail_
+            << " (no invertible Jacobian, or the step drove h <= 0)." << endl;
+    }
     if (nFluxMatchFail_ > 0)
     {
         WarningInFunction << nl
@@ -1260,7 +1266,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                                               + qVof[1]*qVof[1]);
                     if (imposeMode_ == "starstate" || imposeMode_ == "starsrc"
                      || imposeMode_ == "fluxmatch"
-                     || imposeMode_ == "fluxshift")
+                     || imposeMode_ == "fluxshift"
+                     || imposeMode_ == "fluxnewton")
                     {
                         // THE STAR STATE.  Rusanov IS HLL with s_L = -lam_max
                         // and s_R = +lam_max, so its resolved middle state is
@@ -1287,6 +1294,86 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                             qs[i] = S[i][0];
                         col.winQStar = qs;
                         hFill = S[1][0];
+                        if (imposeMode_ == "fluxnewton")
+                        {
+                            // ── SOLVE FOR THE STATE, NOT THE PROFILE ────────
+                            // Every profile reweighting -- scale, shift, the
+                            // full affine map, none at all -- lands within
+                            // 0.05 on q_0.  MEASURED.  So the deficit is not
+                            // in how the lift is normalised, and the one
+                            // degree of freedom never used is the imposed
+                            // DEPTH: h has always been taken from the star
+                            // state while only the profile was adjusted, i.e.
+                            // four flux rows fitted with three unknowns.
+                            //
+                            // Include h and the system is square:
+                            //     F(q) = F*,   q = (h, q_0, ... q_N),
+                            // n_dof_q - 1 equations in n_dof_q - 1 unknowns
+                            // (b is the bed and is not ours to choose).
+                            // Rusanov with both sides equal has no
+                            // dissipation, so numerical_flux(q,q) IS F(q), and
+                            // quasilinear_matrix_x IS its exact Jacobian --
+                            // no finite differences, and the hydrostatic term
+                            // never appears as a difference of large numbers
+                            // because it sits inside F on both sides.
+                            constexpr int NQ = Model::n_dof_q;
+                            List<scalar> Ft(NQ, scalar(0));
+                            // the RAW Riemann mass row, not the
+                            // ledger-corrected qEff: qEff is not available
+                            // here and the debt is orders below the rows being
+                            // matched.  The renormalisation downstream still
+                            // enforces the ledger, and scale-vs-shift-vs-none
+                            // was measured to move q_0 by <= 0.05.
+                            Ft[1] = qStar;
+                            for (int k = 2; k < NQ; ++k) Ft[k] = col.winFq[k];
+                            List<scalar> qN = qs;
+                            bool ok = false;
+                            for (label it = 0; it < 12; ++it)
+                            {
+                                const auto Fq = Numerics::numerical_flux
+                                    (qN, qN, qaux, qaux, param, nHat);
+                                Eigen::Matrix<double, NQ-1, 1> r;
+                                double rn = 0.0, sc = 0.0;
+                                for (int k = 1; k < NQ; ++k)
+                                {
+                                    r(k-1) = Fq[k][0] - Ft[k];
+                                    rn = Foam::max(rn, Foam::mag(r(k-1)));
+                                    sc = Foam::max(sc, Foam::mag(Ft[k]));
+                                }
+                                if (rn <= 1e-13*Foam::max(sc, SMALL))
+                                { ok = true; break; }
+                                const auto Am =
+                                    Model::quasilinear_matrix_x(qN, qaux, param);
+                                Eigen::Matrix<double, NQ-1, NQ-1> J;
+                                for (int a2 = 1; a2 < NQ; ++a2)
+                                    for (int b2 = 1; b2 < NQ; ++b2)
+                                        J(a2-1, b2-1) = Am[a2][b2];
+                                Eigen::FullPivLU
+                                    <Eigen::Matrix<double, NQ-1, NQ-1>> lu(J);
+                                if (!lu.isInvertible()) break;
+                                const Eigen::Matrix<double, NQ-1, 1> dq =
+                                    lu.solve(-r);
+                                // damped: a full step can drive h negative,
+                                // and a negative depth is not a slow solve, it
+                                // is a different problem.
+                                scalar w = 1.0;
+                                for (int t = 0; t < 8; ++t)
+                                {
+                                    if (qN[1] + w*dq(0) > 1e-9) break;
+                                    w *= 0.5;
+                                }
+                                for (int k = 1; k < NQ; ++k)
+                                    qN[k] += w*dq(k-1);
+                                if (qN[1] <= 1e-9) break;
+                            }
+                            if (ok && qN[1] > 1e-9)
+                            {
+                                col.winQStar = qN;
+                                hFill = qN[1];
+                                ++nNewtonOk_;
+                            }
+                            else { ++nNewtonFail_; }
+                        }
                     }
                 }
             }
@@ -1405,7 +1492,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                   || imposeMode_ == "rawflux"
                   || imposeMode_ == "starsrc"
                   || imposeMode_ == "fluxmatch"
-                  || imposeMode_ == "fluxshift")
+                  || imposeMode_ == "fluxshift"
+                  || imposeMode_ == "fluxnewton")
             {
                 // ══ STAR-STATE IMPOSITION ═══════════════════════════════════
                 // ONE independent quantity per face: the face flux phi_f.  U_f
