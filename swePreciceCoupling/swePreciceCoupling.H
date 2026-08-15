@@ -68,6 +68,9 @@ class swePreciceCoupling
         //  the seam keep" is a question about the linear and quadratic moments
         //  as well, and only q_0 was ever booked.
         List<scalar> winFq;
+        //- winFq split: conservative flux and fluctuation separately.
+        List<scalar> winFc;
+        List<scalar> winFl;
         scalar winScale = 1;             // starstate renormalisation factor
         //- imposeMode charswitch: the column Froude the regime was chosen on,
         //  and the branch it took (-1 supercritical out, 0 subcritical,

@@ -181,6 +181,12 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
         // one.  Appended, so every existing reader keeps working.
         for (int k = 2; k < Model::n_dof_q; ++k)
             starLog_() << ",Fq" << (k - 2) << "_patch";
+        // and the CHARGED row split into its two halves, because `charged` is
+        // conservative-flux + fluctuation while `_patch` is conservative flux
+        // ALONE.  If Fl is the size of the reported deficit, the metric is
+        // comparing two different quantities.
+        for (int k = 2; k < Model::n_dof_q; ++k)
+            starLog_() << ",Fq" << (k - 2) << "_Fc,Fq" << (k - 2) << "_Fl";
         starLog_() << nl;
     }
     dict.readIfPresent("debtRepayWindows", debtRepay_);
