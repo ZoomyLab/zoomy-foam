@@ -183,6 +183,20 @@ class swePreciceCoupling
     //  Dropping it CANNOT change mass: the intake is U & Sf and Sf is along the
     //  face normal, so only the normal component enters.  It removes N_zeta
     //  imposed numbers per column at zero cost to the conservation statement.
+    //- impose alpha only on INFLOW faces, interior value on outflow faces.
+    //
+    //  alpha is the ADVECTED field.  At an inflow face it must be specified;
+    //  at an outflow face it is determined by upwinding, and specifying it
+    //  there over-determines the alpha equation.  starstate currently sets it
+    //  geometrically on EVERY face with no direction test; statebc has exactly
+    //  this test and that is why it exists.
+    //
+    //  Note this is the only defensible over-specification claim on the
+    //  resolved side: Dirichlet U with Neumann p (fixedFluxPressure) is well
+    //  posed for incompressible Navier-Stokes, so the velocity imposition is
+    //  NOT the violation -- importing hyperbolic characteristic counting into
+    //  an incompressible solver was a category error.
+    bool alphaDirSwitch_ = false;
     bool imposeVertical_ = true;
     bool writePressure_ = false;
     //- water density for that condition; p_rgh here carries [1 -1 -2] (real

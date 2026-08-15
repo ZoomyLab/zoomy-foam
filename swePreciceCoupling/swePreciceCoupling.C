@@ -69,6 +69,7 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("writePhi", writePhi_);
     dict.readIfPresent("writeState", writeState_);
     dict.readIfPresent("writeAlpha", writeAlpha_);
+    dict.readIfPresent("alphaDirSwitch", alphaDirSwitch_);
     dict.readIfPresent("imposeVertical", imposeVertical_);
     dict.readIfPresent("writePressure", writePressure_);
     dict.readIfPresent("rhoWater", rhoWater_);
@@ -1452,7 +1453,14 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     // flux imposed together, the mixture Godlewski-Raviart
                     // warn about.  Here alpha is taken FROM the interior
                     // (zero-gradient) and only the flux is imposed.
-                    aCol[j] = (imposeMode_ == "fluxonly" || imposeMode_ == "rawflux")
+                    // alphaDirSwitch: outflow faces keep the interior value
+                    // (upwinding owns them); inflow faces take the geometric
+                    // fill.  nStream is the INTO-domain direction, so a
+                    // negative interior projection is an outflow face.
+                    const bool outflowFace = alphaDirSwitch_
+                        && ((uPif[f] & I.nStream) < 0.0);
+                    aCol[j] = (imposeMode_ == "fluxonly"
+                            || imposeMode_ == "rawflux" || outflowFace)
                         ? aPif[f]
                         : Foam::max(scalar(0), Foam::min(scalar(1),
                             (col.floorY + hFill - yLo)/dz));
