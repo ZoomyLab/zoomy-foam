@@ -2480,12 +2480,22 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     // the OUTFLOW column that a full Dirichlet profile
                     // over-determines (-2.346 %), which is precisely what
                     // sweep_direction.sh predicted for incompressible NS.
-                    if (dryFacesInterior_ && aCol[j] <= SMALL && qEff < 0.0)
+                    // `<= 0`, NOT `< 0`, and the difference is the whole
+                    // effect.  qEff == 0 is a DRY seam, not an inflow: the
+                    // constructor calls imposeInflow() once before the time
+                    // loop with hFill = 0, and under `< 0` that single call
+                    // drove the air and seeded the jet that then persisted for
+                    // the entire run.  The per-call counter reads 299 outflow
+                    // against 1 inflow, and that one call is worth the whole
+                    // difference between -2.325 % and -0.634 % on the uniform
+                    // outflow instrument.  A degenerate column has no discharge
+                    // to over-determine, so the air is not ours there either.
+                    if (dryFacesInterior_ && aCol[j] <= SMALL && qEff <= 0.0)
                     {
                         Uin[f] = uPif[f];
                     }
                 }
-                if (dryFacesInterior_) { qEff < 0.0 ? ++nGateOut_ : ++nGateIn_; }
+                if (dryFacesInterior_) { qEff <= 0.0 ? ++nGateOut_ : ++nGateIn_; }
                 // THE ASSERTION, on the field that was actually written and
                 // not on the intermediate it was built from.  Roundoff only;
                 // anything larger is a defect and must stop the run rather
