@@ -2518,6 +2518,18 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                         ? Foam::sqrt(want/mAdv0)
                         : ((Foam::mag(intake0) > tiny) ? qEff/intake0 : 1.0);
                 }
+                else if (imposeMode_ == "mintgen" && qEff <= 0.0)
+                {
+                    // MINTGEN case c/d: the resolved boundary is NOT ours to
+                    // set.  Substituting the interior value and then rescaling
+                    // it to hit qEff is not a zero-gradient condition -- it is
+                    // our authority re-entering one level lower, and it is
+                    // measurable: -0.308 % throttle with the write suppressed
+                    // against -4.6 % with the value swapped and rescaled.
+                    // sFac stays 1 and the write below is skipped entirely, so
+                    // phi follows from the pressure solve as his scheme wants.
+                    sFac = 1.0;
+                }
                 else if (Foam::mag(intake0) > tiny)
                 {
                     sFac = qEff/intake0;
@@ -2536,8 +2548,14 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 // tangential part is projected perpendicular to Sf, so it
                 // rides along in the full-vector impose without disturbing φ.
                 scalar intake = 0.0;
+                // MINTGEN case c/d: write NOTHING.  The patch keeps its own
+                // boundary condition (zero-gradient U and alpha) and phi comes
+                // out of the pressure solve against the imposed p_d.  This is
+                // the whole content of "the resolved side owns the discharge".
+                const bool mgNoWrite = (imposeMode_ == "mintgen" && qEff <= 0.0);
                 forAll(col.faces, j)
                 {
+                    if (mgNoWrite) continue;
                     const label f = col.faces[j];
                     const scalar aSf = Foam::max(magSfP[f], SMALL);
                     const vector nF = SfP[f]/aSf;
@@ -2590,7 +2608,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 // mass identity below is expected NOT to hold there -- that is
                 // the point of the diagnostic, not a defect.
                 const scalar resid = intake - qEff;
-                if (imposeMode_ != "momentum" && imposeMode_ != "starsrc"
+                if (!mgNoWrite
+                 && imposeMode_ != "momentum" && imposeMode_ != "starsrc"
                  && Foam::mag(resid)
                   > 1e-10*Foam::max(Foam::mag(qEff), SMALL) + 1e-18)
                 {
