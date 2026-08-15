@@ -1949,6 +1949,21 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                             }
                         }
                     }
+                    // BASE PROFILE, set BEFORE the moments below.  fitBase=
+                    // interior starts from the VOF's own column P(u_vof) -- a
+                    // state the resolved side already carries, hence admissible
+                    // by construction, which is a better guarantee than a trust
+                    // region (the bound rescued the outflow direction but
+                    // clipped the inflow gain, s2v q0 1.26 -> 12.61).
+                    //
+                    // ORDER IS LOAD-BEARING: S1m is the base profile's own mass
+                    // and the elimination c_0 = (qEff - S1m - ...)/G_0 is built
+                    // from it.  Overwriting uS after that loop left S1m from the
+                    // STAR profile while build() used the interior one, and the
+                    // imposed intake came out exactly 2x the target.
+                    if (fitBase_ == "interior")
+                        forAll(col.faces, j)
+                            uS[j] = uPif[col.faces[j]] & I.nStream;
                     // mass row is linear in c:  sum_j w_j u_j = S1 + sum_m c_m G_m
                     List<scalar> Gm(NM, scalar(0));
                     scalar Wm = 0, S1m = 0;
@@ -2017,17 +2032,6 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                         }
                         return Foam::sqrt(n2);
                     };
-                    // BASE PROFILE.  fitBase=interior starts from the VOF's
-                    // own column P(u_vof) -- a state the resolved side is
-                    // already carrying, hence admissible by construction.
-                    // That is a better admissible-set guarantee than a trust
-                    // region: the bound rescued the outflow direction but
-                    // throttled the inflow one straight back to starstate
-                    // (s2v q0 1.26 -> 12.61), i.e. it clipped the correction
-                    // that was working.
-                    if (fitBase_ == "interior")
-                        forAll(col.faces, j)
-                            uS[j] = uPif[col.faces[j]] & I.nStream;
                     List<scalar> cf(NM, scalar(0));
                     const scalar cBound = fitBound_*Foam::max(uMag, SMALL);
                     const scalar r0m = rnorm(cf);
