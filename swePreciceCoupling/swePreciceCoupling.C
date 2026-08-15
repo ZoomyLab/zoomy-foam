@@ -3017,7 +3017,14 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
             U.boundaryFieldRef()[I.patchID] == Uin;
             alpha.boundaryFieldRef()[I.patchID] == alphaIn;
         }
-        else if (writePressure_)
+        // NOT an `else if`.  It used to be, and the mintgen+mixedU branch above
+        // shadowed it completely: p_d was never imposed in mintgenmix, so every
+        // panel carried a case-a Dirichlet velocity and NO pressure -- the
+        // over-determined outflow this whole scheme exists to avoid.  The
+        // measurement said so plainly: mintgenmix came out bit-identical to the
+        // u-only attempt (+32.871 % throttle), because the p_d gate was dead
+        // code.  The regime gate lives INSIDE the block, per panel.
+        if (writePressure_)
         {
             // MINTGEN-STYLE subcritical outflow: ONE condition, the hydrostatic
             // pressure from the peer's free surface.  Velocity and alpha stay
