@@ -1238,7 +1238,7 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     // once here rather than re-derived per row.
                     col.winFq.setSize(Fc.size(), scalar(0));
                     forAll(col.winFq, k) col.winFq[k] = Fc[k][0] + Fl[1][k];
-                    if (imposeMode_ == "starstate")
+                    if (imposeMode_ == "starstate" || imposeMode_ == "starsrc")
                     {
                         // THE STAR STATE.  Rusanov IS HLL with s_L = -lam_max
                         // and s_R = +lam_max, so its resolved middle state is
