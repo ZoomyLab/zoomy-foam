@@ -102,6 +102,7 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("relax", relax_);
     dict.readIfPresent("imposeMode", imposeMode_);
     dict.readIfPresent("qstarMode", qstarMode_);
+    dict.readIfPresent("pSub", pSub_);
     dict.readIfPresent("outputInterval", outInterval_);
     dict.readIfPresent("maxCo", maxCo_);
     dict.readIfPresent("maxAlphaCo", maxAlphaCo_);
@@ -1254,6 +1255,9 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     // once here rather than re-derived per row.
                     col.winFq.setSize(Fc.size(), scalar(0));
                     forAll(col.winFq, k) col.winFq[k] = Fc[k][0] + Fl[1][k];
+                    // the hydrostatic part OF THAT ROW, on the same pair
+                    col.winPrs = 0.25*param[0]*(qSwe[1]*qSwe[1]
+                                              + qVof[1]*qVof[1]);
                     if (imposeMode_ == "starstate" || imposeMode_ == "starsrc"
                      || imposeMode_ == "fluxmatch")
                     {
@@ -1573,8 +1577,10 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                         const scalar w = aCol[j]*dz;
                         W += w; S1 += w*uS[j]; S2 += w*uS[j]*uS[j];
                     }
-                    const scalar Fconv = (col.winFq.size() > 2)
-                        ? col.winFq[2] - 0.5*param[0]*hFill*hFill : 0.0;
+                    const scalar prs = (pSub_ == "star")
+                        ? 0.5*param[0]*hFill*hFill : col.winPrs;
+                    const scalar Fconv =
+                        (col.winFq.size() > 2) ? col.winFq[2] - prs : 0.0;
                     const scalar num = (W > SMALL)
                         ? Fconv - qEff*qEff/W : 0.0;
                     const scalar den = (W > SMALL) ? S2 - S1*S1/W : 0.0;

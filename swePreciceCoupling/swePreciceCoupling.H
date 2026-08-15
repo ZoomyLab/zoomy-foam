@@ -83,6 +83,12 @@ class swePreciceCoupling
         scalar winSrcQ = 0;
         scalar winSrcM = 0;
         scalar winWidth = 0;             // w_c = (sum magSf)/height [m]
+        //- fluxmatch: the hydrostatic part to subtract from the momentum row,
+        //  built the SAME two-point way the row itself is.  The row is a flux
+        //  of the PAIR (q_L,q_R); g h*^2/2 is a flux of the star state, which
+        //  is a different Riemann problem at the same face.  Mixing them is
+        //  what leaves F_conv below the Cauchy-Schwarz floor.
+        scalar winPrs = 0;
     };
 
     struct Interface
@@ -129,6 +135,12 @@ class swePreciceCoupling
     //  "riemann": full-state RP flux F(qSwe,qVof) — pair with
     //    preciceGhost=fullstate for benchmarking only.
     word qstarMode_ = "characteristic";
+    //- fluxmatch hydrostatic subtraction: "flux" (default) takes the
+    //  two-point average (g h_L^2 + g h_R^2)/4, consistent with the
+    //  two-point momentum row; "star" takes g h*^2/2 from the star
+    //  state.  The switch exists because the choice decides how often
+    //  the affine map is feasible at all.
+    word pSub_ = "flux";
     fileName configPath_;
     word participantName_;
     std::array<std::string, NF> readFields_;
