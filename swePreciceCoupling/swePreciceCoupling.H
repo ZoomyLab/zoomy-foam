@@ -251,6 +251,22 @@ class swePreciceCoupling
     //  an incompressible solver was a category error.
     bool alphaDirSwitch_ = false;
     bool imposeVertical_ = true;
+    //- do NOT drive the air.  The imposition loop writes Uin on every face of
+    //  the column, dry ones included, at the star profile clamped to its
+    //  surface value.  The mass accounting is weighted by alpha, which is zero
+    //  there, so the intake identity holds to 1e-16 and every mass measurement
+    //  ever made on this seam was blind to it -- while the patch expelled the
+    //  DRY faces' volume as well.  At h = 0.10 in an LY = 0.40 domain that is
+    //  0.4*0.495 = 0.198 m2/s of volumetric outflow against 0.0495 m2/s of
+    //  water: four fifths of it air, which the pressure solve must source, and
+    //  it does so with a return jet (+1.09 m/s measured against a -0.495 m/s
+    //  stream) that shears the free surface, smears alpha over two cells and
+    //  drags the water.  Setting this true leaves dry faces at the interior
+    //  value, so the air is governed by the interior as it is in the monolith.
+    //  Default false preserves the delivered path until it is re-measured on
+    //  both dam-break directions -- the uniform instrument alone never decides
+    //  a configuration.
+    bool dryFacesInterior_ = false;
     bool writePressure_ = false;
     //- water density for that condition; p_rgh here carries [1 -1 -2] (real
     //  pressure), not the kinematic form, so rho is needed explicitly.

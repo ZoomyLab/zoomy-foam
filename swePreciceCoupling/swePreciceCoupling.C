@@ -148,6 +148,7 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("writeAlpha", writeAlpha_);
     dict.readIfPresent("alphaDirSwitch", alphaDirSwitch_);
     dict.readIfPresent("imposeVertical", imposeVertical_);
+    dict.readIfPresent("dryFacesInterior", dryFacesInterior_);
     dict.readIfPresent("writePressure", writePressure_);
     dict.readIfPresent("rhoWater", rhoWater_);
     dict.readIfPresent("consistentWrite", consistentWrite_);
@@ -2453,6 +2454,16 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     Ut -= (Ut & nF)*nF;
                     Uin[f] = (phiF/aSf)*nF + Ut;
                     intake += -aCol[j]*(Uin[f] & SfP[f])*dz/aSf;
+                    // The air is not ours to drive.  aCol[j] == 0 above the
+                    // waterline, so the intake just accumulated is identical
+                    // either way and the assertion below is untouched -- that
+                    // is exactly why this cost nothing on any mass measurement
+                    // while it was expelling four fifths of the patch volume as
+                    // air.  Overwrite AFTER the accounting, never before.
+                    if (dryFacesInterior_ && aCol[j] <= SMALL)
+                    {
+                        Uin[f] = uPif[f];
+                    }
                 }
                 // THE ASSERTION, on the field that was actually written and
                 // not on the intermediate it was built from.  Roundoff only;
