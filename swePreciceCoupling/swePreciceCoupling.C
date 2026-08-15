@@ -3042,6 +3042,14 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 const scalar gMag = mag(gV.value());
                 const vectorField& cf =
                     mesh_.boundary()[I.patchID].Cf();
+                // A `mixed` p_rgh is REQUIRED for the per-panel switch: on a
+                // fixedValue patch, declining to write a panel freezes it at
+                // t = 0 rather than making it zero-gradient, and the inflow
+                // direction then collapses (measured, t = 0.45).
+                auto& pb = prgh.boundaryFieldRef()[I.patchID];
+                const bool pMixed = isA<mixedFvPatchField<scalar>>(pb);
+                scalarField pRef(pb.size(), scalar(0));
+                scalarField pFrac(pb.size(), scalar(1));
                 forAll(I.columns, cc)
                 {
                     const Column& cl = I.columns[cc];
@@ -3059,14 +3067,29 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                         // a condition that regime does not admit, and it is
                         // half of why switching only the velocity measured
                         // worse than committing to either row.
-                        if (mixedU_ && f < mgFrac_.size() && mgFrac_[f] > 0.5)
-                        {
-                            continue;           // case a/b: p_d is Neumann
-                        }
                         const scalar yF = cf[f] & I.gUp;
-                        prgh.boundaryFieldRef()[I.patchID][f] =
-                            (yF < zW) ? rhoWater_*gMag*zW : 0.0;
+                        pRef[f] = (yF < zW) ? rhoWater_*gMag*zW : 0.0;
+                        // case c/d take the pressure, a/b leave it to the
+                        // interior.  mgFrac_ is 1 where the velocity branch
+                        // enriched (a/b), so the pressure fraction is its
+                        // COMPLEMENT.  Writing the value and setting the
+                        // fraction to zero is not the same as not writing:
+                        // refValue is simply unused where the fraction is 0.
+                        pFrac[f] = (mixedU_ && f < mgFrac_.size()
+                                 && mgFrac_[f] > 0.5) ? 0.0 : 1.0;
                     }
+                }
+                if (pMixed)
+                {
+                    auto& pm = refCast<mixedFvPatchField<scalar>>(pb);
+                    pm.refValue() = pRef;
+                    pm.refGrad() = 0.0;
+                    pm.valueFraction() = pFrac;
+                    pm.evaluate();
+                }
+                else
+                {
+                    pb == pRef;          // fixedValue path, all panels written
                 }
             }
         }
