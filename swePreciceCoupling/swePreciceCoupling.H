@@ -147,6 +147,21 @@ class swePreciceCoupling
     //- write U and alpha as patch VALUES (default), or impose only the flux
     //  and let flux-derived patch types recompute them.  See the write site.
     bool writeState_ = true;
+    //- pin ONLY alpha, leaving the velocity to the flux-derived patch types.
+    //
+    //  writeState=yes imposes 80 numbers per column -- normal velocity from the
+    //  flux (legitimate: it is the Riemann answer), plus tangential v*, plus
+    //  vertical w*, plus alpha -- where a subcritical outflow admits ONE.  The
+    //  60 velocity numbers add no information the normal component does not
+    //  already carry, since phi_j = u*(zeta_j) alpha_j |S_j| is already
+    //  profile-weighted; w* is the weakest of all, a depth-averaged model
+    //  having no vertical velocity of its own.
+    //
+    //  writeState=no drops all 80 and the deficit falls (coefficient 9.03 ->
+    //  3.24), but alpha then drifts, and the momentum flux is 70-87 % pressure
+    //  term g h^2/2, so q_0 blows up.  This switch keeps the 20 that the
+    //  failure mode actually needs and drops the 60 that only over-constrain.
+    bool writeAlpha_ = false;
     //- scale the written column so its projection reproduces the flux the
     //  patch actually passed.  See the write site: measured ratio 0.9999.
     bool consistentWrite_ = false;

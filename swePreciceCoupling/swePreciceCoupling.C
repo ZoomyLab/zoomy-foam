@@ -68,6 +68,7 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("writeColumns", writeColumns_);
     dict.readIfPresent("writePhi", writePhi_);
     dict.readIfPresent("writeState", writeState_);
+    dict.readIfPresent("writeAlpha", writeAlpha_);
     dict.readIfPresent("consistentWrite", consistentWrite_);
     dict.readIfPresent("fwaveDelta", gFwaveDelta);
     if (dict.lookupOrDefault<Switch>("ledgerLog", false))
@@ -1818,6 +1819,15 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
         if (writeState_)
         {
             U.boundaryFieldRef()[I.patchID] == Uin;
+            alpha.boundaryFieldRef()[I.patchID] == alphaIn;
+        }
+        else if (writeAlpha_)
+        {
+            // Pin the depth and NOTHING else.  The velocity is left to the
+            // flux-derived patch types, which take the normal component from
+            // phi (already profile-weighted) and the tangential from the
+            // interior.  20 imposed numbers instead of 80, chosen so the ones
+            // kept are the ones q_0 depends on through g h^2/2.
             alpha.boundaryFieldRef()[I.patchID] == alphaIn;
         }
         // impose the FACE FLUX too: the segregated VoF advects alpha with
