@@ -150,6 +150,10 @@ class swePreciceCoupling
     //- fluxfit target: "charged" (Fc+Fl, what the results
     //  measure) or "fluct" (the bare VOF-side fluctuation D).
     word fitTarget_ = "charged";
+    //- fluxmodes trust region: |c_m| <= fitBound * max|u*|.  The
+    //  admissible SET, without which the fit trades lobes and
+    //  blows up an outflow seam.
+    scalar fitBound_ = 0.5;
     fileName configPath_;
     word participantName_;
     std::array<std::string, NF> readFields_;

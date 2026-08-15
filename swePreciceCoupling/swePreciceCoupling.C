@@ -133,6 +133,7 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("qstarMode", qstarMode_);
     dict.readIfPresent("pSub", pSub_);
     dict.readIfPresent("fitTarget", fitTarget_);
+    dict.readIfPresent("fitBound", fitBound_);
     dict.readIfPresent("outputInterval", outInterval_);
     dict.readIfPresent("maxCo", maxCo_);
     dict.readIfPresent("maxAlphaCo", maxAlphaCo_);
@@ -2007,6 +2008,7 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                         return Foam::sqrt(n2);
                     };
                     List<scalar> cf(NM, scalar(0));
+                    const scalar cBound = fitBound_*Foam::max(uMag, SMALL);
                     const scalar r0m = rnorm(cf);
                     for (label it = 0; it < 25; ++it)
                     {
@@ -2028,8 +2030,35 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                         for (int t = 0; t < 20; ++t)
                         {
                             List<scalar> ct(cf);
-                            for (int m = 1; m < NM; ++m) ct[m] -= step*gr[m];
-                            if (rnorm(ct) < rc) { cf = ct; moved = true; break; }
+                            for (int m = 1; m < NM; ++m)
+                            {
+                                ct[m] -= step*gr[m];
+                                // TRUST REGION.  The objective is constrained
+                                // -- three coefficients, mass eliminated -- but
+                                // the PROFILE is not: nothing in
+                                // u = u* + sum c_m phi_m requires u to keep its
+                                // sign.  Moments are integrals, so a large
+                                // positive lobe against a large negative one
+                                // hits the same q_0 as a smooth profile.  On an
+                                // OUTFLOW seam that is fatal: one face turning
+                                // negative admits inflow through part of the
+                                // patch and the Courant number ran to 6.4e10.
+                                ct[m] = Foam::max(-cBound,
+                                        Foam::min(cBound, ct[m]));
+                            }
+                            // ...and reject outright any profile that reverses
+                            // sign on a wet face relative to the column's own
+                            // discharge.  This is the admissible SET, which is
+                            // what was missing -- not a tighter objective.
+                            List<scalar> ut(nfM, scalar(0));
+                            build(ct, ut);
+                            bool signOk = true;
+                            const scalar sgn = (qEff >= 0) ? 1.0 : -1.0;
+                            forAll(col.faces, j)
+                                if (aCol[j] > 1e-3 && sgn*ut[j] < 0.0)
+                                { signOk = false; break; }
+                            if (signOk && rnorm(ct) < rc)
+                            { cf = ct; moved = true; break; }
                             step *= 0.5;
                         }
                         if (!moved) break;
