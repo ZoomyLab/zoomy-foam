@@ -2998,7 +2998,19 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     << "'.  Regenerate the case with FLUXBC=mintgenmix."
                     << exit(FatalError);
             }
-            alpha.boundaryFieldRef()[I.patchID] == alphaIn;
+            // alpha is NOT written here.  Table 5.2 makes alpha_1 a Dirichlet
+            // condition in case b ALONE -- supercritical inflow -- and
+            // zero-gradient in a, c and d.  Every case this seam runs is
+            // subcritical, so case b is never selected and writing alpha would
+            // impose a condition the regime does not admit.  That is precisely
+            // the error the unconditional write made: it put a case-b alpha on
+            // a case-a/c panel and came out worse than committing to either row
+            // (+32.9 % throttle against -0.308 %).
+            //
+            // f_alpha (his eq. 5.15, the linear fill from the peer water level)
+            // already exists as the geometric `alphaIn`; wiring it to a
+            // supercritical-inflow branch is the remaining piece and is
+            // UNEXERCISED by any case here.
         }
         else if (writeState_)
         {
@@ -3030,6 +3042,20 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     forAll(cl.faces, j)
                     {
                         const label f = cl.faces[j];
+                        // PER PANEL, when the regime switch is active.  Table
+                        // 5.2 makes p_d a Dirichlet condition in case c ALONE
+                        // -- subcritical flow OUT of the resolved domain --
+                        // and zero-gradient in a, b and d.  mgFrac_ carries
+                        // the regime the velocity branch decided: 1 = enrich
+                        // (inflow, a/b), 0 = the pressure owns the boundary
+                        // (outflow, c/d).  Imposing p_d on an INFLOW panel is
+                        // a condition that regime does not admit, and it is
+                        // half of why switching only the velocity measured
+                        // worse than committing to either row.
+                        if (mixedU_ && f < mgFrac_.size() && mgFrac_[f] > 0.5)
+                        {
+                            continue;           // case a/b: p_d is Neumann
+                        }
                         const scalar yF = cf[f] & I.gUp;
                         prgh.boundaryFieldRef()[I.patchID][f] =
                             (yF < zW) ? rhoWater_*gMag*zW : 0.0;
