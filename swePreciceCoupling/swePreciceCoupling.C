@@ -1259,7 +1259,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     col.winPrs = 0.25*param[0]*(qSwe[1]*qSwe[1]
                                               + qVof[1]*qVof[1]);
                     if (imposeMode_ == "starstate" || imposeMode_ == "starsrc"
-                     || imposeMode_ == "fluxmatch")
+                     || imposeMode_ == "fluxmatch"
+                     || imposeMode_ == "fluxshift")
                     {
                         // THE STAR STATE.  Rusanov IS HLL with s_L = -lam_max
                         // and s_R = +lam_max, so its resolved middle state is
@@ -1403,7 +1404,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                   || imposeMode_ == "fluxonly"
                   || imposeMode_ == "rawflux"
                   || imposeMode_ == "starsrc"
-                  || imposeMode_ == "fluxmatch")
+                  || imposeMode_ == "fluxmatch"
+                  || imposeMode_ == "fluxshift")
             {
                 // ══ STAR-STATE IMPOSITION ═══════════════════════════════════
                 // ONE independent quantity per face: the face flux phi_f.  U_f
@@ -1569,7 +1571,43 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 // reported, never floored: the run falls back to the pure
                 // renormalisation and says so.
                 bool fmDone = false;
-                if (imposeMode_ == "fluxmatch")
+                if (imposeMode_ == "fluxshift")
+                {
+                    // THE SHIFT, not the scale.  Subtracting g h^2/2 from the
+                    // momentum row to get F_conv is catastrophic cancellation:
+                    // the hydrostatic part is 89-97 % of the row, the
+                    // convective part 3-11 %, and the margin above the
+                    // Cauchy-Schwarz floor 0.004-0.4 %.  A relative error of
+                    // 1.7e-4 in h decides feasibility.  MEASURED.
+                    //
+                    // So do not subtract.  The convective momentum of the star
+                    // state is a quadratic form in its own moments,
+                    //     int u^2 dz = h ( ubar^2 + sum_k alpha_k^2 |phi_k|^2 ),
+                    // whose excess over h ubar^2 is a sum of squares -- never
+                    // below the floor, and never a difference of large numbers.
+                    // Taking THAT as the target gives A = 1 identically, and
+                    // the affine map collapses to
+                    //     u_j = u*_j + B,   B = (F_h - S1)/W.
+                    //
+                    // A shift leaves the variance -- hence the convective
+                    // momentum -- exactly as the star state produced it, while
+                    // hitting the mass row exactly.  The delivered
+                    // renormalisation instead SCALES, which multiplies that
+                    // momentum by s^2.  That is the whole difference.
+                    scalar W = 0, S1 = 0;
+                    forAll(col.faces, j)
+                    { const scalar w = aCol[j]*dz; W += w; S1 += w*uS[j]; }
+                    if (W > SMALL)
+                    {
+                        const scalar B = (qEff - S1)/W;
+                        forAll(col.faces, j) uS[j] = uS[j] + B;
+                        col.winScale = 1.0;
+                        fmDone = true;
+                        sFac = 1.0;
+                    }
+                    else { ++nFluxMatchFail_; }
+                }
+                else if (imposeMode_ == "fluxmatch")
                 {
                     scalar W = 0, S1 = 0, S2 = 0;
                     forAll(col.faces, j)
