@@ -1989,8 +1989,18 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                         scalar n2 = 0.0;
                         for (int k = 2; k < Model::n_dof_q; ++k)
                         {
-                            const scalar t = (k < col.winFq.size())
-                                ? col.winFq[k] : 0.0;
+                            // TARGET.  fitTarget=fc treats the seam as a
+                            // CONSERVATIVE system: the shared Riemann problem
+                            // yields one flux F_c and that is what a profile's
+                            // own flux F(P(u)) can be matched against, like
+                            // for like.  fitTarget=charged uses F_c + F_l,
+                            // which puts a fluctuation on one side of the
+                            // residual and none on the other -- the same
+                            // mismatch that makes the v2s q1/q2 metric read
+                            // 143 % fluctuation.
+                            const scalar t = (fitTarget_ == "fc")
+                                ? ((k < col.winFc.size()) ? col.winFc[k] : 0.0)
+                                : ((k < col.winFq.size()) ? col.winFq[k] : 0.0);
                             const scalar d2 = Fp[k][0] - t;
                             n2 += d2*d2;
                         }
