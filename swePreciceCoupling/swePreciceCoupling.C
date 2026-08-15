@@ -75,6 +75,22 @@ Foam::functionObjects::swePreciceCoupling::~swePreciceCoupling()
             << "back to the shape-free uniform profile.  Mass is still exact "
             << "there; the PROFILE is not the star state's." << endl;
     }
+    if (nFluxMatchFail_ > 0)
+    {
+        WarningInFunction << nl
+            << "[fluxmatch] " << nFluxMatchFail_ << " column-window(s) could "
+            << "not form the affine map and fell back to the mass-only "
+            << "renormalisation:" << nl
+            << "    " << nFlatShape_ << " with a FLAT star profile (zero "
+            << "variance -- an affine map cannot change a constant's "
+            << "momentum)," << nl
+            << "    " << nInfeasibleMom_ << " with F_conv < F_h^2/h (the "
+            << "charged momentum is below what ANY velocity distribution "
+            << "carries at that discharge -- the uniform profile is the "
+            << "minimum)." << nl
+            << "Mass is exact in both cases; the MOMENTUM row is not."
+            << endl;
+    }
     if (precice_ && !finalized_) precice_->finalize();
 }
 
@@ -1238,7 +1254,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     // once here rather than re-derived per row.
                     col.winFq.setSize(Fc.size(), scalar(0));
                     forAll(col.winFq, k) col.winFq[k] = Fc[k][0] + Fl[1][k];
-                    if (imposeMode_ == "starstate" || imposeMode_ == "starsrc")
+                    if (imposeMode_ == "starstate" || imposeMode_ == "starsrc"
+                     || imposeMode_ == "fluxmatch")
                     {
                         // THE STAR STATE.  Rusanov IS HLL with s_L = -lam_max
                         // and s_R = +lam_max, so its resolved middle state is
@@ -1381,7 +1398,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                   || imposeMode_ == "momentum"
                   || imposeMode_ == "fluxonly"
                   || imposeMode_ == "rawflux"
-                  || imposeMode_ == "starsrc")
+                  || imposeMode_ == "starsrc"
+                  || imposeMode_ == "fluxmatch")
             {
                 // ══ STAR-STATE IMPOSITION ═══════════════════════════════════
                 // ONE independent quantity per face: the face flux phi_f.  U_f
@@ -1507,7 +1525,85 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 // the profile, and the count is reported at the end of the run.
                 const scalar tiny = 1e-12*Foam::max(wetMeas*uMag, SMALL);
                 scalar sFac = 1.0;
-                if (imposeMode_ == "starsrc")
+                // fluxmatch: the affine map that carries BOTH rows ─────────────
+                // The renormalisation below is u = s*u*, one parameter, and it
+                // is spent entirely on the mass row -- nothing in the algorithm
+                // has ever tried to carry the momentum row.  Restore the shift
+                // and there are two:
+                //
+                //     u_j = A u*_j + B
+                //
+                // which is not an ansatz.  Minimising ||u - u*||^2_w subject to
+                // the two flux constraints gives Lagrange conditions
+                // w(u - u*) - lambda w - 2 mu w u = 0, whose solution IS affine.
+                // So this is the CLOSEST profile to the star state that carries
+                // what the Riemann problem charged, and the current mode is its
+                // B = 0 restriction.
+                //
+                // The VOF side cannot be handed the hydrostatic part: pressure
+                // is the projection's to determine, not the boundary's.  So the
+                // target is the CONVECTIVE row F_q0 - g h^2/2 alone, and only
+                // the part the patch can actually express is imposed.
+                //
+                // With w_j = alpha_j dz, W = sum w = h, S1 = sum w u*,
+                // S2 = sum w u*^2, the constraints close in one line:
+                //
+                //     A^2 = (F_conv - F_h^2/W) / (S2 - S1^2/W),
+                //     B   = (F_h - A S1)/W.
+                //
+                // Both sides are variances.  The denominator is the star
+                // profile's own, non-negative by Cauchy-Schwarz and zero only
+                // for a flat profile.  The numerator is non-negative only when
+                //
+                //     F_conv >= F_h^2/h,
+                //
+                // which is the exact statement that a profile carrying this
+                // mass can carry this momentum AT ALL -- the uniform profile is
+                // the minimum-momentum one.  Below it the seam is being charged
+                // a momentum no velocity distribution can deliver at that
+                // discharge.  That is a REAL infeasibility, counted and
+                // reported, never floored: the run falls back to the pure
+                // renormalisation and says so.
+                bool fmDone = false;
+                if (imposeMode_ == "fluxmatch")
+                {
+                    scalar W = 0, S1 = 0, S2 = 0;
+                    forAll(col.faces, j)
+                    {
+                        const scalar w = aCol[j]*dz;
+                        W += w; S1 += w*uS[j]; S2 += w*uS[j]*uS[j];
+                    }
+                    const scalar Fconv = (col.winFq.size() > 2)
+                        ? col.winFq[2] - 0.5*param[0]*hFill*hFill : 0.0;
+                    const scalar num = (W > SMALL)
+                        ? Fconv - qEff*qEff/W : 0.0;
+                    const scalar den = (W > SMALL) ? S2 - S1*S1/W : 0.0;
+                    const scalar vTiny = 1e-12*Foam::max(S2, SMALL);
+                    if (W > SMALL && den > vTiny && num > 0.0)
+                    {
+                        // sign: keep the profile's orientation, so that a
+                        // faster-at-the-surface star state stays that way.
+                        const scalar A = Foam::sqrt(num/den);
+                        const scalar B = (qEff - A*S1)/W;
+                        forAll(col.faces, j) uS[j] = A*uS[j] + B;
+                        col.winScale = A;
+                        fmDone = true;
+                        sFac = 1.0;
+                    }
+                    else
+                    {
+                        ++nFluxMatchFail_;
+                        if (W > SMALL && den <= vTiny) ++nFlatShape_;
+                        if (num <= 0.0) ++nInfeasibleMom_;
+                    }
+                }
+                if (fmDone)
+                {
+                    // nothing further: the affine map already hits the mass row
+                    // exactly, so a rescale on top would destroy the momentum
+                    // row it was solved for.
+                }
+                else if (imposeMode_ == "starsrc")
                 {
                     // NO renormalisation.  The star state is written as it
                     // comes out of the Riemann problem, which is the whole

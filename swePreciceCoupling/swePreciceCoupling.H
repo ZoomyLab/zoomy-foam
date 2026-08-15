@@ -221,6 +221,14 @@ class swePreciceCoupling
     //- columns whose reconstructed shape carried no mass to rescale
     //  (imposeMode=starstate).  Reported, never hidden.
     label nDegenShape_ = 0;
+    //- fluxmatch: columns where the affine map could not be formed.
+    //  nFlatShape_ is a star profile with no variance (an affine map
+    //  cannot change a constant's momentum); nInfeasibleMom_ is
+    //  F_conv < F_h^2/h, i.e. a momentum no velocity distribution can
+    //  carry at that discharge.  Distinct causes, counted apart.
+    label nFluxMatchFail_ = 0;
+    label nFlatShape_ = 0;
+    label nInfeasibleMom_ = 0;
     long winIdx_ = 0;               // completed-window counter
     scalar outInterval_;
     scalar lastWrite_;
