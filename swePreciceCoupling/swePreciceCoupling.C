@@ -1931,7 +1931,7 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                             if (aCol[j] <= SMALL) continue;   // dry: no weight
                             const label jz = Foam::min
                                 (nfF - 1, Foam::max(label(0),
-                                 label(Foam::round(zW[j]*(nfF - 1)))));
+                                 label(std::lround(zW[j]*(nfF - 1)))));
                             for (int k = 2; k < Model::n_dof_q; ++k)
                                 Cw[k][j] = Cz[k][jz];
                         }
