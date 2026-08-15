@@ -978,6 +978,30 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
     {
         const scalarField aPif(alpha.boundaryField()[I.patchID].patchInternalField());
         const vectorField uPif(U.boundaryField()[I.patchID].patchInternalField());
+        // THE RESOLVED PRESSURE at the patch, p = p_rgh + rho g.x, as
+        // OpenFOAM itself assembles it.  imposeMode nsfit needs the actual
+        // Navier-Stokes momentum flux through the face, and that flux carries
+        // p -- not a hydrostatic term reconstructed from a depth.  Note the
+        // canonical exchange column p is hardcoded to zero (writeBack), so
+        // this is LOCAL and is the only pressure in the system.
+        scalarField pPif(aPif.size(), scalar(0));
+        if (mesh_.foundObject<volScalarField>("p_rgh"))
+        {
+            const volScalarField& prghF =
+                mesh_.lookupObject<volScalarField>("p_rgh");
+            const scalarField prghP
+                (prghF.boundaryField()[I.patchID].patchInternalField());
+            const uniformDimensionedVectorField& gVv =
+                mesh_.lookupObject<uniformDimensionedVectorField>("g");
+            const vectorField& CfP = mesh_.boundary()[I.patchID].Cf();
+            const volScalarField& rhoF =
+                mesh_.foundObject<volScalarField>("rho")
+              ? mesh_.lookupObject<volScalarField>("rho") : alpha;
+            const scalarField rhoP
+                (rhoF.boundaryField()[I.patchID].patchInternalField());
+            forAll(pPif, f)
+                pPif[f] = prghP[f] + rhoP[f]*(gVv.value() & CfP[f]);
+        }
         // Riemann normal in MODEL axes: the into-domain direction expressed
         // in the exchange basis (the reduced model lives in the horizontal
         // (e1, e2) plane).  Historical +x interfaces: (1,0,0); a right-side
