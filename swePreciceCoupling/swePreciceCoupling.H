@@ -247,6 +247,9 @@ class swePreciceCoupling
     //- fluxnewton: how often the square solve for (h, q_0..q_N) closed.
     label nNewtonOk_ = 0;
     label nNewtonFail_ = 0;
+    label nNewtonStall_ = 0;
+    scalar sumRelRes_ = 0;
+    label nRelRes_ = 0;
     long winIdx_ = 0;               // completed-window counter
     scalar outInterval_;
     scalar lastWrite_;

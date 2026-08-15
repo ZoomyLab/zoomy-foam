@@ -75,11 +75,17 @@ Foam::functionObjects::swePreciceCoupling::~swePreciceCoupling()
             << "back to the shape-free uniform profile.  Mass is still exact "
             << "there; the PROFILE is not the star state's." << endl;
     }
-    if (nNewtonOk_ + nNewtonFail_ > 0)
+    if (nNewtonOk_ + nNewtonFail_ + nNewtonStall_ > 0)
     {
-        Info<< "[fluxnewton] F(q) = F* solved on " << nNewtonOk_
-            << " column-window(s), failed on " << nNewtonFail_
-            << " (no invertible Jacobian, or the step drove h <= 0)." << endl;
+        Info<< "[fluxnewton] F(q) = F* converged on " << nNewtonOk_
+            << ", STALLED OFF THE MANIFOLD on " << nNewtonStall_
+            << ", rejected on " << nNewtonFail_ << " column-window(s)." << nl
+            << "   mean relative distance to the nearest reachable flux: "
+            << ((nRelRes_ > 0) ? sumRelRes_/nRelRes_ : 0.0) << nl
+            << "   a nonzero distance means the charged flux is NOT F(q) for "
+            << "any single state -- it is a two-state numerical flux, and no "
+            << "boundary condition that imposes ONE state can carry it."
+            << endl;
     }
     if (nFluxMatchFail_ > 0)
     {
@@ -1328,7 +1334,16 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                             for (int k = 2; k < NQ; ++k) Ft[k] = col.winFq[k];
                             List<scalar> qN = qs;
                             bool ok = false;
-                            for (label it = 0; it < 12; ++it)
+                            // The residual is TRACKED, not just tested.  If
+                            // F* is a Rusanov flux of two DIFFERENT states it
+                            // is generally not F(q) for any single q -- the
+                            // target sits off the manifold and Newton stalls
+                            // at a finite distance.  That distance is the
+                            // answer to "can a boundary condition of this form
+                            // carry what the seam charged", so it is measured
+                            // rather than hidden behind a convergence flag.
+                            scalar rel0 = -1, relN = -1;
+                            for (label it = 0; it < 40; ++it)
                             {
                                 const auto Fq = Numerics::numerical_flux
                                     (qN, qN, qaux, qaux, param, nHat);
@@ -1340,8 +1355,9 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                                     rn = Foam::max(rn, Foam::mag(r(k-1)));
                                     sc = Foam::max(sc, Foam::mag(Ft[k]));
                                 }
-                                if (rn <= 1e-13*Foam::max(sc, SMALL))
-                                { ok = true; break; }
+                                relN = rn/Foam::max(sc, SMALL);
+                                if (rel0 < 0) rel0 = relN;
+                                if (relN <= 1e-10) { ok = true; break; }
                                 const auto Am =
                                     Model::quasilinear_matrix_x(qN, qaux, param);
                                 Eigen::Matrix<double, NQ-1, NQ-1> J;
@@ -1366,11 +1382,16 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                                     qN[k] += w*dq(k-1);
                                 if (qN[1] <= 1e-9) break;
                             }
-                            if (ok && qN[1] > 1e-9)
+                            if (qN[1] > 1e-9 && relN >= 0
+                             && relN <= Foam::max(rel0, scalar(0)))
                             {
+                                // best effort: the closest state on the
+                                // manifold is still a better target than the
+                                // star state when the target is unreachable.
                                 col.winQStar = qN;
                                 hFill = qN[1];
-                                ++nNewtonOk_;
+                                if (ok) ++nNewtonOk_; else ++nNewtonStall_;
+                                sumRelRes_ += relN; ++nRelRes_;
                             }
                             else { ++nNewtonFail_; }
                         }
