@@ -140,7 +140,10 @@ class swePreciceCoupling
     //  two-point momentum row; "star" takes g h*^2/2 from the star
     //  state.  The switch exists because the choice decides how often
     //  the affine map is feasible at all.
-    word pSub_ = "flux";
+    //  MEASURED: "flux" is WRONG.  By convexity (h_L^2+h_R^2)/2 >= h*^2, so
+    //  the two-point average subtracts MORE and drives F_conv further below
+    //  the floor -- infeasible windows went 89 -> 341 of 499.  Default "star".
+    word pSub_ = "star";
     fileName configPath_;
     word participantName_;
     std::array<std::string, NF> readFields_;
