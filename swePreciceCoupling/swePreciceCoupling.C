@@ -994,13 +994,23 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
             const uniformDimensionedVectorField& gVv =
                 mesh_.lookupObject<uniformDimensionedVectorField>("g");
             const vectorField& CfP = mesh_.boundary()[I.patchID].Cf();
-            const volScalarField& rhoF =
-                mesh_.foundObject<volScalarField>("rho")
-              ? mesh_.lookupObject<volScalarField>("rho") : alpha;
+            // KINEMATIC, against WATER density: the reduced model's
+            // momentum row is per unit mass of water, so p/rho_w is the
+            // consistent partner.  No alpha fallback -- alpha is a volume
+            // fraction, and using it as a density is how the first version
+            // came out 17 % wrong before a single fit iteration.
+            if (!mesh_.foundObject<volScalarField>("rho"))
+            {
+                FatalErrorInFunction
+                    << "[nsfit] no rho field: the NS momentum flux cannot be "
+                    << "assembled without it." << Foam::exit(Foam::FatalError);
+            }
             const scalarField rhoP
-                (rhoF.boundaryField()[I.patchID].patchInternalField());
+                (mesh_.lookupObject<volScalarField>("rho")
+                 .boundaryField()[I.patchID].patchInternalField());
             forAll(pPif, f)
-                pPif[f] = prghP[f] + rhoP[f]*(gVv.value() & CfP[f]);
+                pPif[f] = (prghP[f] + rhoP[f]*(gVv.value() & CfP[f]))
+                        / Foam::max(rhoWater_, SMALL);
         }
         // Riemann normal in MODEL axes: the into-domain direction expressed
         // in the exchange basis (the reduced model lives in the horizontal
@@ -1907,8 +1917,7 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                         forAll(col.faces, j)
                         {
                             const label f = col.faces[j];
-                            acc += Cw[k][j]*(uu[j]*uu[j]
-                                 + pPif[f]/Foam::max(rhoWater_, SMALL));
+                            acc += Cw[k][j]*(uu[j]*uu[j] + pPif[f]);
                         }
                         return hFill*acc;
                     };
@@ -1926,6 +1935,28 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                             n2 += d*d;
                         }
                         return Foam::sqrt(n2);
+                    };
+                    // exact mass FIRST, then every search step is made
+                    // mass-neutral, so the constraint is never applied on top
+                    // of a converged fit and cannot undo it.
+                    scalar Wm0 = 0.0, S1m0 = 0.0;
+                    forAll(col.faces, j)
+                    { const scalar w = aCol[j]*dz; Wm0 += w; S1m0 += w*uFit[j]; }
+                    if (Wm0 > SMALL)
+                    {
+                        const scalar B0 = (qEff - S1m0)/Wm0;
+                        forAll(col.faces, j) uFit[j] += B0;
+                    }
+                    auto massNeutral = [&](List<scalar>& uu)
+                    {
+                        scalar W2 = 0.0, S2m = 0.0;
+                        forAll(col.faces, j)
+                        { const scalar w = aCol[j]*dz; W2 += w; S2m += w*uu[j]; }
+                        if (W2 > SMALL)
+                        {
+                            const scalar B2 = (qEff - S2m)/W2;
+                            forAll(col.faces, j) uu[j] += B2;
+                        }
                     };
                     const scalar r00 = rnorm(uFit);
                     // Gauss-Newton in the SPAN OF THE MODEL BASIS: the
@@ -1957,22 +1988,14 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                             forAll(col.faces, j)
                                 for (int m = 0; m < NR; ++m)
                                     ut[j] -= step*g[m]*Cw[m+2][j]*nfF;
+                            massNeutral(ut);
                             const scalar rt = rnorm(ut);
                             if (rt < best) { uFit = ut; best = rt; moved = true; break; }
                             step *= 0.5;
                         }
                         if (!moved) break;
                     }
-                    // EXACT MASS on top, as a pure shift: it changes the mean
-                    // and not the shape, so it costs the fit the least.
-                    scalar Wm = 0.0, S1m = 0.0;
-                    forAll(col.faces, j)
-                    { const scalar w = aCol[j]*dz; Wm += w; S1m += w*uFit[j]; }
-                    if (Wm > SMALL)
-                    {
-                        const scalar B = (qEff - S1m)/Wm;
-                        forAll(col.faces, j) uFit[j] += B;
-                    }
+                    massNeutral(uFit);
                     forAll(col.faces, j) uS[j] = uFit[j];
                     sumRel0_ += r00; sumRelRes_ += rnorm(uFit); ++nRelRes_;
                     if (rnorm(uFit) < 0.999*r00) ++nNewtonOk_;
