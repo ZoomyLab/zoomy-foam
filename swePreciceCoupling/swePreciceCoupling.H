@@ -162,6 +162,20 @@ class swePreciceCoupling
     //  term g h^2/2, so q_0 blows up.  This switch keeps the 20 that the
     //  failure mode actually needs and drops the 60 that only over-constrain.
     bool writeAlpha_ = false;
+    //- MINTGEN-STYLE subcritical outflow: impose ONLY the hydrostatic pressure
+    //  taken from the peer's free surface, leaving velocity and alpha to
+    //  zero-gradient.  That is exactly the admissible condition count -- his
+    //  Table 5.1 gives ONE condition for 0 <= Fr_n < 1, the pressure p_d, with
+    //  du/dn = 0 and dalpha/dn = 0 -- against the 80 numbers writeState imposes.
+    //
+    //  OpenFOAM splits p = p_rgh + rho g.h, so for a hydrostatic column under a
+    //  free surface at z_w the two gravity terms cancel and
+    //      p_rgh = rho_w |g| z_w      (constant over the wetted patch)
+    //  with z_w = floorY + h_peer.  Dry faces are left at ~0.
+    bool writePressure_ = false;
+    //- water density for that condition; p_rgh here carries [1 -1 -2] (real
+    //  pressure), not the kinematic form, so rho is needed explicitly.
+    scalar rhoWater_ = 1000.0;
     //- scale the written column so its projection reproduces the flux the
     //  patch actually passed.  See the write site: measured ratio 0.9999.
     bool consistentWrite_ = false;

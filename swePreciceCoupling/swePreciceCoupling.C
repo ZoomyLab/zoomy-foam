@@ -69,6 +69,8 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("writePhi", writePhi_);
     dict.readIfPresent("writeState", writeState_);
     dict.readIfPresent("writeAlpha", writeAlpha_);
+    dict.readIfPresent("writePressure", writePressure_);
+    dict.readIfPresent("rhoWater", rhoWater_);
     dict.readIfPresent("consistentWrite", consistentWrite_);
     dict.readIfPresent("fwaveDelta", gFwaveDelta);
     if (dict.lookupOrDefault<Switch>("ledgerLog", false))
@@ -1820,6 +1822,38 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
         {
             U.boundaryFieldRef()[I.patchID] == Uin;
             alpha.boundaryFieldRef()[I.patchID] == alphaIn;
+        }
+        else if (writePressure_)
+        {
+            // MINTGEN-STYLE subcritical outflow: ONE condition, the hydrostatic
+            // pressure from the peer's free surface.  Velocity and alpha stay
+            // zero-gradient, so this is exactly the admissible count instead of
+            // the 80 numbers writeState imposes.
+            //
+            // p = p_rgh + rho g.h, so under a free surface at z_w the gravity
+            // terms cancel and p_rgh = rho_w |g| z_w over the wetted patch.
+            if (mesh_.foundObject<volScalarField>("p_rgh"))
+            {
+                volScalarField& prgh =
+                    mesh_.lookupObjectRef<volScalarField>("p_rgh");
+                const uniformDimensionedVectorField& gV =
+                    mesh_.lookupObject<uniformDimensionedVectorField>("g");
+                const scalar gMag = mag(gV.value());
+                const vectorField& cf =
+                    mesh_.boundary()[I.patchID].Cf();
+                forAll(I.columns, cc)
+                {
+                    const Column& cl = I.columns[cc];
+                    const scalar zW = cl.floorY + cl.winHFill;
+                    forAll(cl.faces, j)
+                    {
+                        const label f = cl.faces[j];
+                        const scalar yF = cf[f] & I.gUp;
+                        prgh.boundaryFieldRef()[I.patchID][f] =
+                            (yF < zW) ? rhoWater_*gMag*zW : 0.0;
+                    }
+                }
+            }
         }
         else if (writeAlpha_)
         {
