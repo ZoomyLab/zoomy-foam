@@ -153,7 +153,11 @@ class swePreciceCoupling
     //- fluxmodes trust region: |c_m| <= fitBound * max|u*|.  The
     //  admissible SET, without which the fit trades lobes and
     //  blows up an outflow seam.
-    scalar fitBound_ = 0.5;
+    scalar fitBound_ = 0.0;      // 0 = no trust region
+    //- fluxmodes base: "interior" = the VOF's own column
+    //  P(u_vof), admissible by construction; "star" = the lift.
+    word fitBase_ = "interior";
+    bool fitSign_ = false;
     fileName configPath_;
     word participantName_;
     std::array<std::string, NF> readFields_;

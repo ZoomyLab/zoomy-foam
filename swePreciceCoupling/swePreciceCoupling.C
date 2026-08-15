@@ -134,6 +134,8 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("pSub", pSub_);
     dict.readIfPresent("fitTarget", fitTarget_);
     dict.readIfPresent("fitBound", fitBound_);
+    dict.readIfPresent("fitBase", fitBase_);
+    dict.readIfPresent("fitSign", fitSign_);
     dict.readIfPresent("outputInterval", outInterval_);
     dict.readIfPresent("maxCo", maxCo_);
     dict.readIfPresent("maxAlphaCo", maxAlphaCo_);
@@ -1987,8 +1989,16 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                             Model::project_from_3d(pr, param);
                         const auto Fp = Numerics::numerical_flux
                             (qP, qP, qaux, qaux, param, nHat);
+                        // SQUARE.  Free coefficients are NM-1 (mass takes
+                        // one), so retain exactly that many momentum rows and
+                        // drop the HIGHEST first -- q_2 before q_1.  An
+                        // over-determined fit has to trade rows against each
+                        // other, which is why q_2 degraded whenever q_0
+                        // improved; a square one does not.
+                        const int kEnd =
+                            Foam::min(Model::n_dof_q, 2 + Foam::max(1, NM - 1));
                         scalar n2 = 0.0;
-                        for (int k = 2; k < Model::n_dof_q; ++k)
+                        for (int k = 2; k < kEnd; ++k)
                         {
                             // TARGET.  fitTarget=fc treats the seam as a
                             // CONSERVATIVE system: the shared Riemann problem
@@ -2007,6 +2017,17 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                         }
                         return Foam::sqrt(n2);
                     };
+                    // BASE PROFILE.  fitBase=interior starts from the VOF's
+                    // own column P(u_vof) -- a state the resolved side is
+                    // already carrying, hence admissible by construction.
+                    // That is a better admissible-set guarantee than a trust
+                    // region: the bound rescued the outflow direction but
+                    // throttled the inflow one straight back to starstate
+                    // (s2v q0 1.26 -> 12.61), i.e. it clipped the correction
+                    // that was working.
+                    if (fitBase_ == "interior")
+                        forAll(col.faces, j)
+                            uS[j] = uPif[col.faces[j]] & I.nStream;
                     List<scalar> cf(NM, scalar(0));
                     const scalar cBound = fitBound_*Foam::max(uMag, SMALL);
                     const scalar r0m = rnorm(cf);
@@ -2043,8 +2064,9 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                                 // OUTFLOW seam that is fatal: one face turning
                                 // negative admits inflow through part of the
                                 // patch and the Courant number ran to 6.4e10.
-                                ct[m] = Foam::max(-cBound,
-                                        Foam::min(cBound, ct[m]));
+                                if (fitBound_ > 0)
+                                    ct[m] = Foam::max(-cBound,
+                                            Foam::min(cBound, ct[m]));
                             }
                             // ...and reject outright any profile that reverses
                             // sign on a wet face relative to the column's own
@@ -2053,10 +2075,13 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                             List<scalar> ut(nfM, scalar(0));
                             build(ct, ut);
                             bool signOk = true;
-                            const scalar sgn = (qEff >= 0) ? 1.0 : -1.0;
-                            forAll(col.faces, j)
-                                if (aCol[j] > 1e-3 && sgn*ut[j] < 0.0)
-                                { signOk = false; break; }
+                            if (fitSign_)
+                            {
+                                const scalar sgn = (qEff >= 0) ? 1.0 : -1.0;
+                                forAll(col.faces, j)
+                                    if (aCol[j] > 1e-3 && sgn*ut[j] < 0.0)
+                                    { signOk = false; break; }
+                            }
                             if (signOk && rnorm(ct) < rc)
                             { cf = ct; moved = true; break; }
                             step *= 0.5;
