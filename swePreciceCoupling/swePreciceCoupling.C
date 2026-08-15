@@ -1524,7 +1524,13 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     const scalar mPrs0 = 0.5*param[0]*hFill*hFill;
                     col.winWidth = colArea/Foam::max(col.height, SMALL);
                     col.winSrcQ  = qEff - intake0;
-                    col.winSrcM  = col.winFq0 - (mAdv0 + mPrs0);
+                    // winSrcM is NOT set here.  It is the patch-referenced
+                    // deficit and is booked below, after the state has actually
+                    // been written, from the same projection the results are
+                    // measured with.  mAdv0/mPrs0 remain only as the column's
+                    // own accounting, which is a different and much smaller
+                    // number.
+                    (void)mAdv0; (void)mPrs0;
                 }
                 else if (imposeMode_ == "momentum")
                 {
@@ -1734,7 +1740,16 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
             // interface Riemann problem against the momentum the inlet
             // carries — the number nobody has measured, because nothing on
             // either side imposes it.
-            if (starLog_.valid())
+            //
+            // imposeMode starsrc ALSO reads its momentum-source rate out of
+            // this block, so it must not be gated on a logging switch alone.
+            // The rate it needs is the PATCH-referenced deficit
+            //     F_q0(charged) - F_q0(patch),
+            // i.e. exactly the number the results report -- NOT the column's
+            // own (F_q0 - M_adv - M_prs), which averages 0.02 % of the row
+            // against the 0.84 % the patch projection measures.  Feeding the
+            // source the smaller of the two made it forty times too weak.
+            if (starLog_.valid() || imposeMode_ == "starsrc")
             {
                 const scalar dzC = col.height/Foam::max(1, col.faces.size());
                 scalar qImp = 0.0, mAdv = 0.0;
@@ -1837,7 +1852,17 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                         forAll(carriedPatch, k) carriedPatch[k] = Fp[k][0];
                     }
                 }
+                if (imposeMode_ == "starsrc" && carriedPatch.size() > 2
+                 && col.winFq.size() > 2)
+                {
+                    // Deadbeat, one window late by construction: this is
+                    // measured on the state just imposed and spent during the
+                    // next window.  A body force cannot be an identity the way
+                    // the renormalisation is.
+                    col.winSrcM = col.winFq[2] - carriedPatch[2];
+                }
                 const label nR = col.winFq.size();
+                if (!starLog_.valid()) { continue; }
                 starLog_() << winIdx_ << "," << mesh_.time().value() << ","
                     << c << "," << imposeMode_ << "," << col.curTarget << ","
                     << qImp << "," << (qImp - col.curRate) << ","
