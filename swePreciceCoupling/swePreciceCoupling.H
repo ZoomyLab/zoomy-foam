@@ -75,6 +75,14 @@ class swePreciceCoupling
         //  on the wrong side is invisible in the fields it writes.
         scalar winFr = 0;
         label  winRegime = 0;
+        //- imposeMode starsrc: the two MEANS the source route has to supply.
+        //  winSrcQ is the volumetric rate [m^2/s] the UNSCALED star state
+        //  fails to carry, winSrcM the momentum row [m^3/s^2] it fails to
+        //  carry.  Both are per column width; winWidth converts them.  Zero in
+        //  every other mode -- the source route is the only consumer.
+        scalar winSrcQ = 0;
+        scalar winSrcM = 0;
+        scalar winWidth = 0;             // w_c = (sum magSf)/height [m]
     };
 
     struct Interface

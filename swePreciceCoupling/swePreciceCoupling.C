@@ -12,6 +12,31 @@
 // File scope so both read() and fwaveFlux see it, and declared BEFORE read().
 static Foam::scalar gFwaveDelta = 0.2;
 
+// ── SOURCE-ROUTE CHANNEL ────────────────────────────────────────────────────
+// imposeMode starsrc writes the seam's star state and does NOT renormalise it,
+// so the column carries neither the mass nor the momentum the reduced side
+// charged.  The two means are handed to OpenFOAM's own fvModels instead of
+// being forced into the boundary condition: a volumeSource takes the mass rate
+// and a semiImplicitSource takes the momentum rate, both through a `coded`
+// Function1 that links this library and calls the accessors below.
+//
+// A shared symbol rather than the object registry because Function1 has no
+// registry handle -- it is constructed from a name and a dictionary only, and
+// sees nothing but its argument x.  Single-mesh, single-interface by
+// construction: the accessors return the seam TOTAL, which is what a mean
+// correction over a cell band consumes.
+static double gSeamSrcVolRate = 0.0;   // [m^3/s]   water volume per second
+static double gSeamSrcMomRate = 0.0;   // [m^4/s^2] streamwise momentum/density
+static double gSeamSrcNormal[3] = {1.0, 0.0, 0.0};   // into-domain streamwise
+
+extern "C"
+{
+    double zoomySeamVolRate() { return gSeamSrcVolRate; }
+    double zoomySeamMomRate() { return gSeamSrcMomRate; }
+    double zoomySeamNormal(int i)
+    { return (i >= 0 && i < 3) ? gSeamSrcNormal[i] : 0.0; }
+}
+
 namespace Foam
 {
 namespace functionObjects
@@ -1355,7 +1380,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
             else if (imposeMode_ == "starstate" || imposeMode_ == "charswitch"
                   || imposeMode_ == "momentum"
                   || imposeMode_ == "fluxonly"
-                  || imposeMode_ == "rawflux")
+                  || imposeMode_ == "rawflux"
+                  || imposeMode_ == "starsrc")
             {
                 // ══ STAR-STATE IMPOSITION ═══════════════════════════════════
                 // ONE independent quantity per face: the face flux phi_f.  U_f
@@ -1481,7 +1507,26 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 // the profile, and the count is reported at the end of the run.
                 const scalar tiny = 1e-12*Foam::max(wetMeas*uMag, SMALL);
                 scalar sFac = 1.0;
-                if (imposeMode_ == "momentum")
+                if (imposeMode_ == "starsrc")
+                {
+                    // NO renormalisation.  The star state is written as it
+                    // comes out of the Riemann problem, which is the whole
+                    // point: the boundary condition stops being asked to carry
+                    // a conservation statement it cannot express, and the two
+                    // means it then misses become source terms in the interior.
+                    // Both deficits are booked here and consumed by fvModels.
+                    scalar mAdv0 = 0.0, colArea = 0.0;
+                    forAll(col.faces, j)
+                    {
+                        mAdv0 += uS[j]*uS[j]*aCol[j]*dz;
+                        colArea += magSfP[col.faces[j]];
+                    }
+                    const scalar mPrs0 = 0.5*param[0]*hFill*hFill;
+                    col.winWidth = colArea/Foam::max(col.height, SMALL);
+                    col.winSrcQ  = qEff - intake0;
+                    col.winSrcM  = col.winFq0 - (mAdv0 + mPrs0);
+                }
+                else if (imposeMode_ == "momentum")
                 {
                     // DIAGNOSTIC MODE, NOT A PRODUCTION PATH.  Renormalise the
                     // shape so the imposed MOMENTUM row matches what the SME
@@ -1544,7 +1589,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 // mass identity below is expected NOT to hold there -- that is
                 // the point of the diagnostic, not a defect.
                 const scalar resid = intake - qEff;
-                if (imposeMode_ != "momentum" && Foam::mag(resid)
+                if (imposeMode_ != "momentum" && imposeMode_ != "starsrc"
+                 && Foam::mag(resid)
                   > 1e-10*Foam::max(Foam::mag(qEff), SMALL) + 1e-18)
                 {
                     FatalErrorInFunction
@@ -1896,6 +1942,34 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
             forAll(phiIn, f) phiIn[f] = Uin[f] & SfP[f];
             phiF.boundaryFieldRef()[I.patchID] == phiIn;
         }
+    }
+    // ── hand the two means to the source route ──────────────────────────────
+    // Summed over every column of every interface and converted from
+    // per-column-width to absolute by w_c, because a volumeSource takes a
+    // volumetric flow rate and a semiImplicitSource an absolute force.  Set
+    // unconditionally so a mode change cannot leave a stale rate running.
+    if (imposeMode_ == "starsrc")
+    {
+        scalar qSum = 0.0, mSum = 0.0;
+        forAll(interfaces_, ii)
+        {
+            for (const Column& cl : interfaces_[ii].columns)
+            {
+                qSum += cl.winSrcQ*cl.winWidth;
+                mSum += cl.winSrcM*cl.winWidth;
+            }
+            const vector& nS = interfaces_[ii].nStream;
+            gSeamSrcNormal[0] = nS.x();
+            gSeamSrcNormal[1] = nS.y();
+            gSeamSrcNormal[2] = nS.z();
+        }
+        gSeamSrcVolRate = qSum;
+        gSeamSrcMomRate = mSum;
+    }
+    else
+    {
+        gSeamSrcVolRate = 0.0;
+        gSeamSrcMomRate = 0.0;
     }
     // Window-freeze applies per WINDOW, not per interface: clearing inside
     // the interface loop would hand every interface after the first a stale
