@@ -1341,7 +1341,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                      || imposeMode_ == "fluxshift"
                      || imposeMode_ == "fluxnewton"
                      || imposeMode_ == "fluxfit"
-                     || imposeMode_ == "nsfit")
+                     || imposeMode_ == "nsfit"
+                     || imposeMode_ == "fluxmodes")
                     {
                         // THE STAR STATE.  Rusanov IS HLL with s_L = -lam_max
                         // and s_R = +lam_max, so its resolved middle state is
@@ -1720,7 +1721,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                   || imposeMode_ == "fluxshift"
                   || imposeMode_ == "fluxnewton"
                   || imposeMode_ == "fluxfit"
-                  || imposeMode_ == "nsfit")
+                  || imposeMode_ == "nsfit"
+                  || imposeMode_ == "fluxmodes")
             {
                 // ══ STAR-STATE IMPOSITION ═══════════════════════════════════
                 // ONE independent quantity per face: the face flux phi_f.  U_f
@@ -1886,7 +1888,139 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 // reported, never floored: the run falls back to the pure
                 // renormalisation and says so.
                 bool fmDone = false;
-                if (imposeMode_ == "nsfit")
+                if (imposeMode_ == "fluxmodes")
+                {
+                    // ══ BEST APPROXIMATION OF THE FULL PROFILE ══════════════
+                    // fluxmatch is u = A u* + B: two scalars, so exactly two
+                    // constraints -- mass and the MEAN momentum.  q_1 and q_2
+                    // are then whatever the stretched profile happens to give,
+                    // and they get WORSE (s2v q_1 25.97 -> 32.02) while q_0
+                    // improves.  That is a trade, not a fit.
+                    //
+                    // Here the correction carries ONE COEFFICIENT PER MOMENT,
+                    //     u_j = u*_j + sum_m c_m phi_m(zeta_j),
+                    // which is what the Lagrange conditions give when every
+                    // flux row gets its own multiplier: the correction lives
+                    // in the span of the model's own basis, c = A^T mu.
+                    //
+                    // phi_m is not assumed -- it is READ OFF the model by
+                    // lifting a unit moment vector and subtracting the zero
+                    // lift, so it stays correct if the model changes.
+                    //
+                    // Mass is eliminated ANALYTICALLY (it is linear in c and
+                    // is the one property worth keeping exact), leaving the
+                    // remaining coefficients to least-squares the momentum
+                    // rows.  Gauss-Newton with a finite-difference Jacobian of
+                    // the residual itself, so residual and Jacobian cannot
+                    // disagree.
+                    const label nfM = col.faces.size();
+                    const int NM = Model::n_dof_q - 2;      // q_0 .. q_N
+                    List<List<scalar>> phi(NM, List<scalar>(nfM, scalar(0)));
+                    {
+                        List<scalar> z0(Model::n_dof_q, scalar(0));
+                        z0[1] = hFill;
+                        const auto p0 =
+                            Model::interpolate_to_3d(z0, qaux, param, zW);
+                        for (int m = 0; m < NM; ++m)
+                        {
+                            List<scalar> em(z0);
+                            em[2+m] = 1.0;
+                            const auto pm =
+                                Model::interpolate_to_3d(em, qaux, param, zW);
+                            forAll(col.faces, j)
+                            {
+                                const vector ub =
+                                    (pm[j][2]-p0[j][2])*I.eH1
+                                  + (pm[j][3]-p0[j][3])*I.eH2
+                                  + (pm[j][4]-p0[j][4])*I.gUp;
+                                phi[m][j] = ub & I.nStream;
+                            }
+                        }
+                    }
+                    // mass row is linear in c:  sum_j w_j u_j = S1 + sum_m c_m G_m
+                    List<scalar> Gm(NM, scalar(0));
+                    scalar Wm = 0, S1m = 0;
+                    forAll(col.faces, j)
+                    {
+                        const scalar w = aCol[j]*dz;
+                        Wm += w; S1m += w*uS[j];
+                        for (int m = 0; m < NM; ++m) Gm[m] += w*phi[m][j];
+                    }
+                    // c_0 absorbs the mass constraint; c_1..c_{NM-1} are free
+                    const scalar g0 = Gm[0];
+                    auto build = [&](const List<scalar>& cf, List<scalar>& uu)
+                    {
+                        scalar rest = 0.0;
+                        for (int m = 1; m < NM; ++m) rest += cf[m]*Gm[m];
+                        const scalar c0 = (Foam::mag(g0) > SMALL)
+                            ? (qEff - S1m - rest)/g0 : 0.0;
+                        forAll(col.faces, j)
+                        {
+                            uu[j] = uS[j] + c0*phi[0][j];
+                            for (int m = 1; m < NM; ++m)
+                                uu[j] += cf[m]*phi[m][j];
+                        }
+                    };
+                    auto rnorm = [&](const List<scalar>& cf)
+                    {
+                        List<scalar> uu(nfM, scalar(0));
+                        build(cf, uu);
+                        List<List<scalar>> pr(nfM, List<scalar>(NF, scalar(0)));
+                        forAll(col.faces, j)
+                        {
+                            pr[j][0] = col.floorY; pr[j][1] = hFill;
+                            pr[j][2] = uu[j]*(I.nStream & I.eH1);
+                            pr[j][3] = uu[j]*(I.nStream & I.eH2);
+                            pr[j][4] = 0.0;
+                        }
+                        const List<scalar> qP =
+                            Model::project_from_3d(pr, param);
+                        const auto Fp = Numerics::numerical_flux
+                            (qP, qP, qaux, qaux, param, nHat);
+                        scalar n2 = 0.0;
+                        for (int k = 2; k < Model::n_dof_q; ++k)
+                        {
+                            const scalar t = (k < col.winFq.size())
+                                ? col.winFq[k] : 0.0;
+                            const scalar d2 = Fp[k][0] - t;
+                            n2 += d2*d2;
+                        }
+                        return Foam::sqrt(n2);
+                    };
+                    List<scalar> cf(NM, scalar(0));
+                    const scalar r0m = rnorm(cf);
+                    for (label it = 0; it < 25; ++it)
+                    {
+                        const scalar rc = rnorm(cf);
+                        List<scalar> gr(NM, scalar(0));
+                        scalar gn = 0.0;
+                        for (int m = 1; m < NM; ++m)
+                        {
+                            List<scalar> cp(cf);
+                            const scalar eps = 1e-6*Foam::max(uMag, scalar(1e-6));
+                            cp[m] += eps;
+                            gr[m] = (rnorm(cp) - rc)/eps;
+                            gn += gr[m]*gr[m];
+                        }
+                        if (gn < SMALL) break;
+                        scalar step = rc/gn; bool moved = false;
+                        for (int t = 0; t < 20; ++t)
+                        {
+                            List<scalar> ct(cf);
+                            for (int m = 1; m < NM; ++m) ct[m] -= step*gr[m];
+                            if (rnorm(ct) < rc) { cf = ct; moved = true; break; }
+                            step *= 0.5;
+                        }
+                        if (!moved) break;
+                    }
+                    List<scalar> uFin(nfM, scalar(0));
+                    build(cf, uFin);
+                    forAll(col.faces, j) uS[j] = uFin[j];
+                    sumRel0_ += r0m; sumRelRes_ += rnorm(cf); ++nRelRes_;
+                    if (rnorm(cf) < 0.999*r0m) ++nNewtonOk_; else ++nNewtonStall_;
+                    col.winScale = 1.0; fmDone = true; sFac = 1.0;
+                }
+                else if (imposeMode_ == "nsfit")
                 {
                     // ══ FIT THE NAVIER-STOKES FLUX, NOT THE MODEL FLUX ══════
                     // D is the flux the reduced side wants the resolved side
