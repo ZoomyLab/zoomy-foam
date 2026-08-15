@@ -172,6 +172,18 @@ class swePreciceCoupling
     //  free surface at z_w the two gravity terms cancel and
     //      p_rgh = rho_w |g| z_w      (constant over the wetted patch)
     //  with z_w = floorY + h_peer.  Dry faces are left at ~0.
+    //- impose the LIFTED VERTICAL velocity w* at the patch (default), or
+    //  leave the vertical component to the interior.
+    //
+    //  w* is the least defensible of the imposed components: a depth-averaged
+    //  model carries no vertical velocity of its own, so w* is manufactured by
+    //  the lift and then written onto the boundary as if it were data.  Mintgen
+    //  never supplies one (his eq. 5.18 gives u_i for i = 1,2 only).
+    //
+    //  Dropping it CANNOT change mass: the intake is U & Sf and Sf is along the
+    //  face normal, so only the normal component enters.  It removes N_zeta
+    //  imposed numbers per column at zero cost to the conservation statement.
+    bool imposeVertical_ = true;
     bool writePressure_ = false;
     //- water density for that condition; p_rgh here carries [1 -1 -2] (real
     //  pressure), not the kinematic form, so rho is needed explicitly.

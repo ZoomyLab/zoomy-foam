@@ -69,6 +69,7 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("writePhi", writePhi_);
     dict.readIfPresent("writeState", writeState_);
     dict.readIfPresent("writeAlpha", writeAlpha_);
+    dict.readIfPresent("imposeVertical", imposeVertical_);
     dict.readIfPresent("writePressure", writePressure_);
     dict.readIfPresent("rhoWater", rhoWater_);
     dict.readIfPresent("consistentWrite", consistentWrite_);
@@ -1520,7 +1521,9 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     const scalar aSf = Foam::max(magSfP[f], SMALL);
                     const vector nF = SfP[f]/aSf;
                     const scalar phiF = -sFac*uS[j]*aSf;
-                    vector Ut = sFac*(vS[j]*I.tHat + wS[j]*I.gUp);
+                    vector Ut = sFac*vS[j]*I.tHat
+                        + (imposeVertical_ ? sFac*wS[j] : (uPif[f] & I.gUp))
+                          *I.gUp;
                     Ut -= (Ut & nF)*nF;
                     Uin[f] = (phiF/aSf)*nF + Ut;
                     intake += -aCol[j]*(Uin[f] & SfP[f])*dz/aSf;
