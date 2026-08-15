@@ -2792,6 +2792,26 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                         hAct +=
                             alpha.boundaryField()[I.patchID][col.faces[j]]*dzA;
                 }
+                // ON THE WATER ZETA GRID, not the domain face grid.
+                //
+                // project_from_3d samples a column of WATER: row j is the
+                // profile at the kernel's own node zeta_j = j/(nf-1) over
+                // [0, h].  Filling it face by face hands it the FULL PATCH
+                // HEIGHT with the air velocities included, so it integrates
+                // air as if it were water.  `aAct` was even read and then
+                // never used.
+                //
+                // That is why these rows moved 1.06 -> 25.22 % the moment the
+                // dry-face treatment changed what the air carries: the
+                // diagnostic was measuring the air, not the seam.  It is the
+                // same defect already fixed in the fluxfit weights, where
+                // indexing on the face grid instead of the water grid started
+                // 28 % off before a single iteration.
+                //
+                // Gather the WET samples on their water-relative zeta, then
+                // interpolate onto the kernel's nodes.
+                const label nfA = col.faces.size();
+                DynamicList<scalar> zW_(nfA), uW_(nfA), vW_(nfA), wW_(nfA);
                 forAll(col.faces, j)
                 {
                     const label f = col.faces[j];
@@ -2807,11 +2827,41 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                     const scalar aAct = writeState_
                         ? alphaIn[f]
                         : alpha.boundaryField()[I.patchID][f];
+                    if (aAct <= 1e-3) continue;          // dry: not water
+                    zW_.append((hAct > SMALL)
+                        ? Foam::min(I.sigmaF[f]*col.height/hAct, scalar(1))
+                        : scalar(0));
+                    uW_.append(uAct & I.eH1);
+                    vW_.append(uAct & I.eH2);
+                    wW_.append(uAct & I.gUp);
+                }
+                for (label j = 0; j < nfA; ++j)
+                {
                     impProf[j][0] = col.floorY;
                     impProf[j][1] = hAct;
-                    impProf[j][2] = uAct & I.eH1;
-                    impProf[j][3] = uAct & I.eH2;
-                    impProf[j][4] = uAct & I.gUp;
+                    if (zW_.size() == 0)                 // wholly dry column
+                    {
+                        impProf[j][2] = impProf[j][3] = impProf[j][4] = 0.0;
+                        continue;
+                    }
+                    const scalar zk = (nfA > 1)
+                        ? scalar(j)/scalar(nfA - 1) : scalar(0);
+                    // piecewise-linear in zeta, clamped at both ends
+                    label k = 0;
+                    while (k + 1 < zW_.size() && zW_[k + 1] < zk) ++k;
+                    scalar wgt = 0.0;
+                    if (k + 1 < zW_.size())
+                    {
+                        const scalar dz0 = zW_[k + 1] - zW_[k];
+                        wgt = (dz0 > SMALL)
+                            ? Foam::min(scalar(1),
+                                Foam::max(scalar(0), (zk - zW_[k])/dz0))
+                            : 0.0;
+                    }
+                    const label k1 = Foam::min(k + 1, zW_.size() - 1);
+                    impProf[j][2] = (1 - wgt)*uW_[k] + wgt*uW_[k1];
+                    impProf[j][3] = (1 - wgt)*vW_[k] + wgt*vW_[k1];
+                    impProf[j][4] = (1 - wgt)*wW_[k] + wgt*wW_[k1];
                 }
                 List<scalar> carried;
                 if (hFill > SMALL)
