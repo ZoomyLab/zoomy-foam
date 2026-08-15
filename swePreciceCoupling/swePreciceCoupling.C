@@ -1888,8 +1888,17 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 // reported, never floored: the run falls back to the pure
                 // renormalisation and says so.
                 bool fmDone = false;
-                if (imposeMode_ == "fluxmodes")
+                if (imposeMode_ == "fluxmodes"
+                 && hFill > SMALL && wetMeas > SMALL && uMag > SMALL)
                 {
+                    // GUARDED.  interpolate_to_3d divides by h, and the very
+                    // first imposeInflow() runs from the CONSTRUCTOR with the
+                    // seam still dry -- hFill = 0 there, which raised sigFpe
+                    // inside setupPrecice() before a single timestep.  The
+                    // existing star lift carries the same guard; this block
+                    // needs it too.  A degenerate column falls through to the
+                    // plain renormalisation, which is mass-exact and says
+                    // nothing about the profile -- the honest fallback.
                     // ══ BEST APPROXIMATION OF THE FULL PROFILE ══════════════
                     // fluxmatch is u = A u* + B: two scalars, so exactly two
                     // constraints -- mass and the MEAN momentum.  q_1 and q_2
@@ -2002,8 +2011,10 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                             gr[m] = (rnorm(cp) - rc)/eps;
                             gn += gr[m]*gr[m];
                         }
-                        if (gn < SMALL) break;
-                        scalar step = rc/gn; bool moved = false;
+                        if (gn < 1e-30 || !(rc > 0)) break;
+                        scalar step = rc/gn;
+                        if (!std::isfinite(step)) break;
+                        bool moved = false;
                         for (int t = 0; t < 20; ++t)
                         {
                             List<scalar> ct(cf);
