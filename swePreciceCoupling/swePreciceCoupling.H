@@ -72,6 +72,15 @@ class swePreciceCoupling
         List<scalar> winFc;
         List<scalar> winFl;
         scalar winScale = 1;             // starstate renormalisation factor
+        //- the renormalisation's DENOMINATOR and the column scale it is judged
+        //  against.  winScale alone cannot distinguish "the target moved" from
+        //  "the shape stopped carrying water", and it is the second that kills
+        //  runs: intake0 is a signed sum and passes through zero.  Diagnosing
+        //  that once required recovering intake0 as qEff/scale, which works
+        //  only while scale has not itself underflowed.  Logged so the next
+        //  one does not.
+        scalar winIntake = 0;            // intake0 = sum u* alpha dz
+        scalar winColScale = 0;          // wetMeas*uMag, the column's own scale
         //- imposeMode charswitch: the column Froude the regime was chosen on,
         //  and the branch it took (-1 supercritical out, 0 subcritical,
         //  +1 supercritical in).  Logged, because a regime switch that fires
@@ -250,6 +259,17 @@ class swePreciceCoupling
     //  NOT the violation -- importing hyperbolic characteristic counting into
     //  an incompressible solver was a category error.
     bool alphaDirSwitch_ = false;
+    //- when the reconstructed column carries essentially no net water, do not
+    //  divide by its intake.  The renormalisation is s = qEff/intake0 and
+    //  intake0 is a SIGNED sum: it can pass through zero with qEff ordinary,
+    //  and s then rescales the imposed profile by an arbitrary signed factor.
+    //  This is the threshold on |intake0|/(wetMeas*uMag), the column's
+    //  mean-to-peak velocity ratio, below which the shape is declared
+    //  degenerate and the mass-exact uniform fallback is used instead.  It was
+    //  1e-12 -- twelve orders under anything physical, so it only ever caught
+    //  exact zero.  0 restores that.
+    //  outputs/FINDINGS_the_collapse_is_a_vanishing_denominator.md
+    scalar degenShapeRatio_ = 1e-3;
     bool imposeVertical_ = true;
     //- do NOT drive the air.  The imposition loop writes Uin on every face of
     //  the column, dry ones included, at the star profile clamped to its

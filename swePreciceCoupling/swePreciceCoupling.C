@@ -156,6 +156,7 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
     dict.readIfPresent("writeState", writeState_);
     dict.readIfPresent("writeAlpha", writeAlpha_);
     dict.readIfPresent("alphaDirSwitch", alphaDirSwitch_);
+    dict.readIfPresent("degenerateShapeRatio", degenShapeRatio_);
     dict.readIfPresent("imposeVertical", imposeVertical_);
     dict.readIfPresent("dryFacesInterior", dryFacesInterior_);
     dict.readIfPresent("nuEff", nuEff_);
@@ -207,6 +208,9 @@ bool Foam::functionObjects::swePreciceCoupling::read(const dictionary& dict)
         // comparing two different quantities.
         for (int k = 2; k < Model::n_dof_q; ++k)
             starLog_() << ",Fq" << (k - 2) << "_Fc,Fq" << (k - 2) << "_Fl";
+        // The renormalisation's denominator and the scale it is judged against.
+        // `scale` on its own is a ratio and hides which half moved.
+        starLog_() << ",intake0,col_scale";
         starLog_() << nl;
     }
     dict.readIfPresent("debtRepayWindows", debtRepay_);
@@ -1989,7 +1993,30 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                 // degenerate column falls back to the shape-free uniform
                 // profile, which is still mass-exact but says nothing about
                 // the profile, and the count is reported at the end of the run.
-                const scalar tiny = 1e-12*Foam::max(wetMeas*uMag, SMALL);
+                //
+                // THE THRESHOLD WAS TWELVE ORDERS BELOW ANYTHING PHYSICAL, so
+                // the guard caught exact zero and nothing else.  intake0 is a
+                // signed sum and it can pass THROUGH zero while qEff stays
+                // ordinary; s = qEff/intake0 then returns a huge signed number
+                // and the inlet is handed the reconstructed profile multiplied
+                // by it.  In run_lng_rklo_v2s_coupled intake0 crossed zero at
+                // t = 5.358 s at 1.1e-6 of its own median magnitude, s reached
+                // -2270, and dt underflowed in the next window.  Across all 347
+                // coupled runs of the campaign every single run with
+                // max|s| > 1000 died, and 307 of them never exceed |s| = 3 --
+                // three orders of separation, so this is a wide gap and not a
+                // fitted cut.  See
+                // outputs/FINDINGS_the_collapse_is_a_vanishing_denominator.md
+                //
+                // intake0/(wetMeas*uMag) is the column's mean-to-peak velocity
+                // ratio and lives in [-1, 1]; `degenerateShapeRatio` is a
+                // threshold ON THAT RATIO, so it reads directly as "the mean is
+                // under a thousandth of the peak".  Set it to 0 to restore the
+                // old behaviour of dividing by whatever is there.
+                const scalar tiny =
+                    degenShapeRatio_*Foam::max(wetMeas*uMag, SMALL);
+                col.winIntake   = intake0;
+                col.winColScale = wetMeas*uMag;
                 scalar sFac = 1.0;
                 // fluxmatch: the affine map that carries BOTH rows ─────────────
                 // The renormalisation below is u = s*u*, one parameter, and it
@@ -2946,6 +2973,8 @@ void Foam::functionObjects::swePreciceCoupling::imposeInflow()
                         << ","
                         << ((k < col.winFl.size()) ? col.winFl[k] : 0.0);
                 }
+                starLog_() << "," << col.winIntake
+                           << "," << col.winColScale;
                 starLog_() << nl;
             }
         }
