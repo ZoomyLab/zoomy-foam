@@ -86,6 +86,12 @@ inline double reduce_min(const Field& a)
     for (double x : a.d) m = minimum(m, x);
     return m;
 }
+inline double reduce_max(const Field& a)
+{
+    double m = -std::numeric_limits<double>::infinity();
+    for (double x : a.d) m = maximum(m, x);
+    return m;
+}
 inline bool reduce_any(const Field& a)
 {
     for (double x : a.d) if (x != 0.0) return true;
@@ -703,6 +709,17 @@ Field put(const Field& Q, const std::tuple<I...>& rows, const V& values)
 }
 
 inline Field zeros(int n, const Mesh& M) { return Field(n, M.nc); }
+
+template<class... I>
+Field take(const Field& Q, const std::tuple<I...>& rows)
+{
+    const std::array<int, sizeof...(I)> r = std::apply(
+        [](auto... i) { return std::array<int, sizeof...(I)>{int(i)...}; }, rows);
+    Field out(int(r.size()), Q.n);
+    for (size_t k = 0; k < r.size(); ++k)
+        for (int c = 0; c < Q.n; ++c) out(int(k), c) = Q(r[k], c);
+    return out;
+}
 
 // ── implicit solves (settings from the driver) ──────────────────────────────
 struct Implicit

@@ -41,6 +41,9 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
     cfl = param.Number(default=0.9, bounds=(0, None))
     dt = param.Number(default=None, allow_None=True,
                       doc="Constant time step; None = adaptive CFL step.")
+    cfl_check_every = param.Integer(default=10, bounds=(0, None),
+                                    doc="Constant dt: CFL test every N steps "
+                                        "(1: each step, 0: never).")
     dt_write = param.Number(default=None, allow_None=True,
                             doc="Output interval; None = final state only.")
     couple = param.Dict(default=None, allow_None=True,
@@ -80,6 +83,7 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
             "Q Qaux p time time_end mesh")
         kw = dict(cfl=self.cfl, dimension=dimension, mood=False,
                   dt_write=self.dt_write, imex=self.imex,
+                  cfl_check_every=self.cfl_check_every,
                   dt_constant=None if self.dt is None else sp.Float(self.dt))
         if self.couple:
             run = CxxPrinter().procedure(
@@ -237,6 +241,13 @@ class SymbolicChorinSolverFoam(SymbolicHyperbolicSolverFoam):
     pressure_tol = param.Number(default=ELLIPTIC_RTOL, bounds=(0, None))
     pressure_maxit = param.Integer(default=100, bounds=(1, None))
     pressure_restart = param.Integer(default=None, allow_None=True, bounds=(1, None))
+    pressure_solve = param.Selector(
+        default="linear", objects=["linear", "newton"],
+        doc="'linear': the constraint is affine in the pressure, one linear "
+            "solve.  'newton': a nonlinear constraint, Newton iterations.")
+    pressure_newton_tol = param.Number(default=1e-10, bounds=(0, None),
+                                       doc="Newton: stop at max|R| <= tol.")
+    pressure_newton_maxit = param.Integer(default=10, bounds=(1, None))
 
     def _systems(self, nsm):
         return [("pred", nsm), ("press", self.press), ("corr", self.corr)]
@@ -257,7 +268,10 @@ class SymbolicChorinSolverFoam(SymbolicHyperbolicSolverFoam):
             lambda *a: CH.chorin(
                 nsm, self.press, self.corr, *a, cfl=self.cfl,
                 dimension=dimension, imex=self.imex, time_order=self.time_order,
-                dt_write=self.dt_write,
+                dt_write=self.dt_write, cfl_check_every=self.cfl_check_every,
+                pressure_newton=(None if self.pressure_solve == "linear" else
+                                 (sp.Float(self.pressure_newton_tol),
+                                  int(self.pressure_newton_maxit))),
                 dt_constant=None if self.dt is None else sp.Float(self.dt)))
         return run, "run(Q, Qaux, p, 0.0, time_end, mesh, 0L)"
 
