@@ -782,21 +782,16 @@ Field put(const Field& Q, const std::tuple<I...>& rows, const V& values)
 
 inline Field zeros(int n, const Mesh& M) { return Field(n, M.nc); }
 
-// entries of ``rows`` in [-eps max|Q_row|, 0) -> 0: round-off below zero
+// entries of ``rows`` in [-tol, 0) -> 0: round-off below zero
 template<class... I>
-Field clean_round_off(const Field& Q, const std::tuple<I...>& rows)
+Field clean_round_off(const Field& Q, const std::tuple<I...>& rows, double tol)
 {
     Field out = Q;
     const std::array<int, sizeof...(I)> r = std::apply(
         [](auto... i) { return std::array<int, sizeof...(I)>{int(i)...}; }, rows);
     for (const int q : r)
-    {
-        double m = 0.0;
-        for (int c = 0; c < Q.n; ++c) m = std::max(m, std::abs(Q(q, c)));
-        const double tol = std::numeric_limits<double>::epsilon()*m;
         for (int c = 0; c < Q.n; ++c)
             if (Q(q, c) < 0.0 && Q(q, c) >= -tol) out(q, c) = 0.0;
-    }
     return out;
 }
 

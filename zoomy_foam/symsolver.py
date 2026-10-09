@@ -45,9 +45,9 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
                                     doc="Constant dt: CFL test every N steps "
                                         "(1: each step, 0: never).")
     cfl_wave_speed = param.Selector(
-        default="cells", objects=["cells", "faces"],
-        doc="CFL wave speeds: 'cells' from the cell states of each face, "
-            "'faces' from the first RK stage's Riemann problem.")
+        default="faces", objects=["faces", "cells"],
+        doc="CFL wave speeds: 'faces' from the first RK stage's Riemann "
+            "problem, 'cells' from the cell states of each face.")
     mood = param.Boolean(default=True,
                          doc="A-posteriori MOOD at order >= 2 (cells failing "
                              "the model's admissibility redo at order 1).")
