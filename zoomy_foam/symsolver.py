@@ -44,6 +44,13 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
     cfl_check_every = param.Integer(default=10, bounds=(0, None),
                                     doc="Constant dt: CFL test every N steps "
                                         "(1: each step, 0: never).")
+    cfl_wave_speed = param.Selector(
+        default="cells", objects=["cells", "faces"],
+        doc="CFL wave speeds: 'cells' from the cell states of each face, "
+            "'faces' from the first RK stage's Riemann problem.")
+    mood = param.Boolean(default=True,
+                         doc="A-posteriori MOOD at order >= 2 (cells failing "
+                             "the model's admissibility redo at order 1).")
     dt_write = param.Number(default=None, allow_None=True,
                             doc="Output interval; None = final state only.")
     couple = param.Dict(default=None, allow_None=True,
@@ -61,6 +68,10 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
 
     def _systems(self, nsm):
         return [("nsm", nsm)]
+
+    def _mood(self, nsm):
+        return bool(self.mood and nsm.reconstruction.order >= 2
+                    and nsm.call.admissible is not None)
 
     def _linsolve(self, nsm):
         return None
@@ -81,9 +92,10 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
         """The printed march ``run`` and the call ``march`` makes of it."""
         Q, Qaux, p, time, time_end, mesh = sp.symbols(
             "Q Qaux p time time_end mesh")
-        kw = dict(cfl=self.cfl, dimension=dimension, mood=False,
+        kw = dict(cfl=self.cfl, dimension=dimension, mood=self._mood(nsm),
                   dt_write=self.dt_write, imex=self.imex,
                   cfl_check_every=self.cfl_check_every,
+                  wave_speed=self.cfl_wave_speed,
                   dt_constant=None if self.dt is None else sp.Float(self.dt))
         if self.couple:
             run = CxxPrinter().procedure(
@@ -100,11 +112,10 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
         return run, march
 
     def _configure(self, nsm, linsolve=None):
-        """Backend settings: limiter keyword, implicit-solve tolerances."""
+        """Backend settings: LSQ degree, implicit-solve tolerances."""
         ls = linsolve or dict(tol=self.gmres_tol, restart=self.gmres_restart,
                               maxiter=self.gmres_maxiter, accept=-1.0)
         return ("inline void configure()\n{\n"
-                f'    settings().limiter = "{nsm.reconstruction.limiter}";\n'
                 f"    settings().lsq_degree = {int(nsm.resolved_lsq_degree())};\n"
                 f"    implicit().tol = {self.implicit_tol!r};\n"
                 f"    implicit().maxiter = {self.implicit_maxiter};\n"
@@ -268,7 +279,9 @@ class SymbolicChorinSolverFoam(SymbolicHyperbolicSolverFoam):
             lambda *a: CH.chorin(
                 nsm, self.press, self.corr, *a, cfl=self.cfl,
                 dimension=dimension, imex=self.imex, time_order=self.time_order,
+                mood=self._mood(nsm),
                 dt_write=self.dt_write, cfl_check_every=self.cfl_check_every,
+                wave_speed=self.cfl_wave_speed,
                 pressure_newton=(None if self.pressure_solve == "linear" else
                                  (sp.Float(self.pressure_newton_tol),
                                   int(self.pressure_newton_maxit))),

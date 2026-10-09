@@ -6,6 +6,7 @@
     state as text: ``out/<k>.dat`` = time, then one line per state row (cell
     order of the mesh).
 \*---------------------------------------------------------------------------*/
+#include <cfenv>
 #include <chrono>
 #include <cstdio>
 #include <string>
@@ -43,6 +44,9 @@ int main(int argc, char* argv[])
     Time runTime(Time::controlDictName, args);
     fvMesh mesh(IOobject(fvMesh::defaultRegion, runTime.name(), runTime,
                          IOobject::MUST_READ));
+    // IEEE arithmetic, no traps: MOOD detects a non-finite candidate after
+    // the fact (as on JAX); FOAM_SIGFPE would abort the run instead
+    fedisableexcept(FE_DIVBYZERO | FE_INVALID | FE_OVERFLOW);
 
     zs::configure();
     const int dim = runTime.controlDict().lookupOrDefault<label>("spaceDimension", 1);

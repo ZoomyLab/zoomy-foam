@@ -97,14 +97,26 @@ inline bool reduce_any(const Field& a)
     for (double x : a.d) if (x != 0.0) return true;
     return false;
 }
-inline Field select(const Field& m, const Field& a, const Field& b)
+// entry (i, c) of a field (one row broadcasts) or of a number
+inline double at(const Field& F, int i, int c) { return F(F.nq == 1 ? 0 : i, c); }
+template<class T, std::enable_if_t<std::is_arithmetic_v<T>, int> = 0>
+double at(T x, int, int) { return double(x); }
+inline int rows_of(const Field& F) { return F.nq; }
+template<class T, std::enable_if_t<std::is_arithmetic_v<T>, int> = 0>
+int rows_of(T) { return 1; }
+
+template<class A, class B>
+Field select(const Field& m, const A& a, const B& b)
 {
-    Field r(std::max(a.nq, b.nq), a.n);
+    Field r(std::max({m.nq, rows_of(a), rows_of(b)}), m.n);
     for (int i = 0; i < r.nq; ++i)
         for (int c = 0; c < r.n; ++c)
-            r(i, c) = m(m.nq == 1 ? 0 : i, c) != 0.0 ? a(a.nq == 1 ? 0 : i, c)
-                                                    : b(b.nq == 1 ? 0 : i, c);
+            r(i, c) = at(m, i, c) != 0.0 ? at(a, i, c) : at(b, i, c);
     return r;
+}
+inline Field minimum(const Field& a, const Field& b)
+{
+    return zip(a, b, [](double x, double y) { return minimum(x, y); });
 }
 
 inline Vec col(const Field& F, int c)
@@ -139,7 +151,6 @@ template<int N> std::array<Field, N> split(const Field& F)
 // Backend configuration from the NSM (set by the driver).
 struct Settings
 {
-    std::string limiter = "venkatakrishnan";
     int lsq_degree = 1;
 };
 inline Settings& settings() { static Settings s; return s; }
@@ -388,26 +399,23 @@ inline double dot(const std::array<double, 3>& g, const Foam::vector& r, int dim
     return s;
 }
 
-// Limiter of one cell from one face increment ``delta`` (cell bounds dmin/dmax).
-inline double limit(double delta, double dmin, double dmax, double ev2)
+// Limiter factor of one cell from one face increment ``delta`` (cell bounds
+// dmin/dmax); ``ev2`` = (cell size)^2 for Venkatakrishnan.
+enum class Limiter { minmod, venkatakrishnan, barth_jespersen };
+inline double limit(Limiter L, double delta, double dmin, double dmax, double ev2)
 {
     const double eps = 1e-30;
-    const std::string& L = settings().limiter;
     if (!(delta > eps) && !(delta < -eps)) return 1.0;
     const double dm = delta > eps ? dmax : dmin;
-    if (L == "minmod")
-        return std::clamp(delta > eps ? dm/std::max(delta, eps)
-                                      : dm/std::min(delta, -eps), 0.0, 1.0);
-    if (L == "venkatakrishnan")
+    if (L == Limiter::venkatakrishnan)
     {
         const double num = dm*dm + ev2 + 2*delta*dm;
         const double den = dm*dm + 2*delta*delta + delta*dm + ev2;
         return std::clamp(num/std::max(den, eps), 0.0, 1.0);
     }
-    if (L == "none") return 1.0;
-    FatalErrorInFunction << "limiter " << L << " is not implemented on foam"
-        << Foam::exit(Foam::FatalError);
-    return 1.0;
+    // minmod and Barth-Jespersen: the same ratio on a single face increment
+    return std::clamp(delta > eps ? dm/std::max(delta, eps)
+                                  : dm/std::min(delta, -eps), 0.0, 1.0);
 }
 
 // ── kernels on cells and faces ──────────────────────────────────────────────
@@ -503,7 +511,7 @@ Field boundary_ghosts(K bc, const Field& Q, const Field& Qaux, const Vec& p,
     return bc_states(bc, inner, Qaux, p, time, M);
 }
 
-// Qauxb is the inner cell's aux (only the free-surface reconstruction reads it)
+// Qauxb is the inner cell's aux
 template<int N = 2, class K>
 std::tuple<Field, Field> boundary_states(K bc, const Field& Q, const Field& Qaux,
                                          const Vec& p, double time, const Mesh& M)
@@ -532,70 +540,134 @@ Field boundary_traces(K bc, const Field& Q, const Field& QL, const Field& QR,
 }
 
 // ── reconstruction and assembly ─────────────────────────────────────────────
-// Order 1: cell values.  Order 2: LSQ-MUSCL -- the limited gradient moves
-// each cell value to the face centre; bounds from the neighbours and the
-// boundary ghosts 2 Qb - Q.  QR on a boundary face is the ghost Qb.
-template<class D>
-std::tuple<Field, Field> reconstruct(const Field& Q, const Field& Qaux,
-                                     const Field& Qb, const Field& Qauxb,
-                                     const Vec& p, int order, D demote,
-                                     const Mesh& M)
+// The blocks of zoomy_core.symsolver.reconstruction.  A gradient field holds
+// d/dx_a of row q in row 3 q + a.
+
+// a kernel in every column; a cell-family kernel gets time = dt = 0 and no position
+template<class K>
+Field pointwise(K k, const Field& X, const Field& Xaux, const Vec& p)
 {
-    if constexpr (std::is_same_v<D, bool>)
+    Field out(X.nq, X.n);
+    for (int c = 0; c < X.n; ++c)
     {
-        if (demote && order > 1) order = 1;
+        const Vec x = col(X, c), a = col(Xaux, c);
+        std::vector<double> v;
+        if constexpr (std::is_invocable_v<K, const Vec&, const Vec&, const Vec&>)
+            v = flat(k(x, a, p));
+        else
+            v = flat(k(x, a, p, 0.0, 0.0, Foam::vector::zero));
+        if (c == 0) out = Field(int(v.size()), X.n);
+        for (int i = 0; i < out.nq; ++i) out(i, c) = v[i];
     }
-    else
-        FatalErrorInFunction << "reconstruct: per-cell demotion not on foam yet"
-            << Foam::exit(Foam::FatalError);
+    return out;
+}
+
+inline std::tuple<Field, Field> cell_traces(const Field& Q, const Field& Qb,
+                                            const Mesh& M)
+{
     Field L(Q.nq, M.nf), R(Q.nq, M.nf);
     for (int q = 0; q < Q.nq; ++q)
     {
-        Grad g(M.nc, std::array<double, 3>{});
-        std::vector<double> phi(M.nc, 0.0);
-        if (order == 2)
+        for (int f = 0; f < M.nf; ++f)
         {
-            g = lsq_gradient(Q, q, &Qb, M);
-            std::vector<double> lo(M.nc), hi(M.nc);
-            for (int c = 0; c < M.nc; ++c) lo[c] = hi[c] = Q(q, c);
-            for (int f = 0; f < M.nfi; ++f)
-            {
-                const int o = M.own[f], n = M.nei[f];
-                lo[o] = std::min(lo[o], Q(q, n)); hi[o] = std::max(hi[o], Q(q, n));
-                lo[n] = std::min(lo[n], Q(q, o)); hi[n] = std::max(hi[n], Q(q, o));
-            }
-            for (int i = 0; i < M.nbf; ++i)
-            {
-                const int c = M.bf_cell[i];
-                const double ghost = 2.0*Qb(q, i) - Q(q, c);
-                lo[c] = std::min(lo[c], ghost); hi[c] = std::max(hi[c], ghost);
-            }
-            std::fill(phi.begin(), phi.end(), 1.0);
-            auto face = [&](int c, int f)
-            {
-                const double ev2 = std::pow(std::pow(M.vol[c], 1.0/M.dim), 2);
-                const double delta = dot(g[c], M.fc[f] - M.cc[c], M.dim);
-                phi[c] = std::min(phi[c], limit(delta, lo[c] - Q(q, c), hi[c] - Q(q, c), ev2));
-            };
-            for (int f = 0; f < M.nf; ++f)
-            {
-                face(M.own[f], f);
-                if (M.nei[f] >= 0) face(M.nei[f], f);
-            }
+            L(q, f) = Q(q, M.own[f]);
+            R(q, f) = M.nei[f] >= 0 ? Q(q, M.nei[f]) : 0.0;
         }
-        else if (order != 1)
-            FatalErrorInFunction << "reconstruct: order " << order
-                << Foam::exit(Foam::FatalError);
-        auto at = [&](int c, int f)
+        for (int i = 0; i < M.nbf; ++i) R(q, M.bf_face[i]) = Qb(q, i);
+    }
+    return {L, R};
+}
+
+inline Field gradient(const Field& W, const Field& Wb, const Mesh& M)
+{
+    Field G(3*W.nq, M.nc);
+    for (int q = 0; q < W.nq; ++q)
+    {
+        const Grad g = lsq_gradient(W, q, &Wb, M);
+        for (int c = 0; c < M.nc; ++c)
+            for (int a = 0; a < 3; ++a) G(3*q + a, c) = g[c][a];
+    }
+    return G;
+}
+
+inline double slope_dot(const Field& G, int q, int c, const Foam::vector& r, int dim)
+{
+    double s = 0.0;
+    for (int a = 0; a < dim; ++a) s += G(3*q + a, c)*r[a];
+    return s;
+}
+
+// Limiter factors of ``rows``, 1 elsewhere; bounds from the neighbours and
+// the boundary ghosts 2 Wb - W.
+template<class... I>
+Field limiter_factors(Limiter L, const std::tuple<I...>& rows, const Field& W,
+                      const Field& Wb, const Field& G, const Mesh& M)
+{
+    Field phi(W.nq, M.nc, 1.0);
+    const std::array<int, sizeof...(I)> r = std::apply(
+        [](auto... i) { return std::array<int, sizeof...(I)>{int(i)...}; }, rows);
+    for (const int q : r)
+    {
+        std::vector<double> lo(M.nc), hi(M.nc);
+        for (int c = 0; c < M.nc; ++c) lo[c] = hi[c] = W(q, c);
+        for (int f = 0; f < M.nfi; ++f)
         {
-            return Q(q, c) + phi[c]*dot(g[c], M.fc[f] - M.cc[c], M.dim);
+            const int o = M.own[f], n = M.nei[f];
+            lo[o] = std::min(lo[o], W(q, n)); hi[o] = std::max(hi[o], W(q, n));
+            lo[n] = std::min(lo[n], W(q, o)); hi[n] = std::max(hi[n], W(q, o));
+        }
+        for (int i = 0; i < M.nbf; ++i)
+        {
+            const int c = M.bf_cell[i];
+            const double ghost = 2.0*Wb(q, i) - W(q, c);
+            lo[c] = std::min(lo[c], ghost); hi[c] = std::max(hi[c], ghost);
+        }
+        auto face = [&](int c, int f)
+        {
+            const double ev2 = std::pow(std::pow(M.vol[c], 1.0/M.dim), 2);
+            const double delta = slope_dot(G, q, c, M.fc[f] - M.cc[c], M.dim);
+            phi(q, c) = std::min(phi(q, c), limit(L, delta, lo[c] - W(q, c),
+                                                  hi[c] - W(q, c), ev2));
         };
         for (int f = 0; f < M.nf; ++f)
         {
-            L(q, f) = at(M.own[f], f);
-            R(q, f) = M.nei[f] >= 0 ? at(M.nei[f], f) : 0.0;
+            face(M.own[f], f);
+            if (M.nei[f] >= 0) face(M.nei[f], f);
         }
-        for (int i = 0; i < M.nbf; ++i) R(q, M.bf_face[i]) = Qb(q, i);
+    }
+    return phi;
+}
+template<class... I>
+Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wb,
+             const Field& G, const Mesh& M)
+{ return limiter_factors(Limiter::minmod, rows, W, Wb, G, M); }
+template<class... I>
+Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W,
+                      const Field& Wb, const Field& G, const Mesh& M)
+{ return limiter_factors(Limiter::venkatakrishnan, rows, W, Wb, G, M); }
+template<class... I>
+Field barth_jespersen(const std::tuple<I...>& rows, const Field& W,
+                      const Field& Wb, const Field& G, const Mesh& M)
+{ return limiter_factors(Limiter::barth_jespersen, rows, W, Wb, G, M); }
+
+// each cell's W moved to the face centre by phi G; WR = Wb on boundary faces
+template<class P>
+std::tuple<Field, Field> extrapolate(const Field& W, const Field& Wb,
+                                     const Field& G, const P& phi, const Mesh& M)
+{
+    Field L(W.nq, M.nf), R(W.nq, M.nf);
+    for (int q = 0; q < W.nq; ++q)
+    {
+        auto val = [&](int c, int f)
+        {
+            return W(q, c) + at(phi, q, c)*slope_dot(G, q, c, M.fc[f] - M.cc[c], M.dim);
+        };
+        for (int f = 0; f < M.nf; ++f)
+        {
+            L(q, f) = val(M.own[f], f);
+            R(q, f) = M.nei[f] >= 0 ? val(M.nei[f], f) : 0.0;
+        }
+        for (int i = 0; i < M.nbf; ++i) R(q, M.bf_face[i]) = Wb(q, i);
     }
     return {L, R};
 }
@@ -709,6 +781,24 @@ Field put(const Field& Q, const std::tuple<I...>& rows, const V& values)
 }
 
 inline Field zeros(int n, const Mesh& M) { return Field(n, M.nc); }
+
+// entries of ``rows`` in [-eps max|Q_row|, 0) -> 0: round-off below zero
+template<class... I>
+Field clean_round_off(const Field& Q, const std::tuple<I...>& rows)
+{
+    Field out = Q;
+    const std::array<int, sizeof...(I)> r = std::apply(
+        [](auto... i) { return std::array<int, sizeof...(I)>{int(i)...}; }, rows);
+    for (const int q : r)
+    {
+        double m = 0.0;
+        for (int c = 0; c < Q.n; ++c) m = std::max(m, std::abs(Q(q, c)));
+        const double tol = std::numeric_limits<double>::epsilon()*m;
+        for (int c = 0; c < Q.n; ++c)
+            if (Q(q, c) < 0.0 && Q(q, c) >= -tol) out(q, c) = 0.0;
+    }
+    return out;
+}
 
 template<class... I>
 Field take(const Field& Q, const std::tuple<I...>& rows)
