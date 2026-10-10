@@ -795,6 +795,9 @@ Field clean_round_off(const Field& Q, const std::tuple<I...>& rows, double tol)
     return out;
 }
 
+// the copies of other ranks' cells: none in a serial run
+inline const Field& halo(const Field& X, const Mesh&) { return X; }
+
 template<class... I>
 Field take(const Field& Q, const std::tuple<I...>& rows)
 {
