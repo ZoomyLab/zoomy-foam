@@ -788,38 +788,143 @@ Field root(F f, Field x)
     return x;
 }
 
-// Right preconditioner per row m: (c_m L)^-1 by OpenFOAM's GAMG, L the
-// compact Laplacian (homogeneous Dirichlet on the physical boundary), c_m the
-// operator's mean diagonal of row block m over L's (one probe, random signs).
-template<class A>
-std::function<Field(const Field&)> gamg_preconditioner(A op, const Field& b, const Mesh& M)
+// Right preconditioner of the pressure solve.  The compact part of the
+// operator (own cell and face neighbours, per pair of rows) assembled by
+// probing with distance-2 cell colours; rows whose own block is diagonally
+// dominant are eliminated cell by cell, the others (elliptic) are solved by
+// OpenFOAM's GAMG on their Schur complement (its two-ring part lumped into
+// the diagonal; elliptic rows among each other, and ranks: block Jacobi).
+inline const std::vector<int>& colours(const Mesh& M)
 {
-    Foam::wordList types(M.m.boundary().size(), "calculated");
-    for (const Foam::label p : M.physical) types[p] = "fixedValue";
-    auto z = std::make_shared<Foam::volScalarField>(
-        Foam::IOobject("zs_p", M.m.time().name(), M.m, Foam::IOobject::NO_READ,
-                       Foam::IOobject::NO_WRITE, false),
-        M.m, Foam::dimensionedScalar(Foam::dimless, 0), types);
-    auto L = std::make_shared<Foam::fvScalarMatrix>(Foam::fvm::laplacian(*z));
-    L->diag() = L->D();                        // the boundary's share folded in
-    const double ld = Foam::gAverage(Foam::scalarField(L->diag()/M.m.V().primitiveField()));
-    Field probe(b.nq, b.n);
-    for (int m = 0; m < b.nq; ++m)
-        for (int c = 0; c < M.nown; ++c)
-        {
-            const double h = std::sin(12.9898*M.cc[c][0] + 78.233*M.cc[c][1]
-                                      + 37.719*M.cc[c][2] + m)*43758.5453;
-            probe(m, c) = h - std::floor(h) < 0.5 ? -1.0 : 1.0;
-        }
-    const Field Ap = op(probe);
-    const double n = Foam::returnReduce(double(M.nown), Foam::sumOp<double>());
-    std::vector<double> scale(b.nq);
-    for (int m = 0; m < b.nq; ++m)
+    static std::vector<int> col;
+    if (!col.empty() || M.nown == 0) return col;
+    col.assign(M.nown, -1);
+    const auto& cc = M.m.cellCells();
+    for (int c = 0; c < M.nown; ++c)
     {
-        double d = 0.0;
-        for (int c = 0; c < M.nown; ++c) d += probe(m, c)*Ap(m, c);
-        d = Foam::returnReduce(d, Foam::sumOp<double>())/n;
-        scale[m] = std::abs(d) > 1e-300 ? ld/d : 1.0;
+        std::vector<bool> used;
+        auto mark = [&](int x) { if (col[x] >= 0) { used.resize(std::max<size_t>(used.size(), col[x] + 1)); used[col[x]] = true; } };
+        for (const Foam::label n : cc[c]) { mark(n); for (const Foam::label n2 : cc[n]) mark(n2); }
+        col[c] = int(std::find(used.begin(), used.end(), false) - used.begin());
+    }
+    return col;
+}
+
+struct Schur
+{
+    struct Block { Foam::scalarField d, up, lo; };   // up: row own, column nei
+    std::vector<std::vector<Block>> T;               // the compact operator, row pairs
+    std::vector<int> E, A;                           // elliptic and algebraic rows
+    std::vector<std::vector<double>> Dinv;           // per cell: the A block, inverted
+    std::vector<std::unique_ptr<Foam::lduMatrix>> S; // per elliptic row
+    Foam::FieldField<Foam::Field, Foam::scalar> zero;
+    Foam::lduInterfaceFieldPtrsList none;
+    std::vector<Foam::autoPtr<Foam::lduMatrix::solver>> gamg;
+
+    // T[m][j] v over the own cells
+    std::vector<double> mul(const Mesh& M, int m, int j, const std::vector<double>& v) const
+    {
+        const auto& o = M.m.lduAddr().lowerAddr();
+        const auto& u = M.m.lduAddr().upperAddr();
+        const Block& B = T[m][j];
+        std::vector<double> r(M.nown);
+        for (int i = 0; i < M.nown; ++i) r[i] = B.d[i]*v[i];
+        forAll(o, f) { r[o[f]] += B.up[f]*v[u[f]]; r[u[f]] += B.lo[f]*v[o[f]]; }
+        return r;
+    }
+    // y_A = Dinv r_A, cell by cell
+    std::vector<std::vector<double>> local(const std::vector<std::vector<double>>& r) const
+    {
+        const int na = int(A.size());
+        std::vector<std::vector<double>> y(na, std::vector<double>(Dinv.size(), 0.0));
+        for (size_t i = 0; i < Dinv.size(); ++i)
+            for (int a = 0; a < na; ++a)
+                for (int c = 0; c < na; ++c) y[a][i] += Dinv[i][a*na + c]*r[c][i];
+        return y;
+    }
+};
+
+template<class Op>
+std::function<Field(const Field&)> gamg_preconditioner(Op op, const Field& b, const Mesh& M)
+{
+    using SF = Foam::scalarField;
+    const int k = b.nq, n = M.nown, nf = M.nfi;
+    const auto& o = M.m.lduAddr().lowerAddr();
+    const auto& u = M.m.lduAddr().upperAddr();
+    auto P = std::make_shared<Schur>();
+    P->T.assign(k, std::vector<Schur::Block>(k, {SF(n, 0.0), SF(nf, 0.0), SF(nf, 0.0)}));
+    auto& T = P->T;
+    const auto& col = colours(M);
+    int ncol = 0;
+    for (const int c : col) ncol = std::max(ncol, c + 1);
+    ncol = Foam::returnReduce(ncol, Foam::maxOp<int>());
+    for (int c = 0; c < ncol; ++c)
+        for (int j = 0; j < k; ++j)
+        {
+            Field e(k, b.n);
+            for (int i = 0; i < n; ++i) e(j, i) = col[i] == c;
+            const Field y = op(e);
+            for (int m = 0; m < k; ++m)
+            {
+                for (int i = 0; i < n; ++i) if (col[i] == c) T[m][j].d[i] = y(m, i);
+                for (int f = 0; f < nf; ++f)
+                {
+                    if (col[o[f]] == c) T[m][j].lo[f] = y(m, u[f]);
+                    if (col[u[f]] == c) T[m][j].up[f] = y(m, o[f]);
+                }
+            }
+        }
+    for (int m = 0; m < k; ++m)
+    {
+        const double off = Foam::gSum(Foam::mag(T[m][m].up)) + Foam::gSum(Foam::mag(T[m][m].lo));
+        (off > 0.5*Foam::gSum(Foam::mag(T[m][m].d)) ? P->E : P->A).push_back(m);
+    }
+    const auto& E = P->E;
+    const auto& Aa = P->A;
+    const int na = int(Aa.size());
+    P->Dinv.assign(n, std::vector<double>(na*na));
+    for (int i = 0; i < n; ++i)
+        for (int q = 0; q < na; ++q)
+        {
+            std::vector<double> D(na*na), r(na, 0.0);
+            for (int a = 0; a < na; ++a)
+                for (int c = 0; c < na; ++c) D[a*na + c] = T[Aa[a]][Aa[c]].d[i];
+            r[q] = 1.0;
+            const auto x = dense_solve(D, r);
+            for (int a = 0; a < na; ++a) P->Dinv[i][a*na + q] = x[a];
+        }
+    // S_e = T_ee - T_eA Dinv T_Ae through each cell l: i -> l -> j, i and j
+    // l itself or across one of its faces; i, j two apart: lumped
+    for (const int e : E)
+    {
+        P->S.emplace_back(new Foam::lduMatrix(M.m));
+        Foam::lduMatrix& L = *P->S.back();
+        SF& d = L.diag();
+        SF& up = L.upper();
+        SF& lo = L.lower();
+        d = T[e][e].d; up = T[e][e].up; lo = T[e][e].lo;
+        for (int l = 0; l < n; ++l)
+        {
+            std::vector<std::pair<int, int>> ring{{l, -1}};
+            for (const Foam::label f : M.m.cells()[l])
+                if (f < nf) ring.push_back({o[f] == l ? u[f] : o[f], f});
+            auto in = [&](int a, int i, int f)        // T[e][a], row i, column l
+            { return f < 0 ? T[e][a].d[l] : o[f] == i ? T[e][a].up[f] : T[e][a].lo[f]; };
+            auto out = [&](int a, int g)              // T[a][e], row l, column j
+            { return g < 0 ? T[a][e].d[l] : o[g] == l ? T[a][e].up[g] : T[a][e].lo[g]; };
+            for (const auto& [i, f] : ring)
+                for (const auto& [j, g] : ring)
+                {
+                    double s = 0.0;
+                    for (int a = 0; a < na; ++a)
+                        for (int c = 0; c < na; ++c)
+                            s += in(Aa[a], i, f)*P->Dinv[l][a*na + c]*out(Aa[c], g);
+                    if (i == j) d[i] -= s;
+                    else if (f < 0) (o[g] == l ? up[g] : lo[g]) -= s;
+                    else if (g < 0) (o[f] == i ? up[f] : lo[f]) -= s;
+                    else d[i] -= s;
+                }
+        }
     }
     Foam::dictionary dict;
     dict.add("solver", Foam::word("GAMG"));
@@ -828,19 +933,45 @@ std::function<Field(const Field&)> gamg_preconditioner(A op, const Field& b, con
     dict.add("relTol", 0.1);
     dict.add("maxIter", 10);
     dict.add("nCellsInCoarsestLevel", 2);
-    std::shared_ptr<Foam::lduMatrix::solver> gamg(Foam::lduMatrix::solver::New(
-        "zs_p", *L, L->boundaryCoeffs(), L->internalCoeffs(),
-        z->boundaryField().scalarInterfaces(), dict).ptr());
-    return [z, L, gamg, scale, &M](const Field& v)   // z, L: kept alive for gamg
+    const Foam::label np = M.m.boundary().size();
+    P->zero.setSize(np);
+    P->none.setSize(np);
+    for (Foam::label p = 0; p < np; ++p) P->zero.set(p, new SF(M.m.boundary()[p].size(), 0.0));
+    for (const auto& L : P->S)
+        P->gamg.push_back(Foam::lduMatrix::solver::New("zs_p", *L, P->zero, P->zero, P->none, dict));
+    // y_A = Dinv v_A;  S z_E = v_E - T_EA y_A;  z_A = Dinv (v_A - T_AE z_E)
+    return [P, &M](const Field& v)
     {
+        const int n = M.nown, na = int(P->A.size());
+        auto row = [&](const Field& X, int m)
+        { return std::vector<double>(X.d.begin() + size_t(m)*X.n, X.d.begin() + size_t(m)*X.n + n); };
+        std::vector<std::vector<double>> vA;
+        for (const int a : P->A) vA.push_back(row(v, a));
+        const auto yA = P->local(vA);
         Field out(v.nq, v.n);
-        Foam::scalarField x(M.nown), src(M.nown);
-        for (int m = 0; m < v.nq; ++m)
+        for (size_t q = 0; q < P->E.size(); ++q)
         {
-            for (int c = 0; c < M.nown; ++c) { x[c] = 0.0; src[c] = M.m.V()[c]*v(m, c); }
-            gamg->solve(x, src);
-            for (int c = 0; c < M.nown; ++c) out(m, c) = scale[m]*x[c];
+            const int e = P->E[q];
+            const auto ve = row(v, e);
+            Foam::scalarField r(n), x(n, 0.0);
+            for (int i = 0; i < n; ++i) r[i] = ve[i];
+            for (int a = 0; a < na; ++a)
+            {
+                const auto t = P->mul(M, e, P->A[a], yA[a]);
+                for (int i = 0; i < n; ++i) r[i] -= t[i];
+            }
+            P->gamg[q]->solve(x, r);
+            for (int i = 0; i < n; ++i) out(e, i) = x[i];
         }
+        for (int a = 0; a < na; ++a)
+            for (const int e : P->E)
+            {
+                const auto t = P->mul(M, P->A[a], e, row(out, e));
+                for (int i = 0; i < n; ++i) vA[a][i] -= t[i];
+            }
+        const auto zA = P->local(vA);
+        for (int a = 0; a < na; ++a)
+            for (int i = 0; i < n; ++i) out(P->A[a], i) = zA[a][i];
         return out;
     };
 }
