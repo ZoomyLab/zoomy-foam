@@ -49,6 +49,8 @@ int main(int argc, char* argv[])
     fedisableexcept(FE_DIVBYZERO | FE_INVALID | FE_OVERFLOW);
 
     zs::configure();
+    zs::implicit().ls_gamg =
+        runTime.controlDict().lookupOrDefault<word>("pressurePreconditioner", "none") == "gamg";
     const int dim = runTime.controlDict().lookupOrDefault<label>("spaceDimension", 1);
     const zs::Mesh M(mesh, dim, std::vector<std::string>(zs::sys.bc_tags.begin(), zs::sys.bc_tags.end()));
 

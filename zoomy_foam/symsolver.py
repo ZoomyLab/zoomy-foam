@@ -24,7 +24,7 @@ from scipy.spatial import cKDTree
 from zoomy_core.numerics import NumericalSystemModel
 from zoomy_core.symsolver import CxxPrinter
 from zoomy_core.solver.constants import ELLIPTIC_RTOL, elliptic_constants
-from zoomy_core.symsolver import chorin as CH
+from zoomy_core.symsolver.program import _program, chorin_program, hyperbolic_program
 from zoomy_core.symsolver import hyperbolic as T
 from zoomy_foam._pipeline import (FOAM_ROOT, _BINCACHE, _apptainer,
                                   _mesh_geometry,
@@ -94,55 +94,37 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
                     and nsm.call.admissible is not None)
 
     def _linsolve(self, nsm):
-        return None
+        return dict(tol=self.gmres_tol, restart=self.gmres_restart,
+                    maxiter=self.gmres_maxiter, accept=-1.0)
+
+    def _kw(self, nsm, dimension):
+        return dict(dimension=dimension, cfl=self.cfl, mood=self._mood(nsm),
+                    dt_write=self.dt_write, imex=self.imex,
+                    cfl_check_every=self.cfl_check_every,
+                    wave_speed=self.cfl_wave_speed, dt_constant=self.dt,
+                    implicit=dict(tol=self.implicit_tol, maxiter=self.implicit_maxiter),
+                    linsolve=self._linsolve(nsm))
+
+    def _control(self):
+        """Run-time settings of this solver in the controlDict."""
+        return ""
 
     def _print(self, nsm, dimension):
-        run, march = self._print_run(nsm, dimension)
-        run += ("\n\ninline auto march = [](auto Q, auto Qaux, auto p, auto time_end, "
-                f"auto mesh) {{\n    return {march};\n}};")
-        Q, Qaux, p, mesh = sp.symbols("Q Qaux p mesh")
-        aux = CxxPrinter().procedure(
-            "initial_aux", (Q, Qaux, p, mesh),
-            lambda Q, Qaux, p, mesh: (T.full_aux(nsm, Q, Qaux, p, sp.S.Zero,
-                                                 sp.S.One, mesh),))
-        return (run + "\n\n" + aux + "\n\n"
-                + self._configure(nsm, self._linsolve(nsm)) + "\n")
-
-    def _print_run(self, nsm, dimension):
-        """The printed march ``run`` and the call ``march`` makes of it."""
-        Q, Qaux, p, time, time_end, mesh = sp.symbols(
-            "Q Qaux p time time_end mesh")
-        kw = dict(cfl=self.cfl, dimension=dimension, mood=self._mood(nsm),
-                  dt_write=self.dt_write, imex=self.imex,
-                  cfl_check_every=self.cfl_check_every,
-                  wave_speed=self.cfl_wave_speed,
-                  dt_constant=None if self.dt is None else sp.Float(self.dt))
-        if self.couple:
-            run = CxxPrinter().procedure(
-                "run", (Q, Qaux, p, time, mesh),
-                lambda *a: T.hyperbolic_precice(
-                    nsm, *a, side=self.couple["side"],
-                    subcycling=self.subcycling, **kw))
-            march = "run(Q, Qaux, p, 0.0, mesh, 0L)"
-        else:
-            run = CxxPrinter().procedure(
-                "run", (Q, Qaux, p, time, time_end, mesh),
-                lambda *a: T.hyperbolic(nsm, *a, **kw))
-            march = "run(Q, Qaux, p, 0.0, time_end, mesh, 0L)"
-        return run, march
-
-    def _configure(self, nsm, linsolve=None):
-        """Backend settings: implicit-solve tolerances."""
-        ls = linsolve or dict(tol=self.gmres_tol, restart=self.gmres_restart,
-                              maxiter=self.gmres_maxiter, accept=-1.0)
-        return ("inline void configure()\n{\n"
-                f"    implicit().tol = {self.implicit_tol!r};\n"
-                f"    implicit().maxiter = {self.implicit_maxiter};\n"
-                f"    implicit().ls_tol = {float(ls['tol'])!r};\n"
-                f"    implicit().ls_restart = {int(ls['restart'])};\n"
-                f"    implicit().ls_maxiter = {int(ls['maxiter'])};\n"
-                f"    implicit().ls_accept = {float(ls['accept'])!r};\n"
-                f"    implicit().ls_gamg = {str(bool(ls.get('gamg'))).lower()};\n}}")
+        """The host program (:mod:`zoomy_core.symsolver.program`); coupled:
+        the preCICE march as its ``run`` (``time_end`` unused, preCICE ends
+        the loop)."""
+        kw = self._kw(nsm, dimension)
+        if not self.couple:
+            return hyperbolic_program(nsm, **kw)
+        implicit, linsolve = kw.pop("implicit"), kw.pop("linsolve")
+        kw["dt_constant"] = None if self.dt is None else sp.Float(self.dt)
+        Q, Qaux, p, time, time_end, mesh = sp.symbols("Q Qaux p time time_end mesh")
+        run = CxxPrinter().procedure(
+            "run", (Q, Qaux, p, time, time_end, mesh),
+            lambda Q, Qaux, p, time, time_end, mesh: T.hyperbolic_precice(
+                nsm, Q, Qaux, p, time, mesh, side=self.couple["side"],
+                subcycling=self.subcycling, **kw))
+        return _program(nsm, run, implicit, linsolve, nsm.resolved_lsq_degree())
 
     def build(self, nsm, dimension):
         """Print, write the build tree, wmake (cached).  Returns the binary."""
@@ -204,7 +186,7 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
             f"application symFoam; startFrom startTime; startTime 0; stopAt endTime;\n"
             f"endTime {1e30 if self.time_end is None else self.time_end!r}; deltaT 1; writeControl timeStep; "
             f"writeInterval 1; writeFormat ascii; writePrecision 17; spaceDimension {dim};\n"
-            + _precice_dict(self.couple))
+            + self._control() + _precice_dict(self.couple))
         if structured:
             _write_grid_system(case, lo, hi, n, dim, names)
             mesher = "blockMesh > log.blockMesh 2>&1"
@@ -391,25 +373,18 @@ class SymbolicChorinSolverFoam(SymbolicHyperbolicSolverFoam):
                                  restart=self.pressure_restart).values
         tol = float(ell["c_elliptic_tol"])
         return dict(tol=tol, restart=int(ell["c_elliptic_restart"]),
-                    maxiter=self.pressure_maxit, accept=max(1e-6, 10.0 * tol),
-                    gamg=self.pressure_preconditioner == "gamg")
+                    maxiter=self.pressure_maxit, accept=max(1e-6, 10.0 * tol))
 
-    def _print_run(self, nsm, dimension):
-        Q, Qaux, p, time, time_end, mesh = sp.symbols(
-            "Q Qaux p time time_end mesh")
-        run = CxxPrinter().procedure(
-            "run", (Q, Qaux, p, time, time_end, mesh),
-            lambda *a: CH.chorin(
-                nsm, self.press, self.corr, *a, cfl=self.cfl,
-                dimension=dimension, imex=self.imex, time_order=self.time_order,
-                mood=self._mood(nsm),
-                dt_write=self.dt_write, cfl_check_every=self.cfl_check_every,
-                wave_speed=self.cfl_wave_speed,
-                pressure_newton=(None if self.pressure_solve == "linear" else
-                                 (sp.Float(self.pressure_newton_tol),
-                                  int(self.pressure_newton_maxit))),
-                dt_constant=None if self.dt is None else sp.Float(self.dt)))
-        return run, "run(Q, Qaux, p, 0.0, time_end, mesh, 0L)"
+    def _control(self):
+        return f"pressurePreconditioner {self.pressure_preconditioner};\n"
+
+    def _print(self, nsm, dimension):
+        return chorin_program(
+            nsm, self.press, self.corr, time_order=self.time_order,
+            pressure_newton=(None if self.pressure_solve == "linear" else
+                             (sp.Float(self.pressure_newton_tol),
+                              int(self.pressure_newton_maxit))),
+            **self._kw(nsm, dimension))
 
     def run(self, mesh, systems, Q0, workdir):
         pred, press, corr = systems

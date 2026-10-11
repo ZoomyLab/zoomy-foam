@@ -160,6 +160,13 @@ template<int N> std::array<Field, N> split(const Field& F)
     return out;
 }
 
+// Backend configuration from the NSM (set by the printed configure()).
+struct Settings
+{
+    int lsq_degree = 1;       // highest derivative order the model asks for
+};
+inline Settings& settings() { static Settings s; return s; }
+
 // x with A x = b, n x n row-major, partial pivoting
 inline std::vector<double> dense_solve(std::vector<double> A, std::vector<double> b)
 {
@@ -623,11 +630,14 @@ Field derivatives(const S& spec, const Field& Q, Field out, const Mesh& M,
         if (!rows.empty() && std::find(rows.begin(), rows.end(), e[1]) == rows.end()) continue;
         std::vector<int> ax;                   // the axes, with multiplicity
         for (int a = 0; a < 3; ++a) ax.insert(ax.end(), e[2 + a], a);
+        if (int(ax.size()) > std::min(2, settings().lsq_degree))
+            FatalErrorInFunction << "derivative_aux: order " << ax.size() << " > 2 or above the LSQ degree "
+                << settings().lsq_degree << Foam::exit(Foam::FatalError);
         const Foam::volScalarField& s = M.load(Q, e[1], Qb);
         const Foam::volVectorField g(Foam::fvc::grad(s));
         if (ax.size() == 1)
             M.copy(out, e[0], g, [&](const Foam::vector& v) { return v[ax[0]]; });
-        else if (ax.size() == 2)
+        else
         {
             const Foam::surfaceVectorField n(M.m.nf());
             Foam::surfaceVectorField gf(Foam::fvc::interpolate(g));
@@ -636,9 +646,6 @@ Field derivatives(const S& spec, const Field& Q, Field out, const Mesh& M,
             M.copy(out, e[0], H, [&](const Foam::tensor& t)
                    { return 0.5*(t[3*ax[0] + ax[1]] + t[3*ax[1] + ax[0]]); });
         }
-        else
-            FatalErrorInFunction << "derivative_aux: order " << ax.size() << " > 2"
-                << Foam::exit(Foam::FatalError);
     }
     return out;
 }
@@ -726,7 +733,7 @@ struct Implicit
     double ls_tol = 1e-7;     // GMRES: ||A x - b|| <= ls_tol ||b||
     int ls_restart = 20, ls_maxiter = 30;
     double ls_accept = -1;    // > 0: abort above this relative residual
-    bool ls_gamg = false;     // GMRES right preconditioned by GAMG Laplacians
+    bool ls_gamg = false;     // controlDict pressurePreconditioner gamg
     long ls_solves = 0, ls_iters = 0;   // statistics
 };
 inline Implicit& implicit() { static Implicit s; return s; }
