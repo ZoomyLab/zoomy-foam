@@ -22,6 +22,10 @@
 #include "volFields.H"
 #include "surfaceFields.H"
 #include "emptyPolyPatch.H"
+#include "processorPolyPatch.H"
+#include "fvc.H"
+#include "fvm.H"
+#include "fvMatrices.H"
 
 #include <memory>
 #include <precice/precice.hpp>
@@ -80,22 +84,30 @@ using std::pow;
 // NaN propagates (std::min / std::max would swallow it)
 inline double minimum(double a, double b) { return (a != a || b != b) ? NaN : std::min(a, b); }
 inline double maximum(double a, double b) { return (a != a || b != b) ? NaN : std::max(a, b); }
+// over all ranks (OpenFOAM's minOp / maxOp would swallow a NaN)
+inline double global(double m, bool lowest)
+{
+    if (Foam::returnReduce(m != m, Foam::orOp<bool>())) return NaN;
+    return lowest ? Foam::returnReduce(m, Foam::minOp<double>())
+                  : Foam::returnReduce(m, Foam::maxOp<double>());
+}
 inline double reduce_min(const Field& a)
 {
     double m = std::numeric_limits<double>::infinity();
     for (double x : a.d) m = minimum(m, x);
-    return m;
+    return global(m, true);
 }
 inline double reduce_max(const Field& a)
 {
     double m = -std::numeric_limits<double>::infinity();
     for (double x : a.d) m = maximum(m, x);
-    return m;
+    return global(m, false);
 }
 inline bool reduce_any(const Field& a)
 {
-    for (double x : a.d) if (x != 0.0) return true;
-    return false;
+    bool any = false;
+    for (double x : a.d) any = any || x != 0.0;
+    return Foam::returnReduce(any, Foam::orOp<bool>());
 }
 // entry (i, c) of a field (one row broadcasts) or of a number
 inline double at(const Field& F, int i, int c) { return F(F.nq == 1 ? 0 : i, c); }
@@ -148,13 +160,6 @@ template<int N> std::array<Field, N> split(const Field& F)
     return out;
 }
 
-// Backend configuration from the NSM (set by the driver).
-struct Settings
-{
-    int lsq_degree = 1;
-};
-inline Settings& settings() { static Settings s; return s; }
-
 // x with A x = b, n x n row-major, partial pivoting
 inline std::vector<double> dense_solve(std::vector<double> A, std::vector<double> b)
 {
@@ -185,23 +190,35 @@ inline std::vector<double> dense_solve(std::vector<double> A, std::vector<double
 }
 
 // ── mesh ────────────────────────────────────────────────────────────────────
+// Columns of a cell field: the rank's own cells, then one halo column per
+// processor-patch face (the cell across it, kept current by ``halo``).  Faces:
+// internal, physical boundary, processor (owner -> halo column).
+struct Mesh;
+inline const Mesh*& active() { static const Mesh* m = nullptr; return m; }
+
+template<class... I> std::array<int, sizeof...(I)> ints(const std::tuple<I...>& t)
+{
+    return std::apply([](auto... i) { return std::array<int, sizeof...(I)>{int(i)...}; }, t);
+}
+
 struct Mesh
 {
     const Foam::fvMesh& m;
-    int dim, nc, nfi, nf, nbf;
+    int dim, nown, nc, nfi, nf, nbf;
     std::vector<int> own, nei, cfl_nei;      // nei = -1 on a boundary face
     std::vector<Foam::vector> normal, fc, cc;
     std::vector<double> area, vol, inradius;
     std::vector<int> bf_face, bf_cell, bf_branch;
     std::vector<std::string> bf_tag;         // patch name of each boundary face
-    std::vector<std::array<int, 3>> mon;     // LSQ monomials, 1 <= order <= degree
-    std::vector<std::vector<int>> lsq_nbrs;  // LSQ stencil
-    std::vector<std::vector<int>> cell_bf;   // boundary faces of each cell
+    std::vector<Foam::label> physical, processor;   // patch indices
+    mutable Foam::volScalarField s;          // scratch, calculated patches
 
-    Mesh(const Foam::fvMesh& mesh, int dim_, const std::vector<std::string>& tags,
-         int degree = settings().lsq_degree)
+    Mesh(const Foam::fvMesh& mesh, int dim_, const std::vector<std::string>& tags)
     :
-        m(mesh), dim(dim_), nc(mesh.nCells()), nfi(mesh.nInternalFaces())
+        m(mesh), dim(dim_), nown(mesh.nCells()), nfi(mesh.nInternalFaces()),
+        s(Foam::IOobject("zs", mesh.time().name(), mesh, Foam::IOobject::NO_READ,
+                         Foam::IOobject::NO_WRITE, false),
+          mesh, Foam::dimensionedScalar(Foam::dimless, 0))
     {
         auto add = [&](int o, int ne, const Foam::vector& S, const Foam::vector& C)
         {
@@ -214,7 +231,10 @@ struct Mesh
         forAll(mesh.boundaryMesh(), patchI)
         {
             const Foam::polyPatch& pp = mesh.boundaryMesh()[patchI];
-            if (Foam::isA<Foam::emptyPolyPatch>(pp)) continue;
+            if (Foam::isA<Foam::processorPolyPatch>(pp)) processor.push_back(patchI);
+            if (Foam::isA<Foam::emptyPolyPatch>(pp) || Foam::isA<Foam::processorPolyPatch>(pp))
+                continue;
+            physical.push_back(patchI);
             int branch = 0;
             if (!tags.empty())
             {
@@ -235,188 +255,69 @@ struct Mesh
                     mesh.Cf().boundaryField()[patchI][k]);
             }
         }
-        nf = int(own.size()); nbf = int(bf_face.size());
+        nbf = int(bf_face.size());
+        nc = nown;
+        for (const Foam::label p : processor)
+            forAll(mesh.boundaryMesh()[p], k)
+                add(mesh.boundaryMesh()[p].faceCells()[k], nc++,
+                    mesh.Sf().boundaryField()[p][k], mesh.Cf().boundaryField()[p][k]);
+        nf = int(own.size());
         std::vector<double> surface(nc, 0.0);
-        for (int f = 0; f < nf; ++f)
+        for (int f = 0; f < nf; ++f) surface[own[f]] += area[f];
+        for (int f = 0; f < nfi; ++f) surface[nei[f]] += area[f];
+        Field g(5, nc);                          // the halo columns' geometry
+        for (int c = 0; c < nown; ++c)
         {
-            surface[own[f]] += area[f];
-            if (nei[f] >= 0) surface[nei[f]] += area[f];
+            g(0, c) = mesh.V()[c];
+            g(1, c) = dim*mesh.V()[c]/surface[c];
+            for (int a = 0; a < 3; ++a) g(2 + a, c) = mesh.C()[c][a];
         }
-        cell_bf.resize(nc);
-        for (int i = 0; i < nbf; ++i) cell_bf[bf_cell[i]].push_back(i);
+        exchange(g);
         for (int c = 0; c < nc; ++c)
         {
-            vol.push_back(mesh.V()[c]);
-            cc.push_back(mesh.C()[c]);
-            inradius.push_back(dim*mesh.V()[c]/surface[c]);
+            vol.push_back(g(0, c));
+            inradius.push_back(g(1, c));
+            cc.push_back(Foam::vector(g(2, c), g(3, c), g(4, c)));
         }
-        for (int t = 1; t <= degree; ++t)
-            for (int a = t; a >= 0; --a)
-                for (int b = t - a; b >= 0; --b)
-                {
-                    const std::array<int, 3> m{a, b, t - a - b};
-                    if ((dim < 2 && m[1]) || (dim < 3 && m[2])) continue;
-                    mon.push_back(m);
-                }
-        stencils(mesh);
+        active() = this;
     }
 
-    // zoomy_core.mesh.geometry_xp._lsq_stencils: vertex one-ring (>= 2-D) or
-    // face neighbours (1-D), grown by face-neighbour rings until there are
-    // more samples than monomials; in 1-D every stencil is then padded to
-    // the largest one.
-    void stencils(const Foam::fvMesh& mesh)
+    // row ``row`` of X into the scratch field; physical boundary faces carry
+    // the face values B (per boundary face) or the cell value; processor
+    // patches the neighbours' values
+    const Foam::volScalarField& load(const Field& X, int row, const Field* B) const
     {
-        const size_t required = mon.size() + 1;
-        auto has = [](const std::vector<int>& v, int x)
-        {
-            return std::find(v.begin(), v.end(), x) != v.end();
-        };
-        auto grow = [&](std::vector<int>& cur, int c)
-        {
-            std::vector<int> add;
-            for (const int x : cur)
-                for (const Foam::label n : mesh.cellCells()[x])
-                    if (n != c && !has(cur, n) && !has(add, n)) add.push_back(n);
-            cur.insert(cur.end(), add.begin(), add.end());
-            return !add.empty();
-        };
-        lsq_nbrs.assign(nc, {});
-        for (int c = 0; c < nc; ++c)
-        {
-            auto& cur = lsq_nbrs[c];
-            if (dim >= 2)
+        auto& in = s.primitiveFieldRef();
+        for (int c = 0; c < nown; ++c) in[c] = X(row, c);
+        int i = 0;
+        for (const Foam::label p : physical)
+            for (auto& v : s.boundaryFieldRef()[p])
             {
-                for (const Foam::label pt : mesh.cellPoints()[c])
-                    for (const Foam::label n : mesh.pointCells()[pt])
-                        if (n != c && !has(cur, n)) cur.push_back(n);
+                v = B ? (*B)(row, i) : X(row, bf_cell[i]);
+                ++i;
             }
-            for (const Foam::label n : mesh.cellCells()[c])
-                if (cur.size() < required || dim < 2)
-                    if (!has(cur, n)) cur.push_back(n);
-            while (cur.size() < required && grow(cur, c)) {}
-        }
-        if (dim >= 2) return;
-        size_t most = 0;
-        for (const auto& v : lsq_nbrs) most = std::max(most, v.size());
-        for (int c = 0; c < nc; ++c)
-        {
-            while (lsq_nbrs[c].size() < most && grow(lsq_nbrs[c], c)) {}
-            lsq_nbrs[c].resize(std::min(most, lsq_nbrs[c].size()));
-        }
+        s.correctBoundaryConditions();
+        return s;
+    }
+
+    // row ``row`` of X from a vol field: own cells, then the neighbours'
+    // values on the processor patches
+    template<class T, class C>
+    void copy(Field& X, int row, const Foam::VolField<T>& f, C cmpt) const
+    {
+        for (int c = 0; c < nown; ++c) X(row, c) = cmpt(f[c]);
+        int h = nown;
+        for (const Foam::label p : processor)
+            for (const T& v : f.boundaryField()[p]) X(row, h++) = cmpt(v);
+    }
+
+    void exchange(Field& X) const
+    {
+        if (!Foam::Pstream::parRun()) return;
+        for (int i = 0; i < X.nq; ++i)
+            copy(X, i, load(X, i, nullptr), [](double v) { return v; });
     }
 };
-
-// ── least-squares gradients ─────────────────────────────────────────────────
-// Unweighted polynomial LSQ fit (monomials M.mon) over the stencil; the
-// coefficients come back as derivatives (times the multi-index factorial).
-// A boundary face adds a sample at the ghost position 2 (x_f - x_c) carrying
-// ghost - u (``Ub``) or 0; from 2-D on it feeds only the derivatives along its
-// own normal axis, the others keep the interior fit (REQ-174b).
-using Coeffs = std::vector<std::vector<double>>;
-using Grad = std::vector<std::array<double, 3>>;
-
-inline Coeffs lsq_fit(const Field& U, int row, const Field* Ub, const Mesh& M)
-{
-    const int m = int(M.mon.size());
-    auto vrow = [&](const Foam::vector& d)
-    {
-        std::vector<double> v(m, 1.0);
-        for (int k = 0; k < m; ++k)
-            for (int a = 0; a < 3; ++a)
-                for (int e = 0; e < M.mon[k][a]; ++e) v[k] *= d[a];
-        return v;
-    };
-    auto add = [&](std::vector<double>& A, std::vector<double>& b,
-                   const Foam::vector& d, double du)
-    {
-        const auto v = vrow(d);
-        for (int i = 0; i < m; ++i)
-        {
-            b[i] += v[i]*du;
-            for (int j = 0; j < m; ++j) A[i*m + j] += v[i]*v[j];
-        }
-    };
-    std::vector<double> fact(m, 1.0);
-    for (int k = 0; k < m; ++k)
-        for (int a = 0; a < 3; ++a)
-            for (int e = 2; e <= M.mon[k][a]; ++e) fact[k] *= e;
-    Coeffs out(M.nc, std::vector<double>(m));
-    for (int c = 0; c < M.nc; ++c)
-    {
-        std::vector<double> A(m*m, 0.0), b(m, 0.0);
-        for (const int n : M.lsq_nbrs[c]) add(A, b, M.cc[n] - M.cc[c], U(row, n) - U(row, c));
-        auto ghost = [&](int i, std::vector<double>& A1, std::vector<double>& b1)
-        {
-            const Foam::vector d = 2.0*(M.fc[M.bf_face[i]] - M.cc[c]);
-            add(A1, b1, d, Ub ? (*Ub)(row, i) - U(row, c) : 0.0);
-            int axis = 0;
-            for (int a = 1; a < M.dim; ++a) if (std::abs(d[a]) > std::abs(d[axis])) axis = a;
-            return axis;
-        };
-        std::vector<double> x;
-        if (M.dim == 1 || M.cell_bf[c].empty())
-        {
-            for (const int i : M.cell_bf[c]) ghost(i, A, b);
-            x = dense_solve(A, b);
-        }
-        else
-        {
-            x = dense_solve(A, b);
-            for (const int i : M.cell_bf[c])
-            {
-                auto A1 = A;
-                auto b1 = b;
-                const int axis = ghost(i, A1, b1);
-                const auto x1 = dense_solve(A1, b1);
-                for (int k = 0; k < m; ++k)
-                {
-                    const auto& e = M.mon[k];
-                    if (e[axis] != 0 && e[0] + e[1] + e[2] == e[axis]) x[k] = x1[k];
-                }
-            }
-        }
-        for (int k = 0; k < m; ++k) out[c][k] = x[k]*fact[k];
-    }
-    return out;
-}
-
-inline Grad lsq_gradient(const Field& U, int row, const Field* Ub, const Mesh& M)
-{
-    const Coeffs co = lsq_fit(U, row, Ub, M);
-    Grad g(M.nc, std::array<double, 3>{});
-    for (size_t k = 0; k < M.mon.size(); ++k)
-        for (int a = 0; a < 3; ++a)
-            if (M.mon[k][a] == 1 && M.mon[k][0] + M.mon[k][1] + M.mon[k][2] == 1)
-                for (int c = 0; c < M.nc; ++c) g[c][a] = co[c][k];
-    return g;
-}
-
-inline double dot(const std::array<double, 3>& g, const Foam::vector& r, int dim)
-{
-    double s = 0.0;
-    for (int i = 0; i < dim; ++i) s += g[i]*r[i];
-    return s;
-}
-
-// Limiter factor of one cell from one face increment ``delta`` (cell bounds
-// dmin/dmax); ``ev2`` = (cell size)^2 for Venkatakrishnan.
-enum class Limiter { minmod, venkatakrishnan, barth_jespersen };
-inline double limit(Limiter L, double delta, double dmin, double dmax, double ev2)
-{
-    const double eps = 1e-30;
-    if (!(delta > eps) && !(delta < -eps)) return 1.0;
-    const double dm = delta > eps ? dmax : dmin;
-    if (L == Limiter::venkatakrishnan)
-    {
-        const double num = dm*dm + ev2 + 2*delta*dm;
-        const double den = dm*dm + 2*delta*delta + delta*dm + ev2;
-        return std::clamp(num/std::max(den, eps), 0.0, 1.0);
-    }
-    // minmod and Barth-Jespersen: the same ratio on a single face increment
-    return std::clamp(delta > eps ? dm/std::max(delta, eps)
-                                  : dm/std::min(delta, -eps), 0.0, 1.0);
-}
 
 // ── kernels on cells and faces ──────────────────────────────────────────────
 template<class K>
@@ -578,16 +479,38 @@ inline std::tuple<Field, Field> cell_traces(const Field& Q, const Field& Qb,
     return {L, R};
 }
 
-inline Field gradient(const Field& W, const Field& Wb, const Mesh& M)
+// The boundary ghost Wb sits at twice the cell-to-face offset: the face
+// carries (W + Wb)/2.
+inline Field face_values(const Field& W, const Field& Wb, const Mesh& M)
+{
+    Field F(W.nq, M.nbf);
+    for (int q = 0; q < W.nq; ++q)
+        for (int i = 0; i < M.nbf; ++i) F(q, i) = 0.5*(W(q, M.bf_cell[i]) + Wb(q, i));
+    return F;
+}
+
+// OpenFOAM's gradient scheme ``scheme`` (fvSchemes) of every row in ``rows``:
+// row 3 q + a of the result holds d/dx_a of row q
+template<class R>
+Field fv_gradient(const R& rows, const Field& W, const Field& Wb, const Mesh& M,
+                  const char* scheme)
 {
     Field G(3*W.nq, M.nc);
-    for (int q = 0; q < W.nq; ++q)
+    const Field F = face_values(W, Wb, M);
+    for (const int q : rows)
     {
-        const Grad g = lsq_gradient(W, q, &Wb, M);
-        for (int c = 0; c < M.nc; ++c)
-            for (int a = 0; a < 3; ++a) G(3*q + a, c) = g[c][a];
+        const Foam::volVectorField g(Foam::fvc::grad(M.load(W, q, &F), scheme));
+        for (int a = 0; a < 3; ++a)
+            M.copy(G, 3*q + a, g, [a](const Foam::vector& v) { return v[a]; });
     }
     return G;
+}
+
+inline Field gradient(const Field& W, const Field& Wb, const Mesh& M)
+{
+    std::vector<int> rows(W.nq);
+    for (int q = 0; q < W.nq; ++q) rows[q] = q;
+    return fv_gradient(rows, W, Wb, M, "grad");
 }
 
 inline double slope_dot(const Field& G, int q, int c, const Foam::vector& r, int dim)
@@ -597,58 +520,39 @@ inline double slope_dot(const Field& G, int q, int c, const Foam::vector& r, int
     return s;
 }
 
-// Limiter factors of ``rows``, 1 elsewhere; bounds from the neighbours and
-// the boundary ghosts 2 Wb - W.
+// Limiter factors of ``rows``, 1 elsewhere: OpenFOAM's cellLimited gradient
+// (fvSchemes ``limited(<name>)``) is phi G.
 template<class... I>
-Field limiter_factors(Limiter L, const std::tuple<I...>& rows, const Field& W,
-                      const Field& Wb, const Field& G, const Mesh& M)
+Field limiter_factors(const char* scheme, const std::tuple<I...>& rows,
+                      const Field& W, const Field& Wb, const Field& G, const Mesh& M)
 {
     Field phi(W.nq, M.nc, 1.0);
-    const std::array<int, sizeof...(I)> r = std::apply(
-        [](auto... i) { return std::array<int, sizeof...(I)>{int(i)...}; }, rows);
-    for (const int q : r)
-    {
-        std::vector<double> lo(M.nc), hi(M.nc);
-        for (int c = 0; c < M.nc; ++c) lo[c] = hi[c] = W(q, c);
-        for (int f = 0; f < M.nfi; ++f)
+    const Field L = fv_gradient(ints(rows), W, Wb, M, scheme);
+    for (const int q : ints(rows))
+        for (int c = 0; c < M.nc; ++c)
         {
-            const int o = M.own[f], n = M.nei[f];
-            lo[o] = std::min(lo[o], W(q, n)); hi[o] = std::max(hi[o], W(q, n));
-            lo[n] = std::min(lo[n], W(q, o)); hi[n] = std::max(hi[n], W(q, o));
+            double gg = 0.0, gl = 0.0;
+            for (int a = 0; a < 3; ++a)
+            {
+                gg += G(3*q + a, c)*G(3*q + a, c);
+                gl += G(3*q + a, c)*L(3*q + a, c);
+            }
+            if (gg > 0.0) phi(q, c) = gl/gg;
         }
-        for (int i = 0; i < M.nbf; ++i)
-        {
-            const int c = M.bf_cell[i];
-            const double ghost = 2.0*Wb(q, i) - W(q, c);
-            lo[c] = std::min(lo[c], ghost); hi[c] = std::max(hi[c], ghost);
-        }
-        auto face = [&](int c, int f)
-        {
-            const double ev2 = std::pow(std::pow(M.vol[c], 1.0/M.dim), 2);
-            const double delta = slope_dot(G, q, c, M.fc[f] - M.cc[c], M.dim);
-            phi(q, c) = std::min(phi(q, c), limit(L, delta, lo[c] - W(q, c),
-                                                  hi[c] - W(q, c), ev2));
-        };
-        for (int f = 0; f < M.nf; ++f)
-        {
-            face(M.own[f], f);
-            if (M.nei[f] >= 0) face(M.nei[f], f);
-        }
-    }
     return phi;
 }
 template<class... I>
 Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wb,
              const Field& G, const Mesh& M)
-{ return limiter_factors(Limiter::minmod, rows, W, Wb, G, M); }
+{ return limiter_factors("limited(minmod)", rows, W, Wb, G, M); }
 template<class... I>
 Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W,
                       const Field& Wb, const Field& G, const Mesh& M)
-{ return limiter_factors(Limiter::venkatakrishnan, rows, W, Wb, G, M); }
+{ return limiter_factors("limited(venkatakrishnan)", rows, W, Wb, G, M); }
 template<class... I>
 Field barth_jespersen(const std::tuple<I...>& rows, const Field& W,
                       const Field& Wb, const Field& G, const Mesh& M)
-{ return limiter_factors(Limiter::barth_jespersen, rows, W, Wb, G, M); }
+{ return limiter_factors("limited(barth_jespersen)", rows, W, Wb, G, M); }
 
 // each cell's W moved to the face centre by phi G; WR = Wb on boundary faces
 template<class P>
@@ -706,48 +610,53 @@ Field edge_source(K k, const Field& Q, const Field& QL, const Field& QR,
 }
 
 // ── whole-domain operations ─────────────────────────────────────────────────
-// Derivatives from the LSQ fit; boundary samples carry no change.
+// Derivatives (orders 1, 2) by OpenFOAM operators: fvc::grad (fvSchemes
+// default), second order the Gauss integral of the face gradient (cell
+// gradients interpolated, the normal part from the two cell values: compact).
+// Boundary faces carry Qb (the face value), else the cell value.
 template<class S>
-Field derivative_aux(const S& spec, const Field& Q, const Field& Qaux, const Mesh& M)
+Field derivatives(const S& spec, const Field& Q, Field out, const Mesh& M,
+                  const Field* Qb, const std::vector<int>& rows)
 {
-    Field out = Qaux;
     for (const auto& e : spec)
     {
-        int k = 0;
-        while (k < int(M.mon.size())
-               && !(M.mon[k][0] == e[2] && M.mon[k][1] == e[3] && M.mon[k][2] == e[4])) ++k;
-        if (k == int(M.mon.size()))
-            FatalErrorInFunction << "derivative_aux: (" << e[2] << " " << e[3] << " "
-                << e[4] << ") exceeds the LSQ degree " << settings().lsq_degree
+        if (!rows.empty() && std::find(rows.begin(), rows.end(), e[1]) == rows.end()) continue;
+        std::vector<int> ax;                   // the axes, with multiplicity
+        for (int a = 0; a < 3; ++a) ax.insert(ax.end(), e[2 + a], a);
+        const Foam::volScalarField& s = M.load(Q, e[1], Qb);
+        const Foam::volVectorField g(Foam::fvc::grad(s));
+        if (ax.size() == 1)
+            M.copy(out, e[0], g, [&](const Foam::vector& v) { return v[ax[0]]; });
+        else if (ax.size() == 2)
+        {
+            const Foam::surfaceVectorField n(M.m.nf());
+            Foam::surfaceVectorField gf(Foam::fvc::interpolate(g));
+            gf += n*(Foam::fvc::snGrad(s) - (n & gf));
+            const Foam::volTensorField H(Foam::fvc::surfaceIntegrateExtrapolate(M.m.Sf()*gf));
+            M.copy(out, e[0], H, [&](const Foam::tensor& t)
+                   { return 0.5*(t[3*ax[0] + ax[1]] + t[3*ax[1] + ax[0]]); });
+        }
+        else
+            FatalErrorInFunction << "derivative_aux: order " << ax.size() << " > 2"
                 << Foam::exit(Foam::FatalError);
-        const Coeffs co = lsq_fit(Q, e[1], nullptr, M);
-        for (int c = 0; c < M.nc; ++c) out(e[0], c) = co[c][k];
     }
     return out;
 }
 
-// Only the derivatives of state ``rows``; boundary values Qb enter as the
-// ghost 2 Qb - Q (linear extrapolation through the face).
+// boundary faces: no change
+template<class S>
+Field derivative_aux(const S& spec, const Field& Q, const Field& Qaux, const Mesh& M)
+{
+    return derivatives(spec, Q, Qaux, M, nullptr, {});
+}
+
+// Only the derivatives of state ``rows``; the boundary faces carry Qb.
 template<class S, class... I>
 Field derivative_aux(const S& spec, const Field& Q, const Field& Qaux,
                      const Mesh& M, const Field& Qb, const std::tuple<I...>& rows)
 {
-    const std::array<int, sizeof...(I)> r = std::apply(
-        [](auto... i) { return std::array<int, sizeof...(I)>{int(i)...}; }, rows);
-    Field G(Q.nq, M.nbf);
-    for (int i = 0; i < M.nbf; ++i)
-        for (int q = 0; q < Q.nq; ++q) G(q, i) = 2.0*Qb(q, i) - Q(q, M.bf_cell[i]);
-    Field out = Qaux;
-    for (const auto& e : spec)
-    {
-        if (std::find(r.begin(), r.end(), e[1]) == r.end()) continue;
-        int k = 0;
-        while (k < int(M.mon.size())
-               && !(M.mon[k][0] == e[2] && M.mon[k][1] == e[3] && M.mon[k][2] == e[4])) ++k;
-        const Coeffs co = lsq_fit(Q, e[1], &G, M);
-        for (int c = 0; c < M.nc; ++c) out(e[0], c) = co[c][k];
-    }
-    return out;
+    const auto r = ints(rows);
+    return derivatives(spec, Q, Qaux, M, &Qb, std::vector<int>(r.begin(), r.end()));
 }
 
 template<class K>
@@ -769,8 +678,7 @@ template<class... I, class V>
 Field put(const Field& Q, const std::tuple<I...>& rows, const V& values)
 {
     Field out = Q;
-    const std::array<int, sizeof...(I)> r = std::apply(
-        [](auto... i) { return std::array<int, sizeof...(I)>{int(i)...}; }, rows);
+    const auto r = ints(rows);
     for (size_t k = 0; k < r.size(); ++k)
         for (int c = 0; c < Q.n; ++c)
         {
@@ -787,24 +695,23 @@ template<class... I>
 Field clean_round_off(const Field& Q, const std::tuple<I...>& rows, double tol)
 {
     Field out = Q;
-    const std::array<int, sizeof...(I)> r = std::apply(
-        [](auto... i) { return std::array<int, sizeof...(I)>{int(i)...}; }, rows);
+    const auto r = ints(rows);
     for (const int q : r)
         for (int c = 0; c < Q.n; ++c)
             if (Q(q, c) < 0.0 && Q(q, c) >= -tol) out(q, c) = 0.0;
     return out;
 }
 
-// the copies of other ranks' cells: none in a serial run (any value: a field,
-// or the scalar 0 of a zero pressure)
-template<class T>
-T halo(const T& X, const Mesh&) { return X; }   // by value: never a dangling reference
+// the halo columns from their owners (processor patches); a number (the
+// zero pressure) has none.  By value: never a dangling reference.
+inline Field halo(const Field& X, const Mesh& M) { Field Y = X; M.exchange(Y); return Y; }
+template<class T, std::enable_if_t<std::is_arithmetic_v<T>, int> = 0>
+T halo(T x, const Mesh&) { return x; }
 
 template<class... I>
 Field take(const Field& Q, const std::tuple<I...>& rows)
 {
-    const std::array<int, sizeof...(I)> r = std::apply(
-        [](auto... i) { return std::array<int, sizeof...(I)>{int(i)...}; }, rows);
+    const auto r = ints(rows);
     Field out(int(r.size()), Q.n);
     for (size_t k = 0; k < r.size(); ++k)
         for (int c = 0; c < Q.n; ++c) out(int(k), c) = Q(r[k], c);
@@ -819,21 +726,20 @@ struct Implicit
     double ls_tol = 1e-7;     // GMRES: ||A x - b|| <= ls_tol ||b||
     int ls_restart = 20, ls_maxiter = 30;
     double ls_accept = -1;    // > 0: abort above this relative residual
+    bool ls_gamg = false;     // GMRES right preconditioned by GAMG Laplacians
+    long ls_solves = 0, ls_iters = 0;   // statistics
 };
 inline Implicit& implicit() { static Implicit s; return s; }
 
-inline double norm(const Field& a)
-{
-    double s = 0.0;
-    for (double x : a.d) s += x*x;
-    return std::sqrt(s);
-}
+// cell fields, over the own cells of all ranks
 inline double vdot(const Field& a, const Field& b)
 {
     double s = 0.0;
-    for (size_t k = 0; k < a.d.size(); ++k) s += a.d[k]*b.d[k];
-    return s;
+    for (int i = 0; i < a.nq; ++i)
+        for (int c = 0; c < active()->nown; ++c) s += a(i, c)*b(i, c);
+    return Foam::returnReduce(s, Foam::sumOp<double>());
 }
+inline double norm(const Field& a) { return std::sqrt(vdot(a, a)); }
 
 // Newton on a cell-local residual f (x -> R, same shape).  Each cell's
 // n x n Jacobian by one-sided differences, one variable at a time in all
@@ -882,28 +788,90 @@ Field root(F f, Field x)
     return x;
 }
 
-// Restarted GMRES (modified Gram-Schmidt, Givens) on the linear map A.
+// Right preconditioner per row m: (c_m L)^-1 by OpenFOAM's GAMG, L the
+// compact Laplacian (homogeneous Dirichlet on the physical boundary), c_m the
+// operator's mean diagonal of row block m over L's (one probe, random signs).
+template<class A>
+std::function<Field(const Field&)> gamg_preconditioner(A op, const Field& b, const Mesh& M)
+{
+    Foam::wordList types(M.m.boundary().size(), "calculated");
+    for (const Foam::label p : M.physical) types[p] = "fixedValue";
+    auto z = std::make_shared<Foam::volScalarField>(
+        Foam::IOobject("zs_p", M.m.time().name(), M.m, Foam::IOobject::NO_READ,
+                       Foam::IOobject::NO_WRITE, false),
+        M.m, Foam::dimensionedScalar(Foam::dimless, 0), types);
+    auto L = std::make_shared<Foam::fvScalarMatrix>(Foam::fvm::laplacian(*z));
+    L->diag() = L->D();                        // the boundary's share folded in
+    const double ld = Foam::gAverage(Foam::scalarField(L->diag()/M.m.V().primitiveField()));
+    Field probe(b.nq, b.n);
+    for (int m = 0; m < b.nq; ++m)
+        for (int c = 0; c < M.nown; ++c)
+        {
+            const double h = std::sin(12.9898*M.cc[c][0] + 78.233*M.cc[c][1]
+                                      + 37.719*M.cc[c][2] + m)*43758.5453;
+            probe(m, c) = h - std::floor(h) < 0.5 ? -1.0 : 1.0;
+        }
+    const Field Ap = op(probe);
+    const double n = Foam::returnReduce(double(M.nown), Foam::sumOp<double>());
+    std::vector<double> scale(b.nq);
+    for (int m = 0; m < b.nq; ++m)
+    {
+        double d = 0.0;
+        for (int c = 0; c < M.nown; ++c) d += probe(m, c)*Ap(m, c);
+        d = Foam::returnReduce(d, Foam::sumOp<double>())/n;
+        scale[m] = std::abs(d) > 1e-300 ? ld/d : 1.0;
+    }
+    Foam::dictionary dict;
+    dict.add("solver", Foam::word("GAMG"));
+    dict.add("smoother", Foam::word("GaussSeidel"));
+    dict.add("tolerance", 0.0);
+    dict.add("relTol", 0.1);
+    dict.add("maxIter", 10);
+    dict.add("nCellsInCoarsestLevel", 2);
+    std::shared_ptr<Foam::lduMatrix::solver> gamg(Foam::lduMatrix::solver::New(
+        "zs_p", *L, L->boundaryCoeffs(), L->internalCoeffs(),
+        z->boundaryField().scalarInterfaces(), dict).ptr());
+    return [z, L, gamg, scale, &M](const Field& v)   // z, L: kept alive for gamg
+    {
+        Field out(v.nq, v.n);
+        Foam::scalarField x(M.nown), src(M.nown);
+        for (int m = 0; m < v.nq; ++m)
+        {
+            for (int c = 0; c < M.nown; ++c) { x[c] = 0.0; src[c] = M.m.V()[c]*v(m, c); }
+            gamg->solve(x, src);
+            for (int c = 0; c < M.nown; ++c) out(m, c) = scale[m]*x[c];
+        }
+        return out;
+    };
+}
+
+// Restarted flexible GMRES (modified Gram-Schmidt, Givens) on the linear map
+// A, global inner products.
 template<class A>
 Field linsolve(A op, const Field& b)
 {
-    const auto& o = implicit();
+    auto& o = implicit();
     const double nb = norm(b);
     Field x(b.nq, b.n);
+    ++o.ls_solves;
     if (nb == 0.0) return x;
+    std::function<Field(const Field&)> prec = [](const Field& v) { return v; };
+    if (o.ls_gamg) prec = gamg_preconditioner(op, b, *active());
     const int m = o.ls_restart;
     for (int outer = 0; outer < o.ls_maxiter; ++outer)
     {
         Field r = b - op(x);
         double beta = norm(r);
         if (beta <= o.ls_tol*nb) break;
-        std::vector<Field> V{r/beta};
+        std::vector<Field> V{r/beta}, Z;
         std::vector<std::vector<double>> H(m + 1, std::vector<double>(m, 0.0));
         std::vector<double> cs(m), sn(m), g(m + 1, 0.0);
         g[0] = beta;
         int j = 0;
-        for (; j < m; ++j)
+        for (; j < m; ++j, ++o.ls_iters)
         {
-            Field w = op(V[j]);
+            Z.push_back(prec(V[j]));
+            Field w = op(Z[j]);
             for (int i = 0; i <= j; ++i)
             {
                 H[i][j] = vdot(w, V[i]);
@@ -931,7 +899,7 @@ Field linsolve(A op, const Field& b)
             for (int k = i + 1; k < j; ++k) y[i] -= H[i][k]*y[k];
             y[i] /= H[i][i];
         }
-        for (int i = 0; i < j; ++i) x = x + y[i]*V[i];
+        for (int i = 0; i < j; ++i) x = x + y[i]*Z[i];
     }
     if (o.ls_accept > 0)
     {

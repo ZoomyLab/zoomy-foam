@@ -24,13 +24,13 @@ namespace zs
 #include "Solver.H"
 }
 
-static void dump(const std::string& path, double time, const zs::Field& Q)
+static void dump(const std::string& path, double time, const zs::Field& Q, int n)
 {
     FILE* f = std::fopen(path.c_str(), "w");
     std::fprintf(f, "%.17g\n", time);
     for (int i = 0; i < Q.nq; ++i)
     {
-        for (int c = 0; c < Q.n; ++c) std::fprintf(f, "%.17g ", Q(i, c));
+        for (int c = 0; c < n; ++c) std::fprintf(f, "%.17g ", Q(i, c));
         std::fprintf(f, "\n");
     }
     std::fclose(f);
@@ -61,21 +61,25 @@ int main(int argc, char* argv[])
                      IOobject::MUST_READ, IOobject::NO_WRITE),
             mesh
         );
-        for (int c = 0; c < M.nc; ++c) Q(i, c) = qi[c];
+        for (int c = 0; c < M.nown; ++c) Q(i, c) = qi[c];
     }
+    Q = zs::halo(Q, M);
     const zs::Vec p = zs::System::parameters();
     const double time_end = runTime.endTime().value();
 
-    mkDir("out");
+    const std::string out = runTime.path()/"out";
+    mkDir(out);
     int k = 0;
     zs::writer() = [&](double t, const zs::Field& q, const zs::Field&)
     {
-        dump("out/" + std::to_string(k++) + ".dat", t, q);
+        dump(out + "/" + std::to_string(k++) + ".dat", t, q, M.nown);
     };
 
     // preCICE: controlDict precice { participant; config; mesh; write (..);
     // read (..); tag; } -- the coupled patch and the data names.
     const bool coupled = runTime.controlDict().found("precice");
+    if (coupled && Pstream::parRun())
+        FatalErrorInFunction << "preCICE coupling runs serial" << exit(FatalError);
     if (coupled)
     {
         const dictionary& d = runTime.controlDict().subDict("precice");
@@ -100,12 +104,15 @@ int main(int argc, char* argv[])
 
     Qaux = std::get<0>(zs::initial_aux(Q, Qaux, p, std::cref(M), 0L));
     const auto t0 = std::chrono::steady_clock::now();
-    const auto out = zs::march(Q, Qaux, p, time_end, std::cref(M));
+    const auto res = zs::march(Q, Qaux, p, time_end, std::cref(M));
     Info<< "symFoam: march wall time "
         << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
         << " s" << endl;
     if (coupled) zs::coupling().participant->finalize();
-    dump("out/final.dat", std::get<0>(out), std::get<1>(out));
-    Info<< "symFoam: t = " << std::get<0>(out) << nl << "End" << endl;
+    dump(out + "/final.dat", std::get<0>(res), std::get<1>(res), M.nown);
+    if (zs::implicit().ls_solves)
+        Info<< "symFoam: linsolve " << zs::implicit().ls_solves << " solves, "
+            << zs::implicit().ls_iters << " GMRES iterations" << endl;
+    Info<< "symFoam: t = " << std::get<0>(res) << nl << "End" << endl;
     return 0;
 }

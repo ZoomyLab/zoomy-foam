@@ -29,6 +29,21 @@ from zoomy_foam._pipeline import (FOAM_ROOT, _BINCACHE, _apptainer,
 from zoomy_foam.symkernels import write_kernels
 
 APP = FOAM_ROOT / "symsolver"
+# gradients, limiters (rt.H gradient / minmod / ...), the pressure preconditioner
+SCHEMES = """FoamFile { version 2.0; format ascii; class dictionary; object fvSchemes; }
+ddtSchemes { default none; }
+divSchemes { default none; }
+gradSchemes
+{
+    default leastSquares;
+    limited(minmod) cellLimited leastSquares 1;
+    limited(barth_jespersen) cellLimited leastSquares 1;
+    limited(venkatakrishnan) cellLimited<Venkatakrishnan> leastSquares 1;
+}
+laplacianSchemes { default Gauss linear corrected; }
+interpolationSchemes { default linear; }
+snGradSchemes { default corrected; }
+"""
 # preCICE the binary links: a prefix whose version matches the Python peers
 # (conda-forge stops at 3.4.0, the container ships 3.4.1; preCICE refuses to
 # couple different versions).  Unset or missing: the container's own.
@@ -65,6 +80,8 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
     gmres_tol = param.Number(default=1e-7, bounds=(0, None))
     gmres_restart = param.Integer(default=20, bounds=(1, None))
     gmres_maxiter = param.Integer(default=30, bounds=(1, None))
+    nprocs = param.Integer(default=1, bounds=(1, None),
+                           doc="MPI ranks: decomposePar (scotch), mpirun -parallel.")
 
     def _systems(self, nsm):
         return [("nsm", nsm)]
@@ -112,17 +129,17 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
         return run, march
 
     def _configure(self, nsm, linsolve=None):
-        """Backend settings: LSQ degree, implicit-solve tolerances."""
+        """Backend settings: implicit-solve tolerances."""
         ls = linsolve or dict(tol=self.gmres_tol, restart=self.gmres_restart,
                               maxiter=self.gmres_maxiter, accept=-1.0)
         return ("inline void configure()\n{\n"
-                f"    settings().lsq_degree = {int(nsm.resolved_lsq_degree())};\n"
                 f"    implicit().tol = {self.implicit_tol!r};\n"
                 f"    implicit().maxiter = {self.implicit_maxiter};\n"
                 f"    implicit().ls_tol = {float(ls['tol'])!r};\n"
                 f"    implicit().ls_restart = {int(ls['restart'])};\n"
                 f"    implicit().ls_maxiter = {int(ls['maxiter'])};\n"
-                f"    implicit().ls_accept = {float(ls['accept'])!r};\n}}")
+                f"    implicit().ls_accept = {float(ls['accept'])!r};\n"
+                f"    implicit().ls_gamg = {str(bool(ls.get('gamg'))).lower()};\n}}")
 
     def build(self, nsm, dimension):
         """Print, write the build tree, wmake (cached).  Returns the binary."""
@@ -175,11 +192,13 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
             (case / d).mkdir(parents=True)
         names = _side_names(mesh, dim)
         _write_grid_system(case, lo, hi, n, dim, names)
+        (case / "system" / "fvSchemes").write_text(SCHEMES)
         (case / "system" / "controlDict").write_text(
             "FoamFile { version 2.0; format ascii; class dictionary; object controlDict; }\n"
             f"application symFoam; startFrom startTime; startTime 0; stopAt endTime;\n"
             f"endTime {1e30 if self.time_end is None else self.time_end!r}; deltaT 1; writeControl timeStep; "
-            f"writeInterval 1; spaceDimension {dim};\n" + _precice_dict(self.couple))
+            f"writeInterval 1; writeFormat ascii; writePrecision 17; spaceDimension {dim};\n"
+            + _precice_dict(self.couple))
         Q0 = np.asarray(Q0)[:, order]
         patches = {nm: "zeroGradient" for nm in names}
         patches["frontAndBack"] = "empty"
@@ -187,19 +206,35 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
             patches["topAndBottom"] = "empty"
         for i, q in enumerate(Q0):
             _write_field(case, f"Q{i}", q, patches)
-        r = _apptainer(f"cd {case}; blockMesh > log.blockMesh 2>&1 && "
-                       f"{binary} > log.symFoam 2>&1",
+        run = f"{binary} > log.symFoam 2>&1"
+        if self.nprocs > 1:
+            (case / "system" / "decomposeParDict").write_text(
+                "FoamFile { version 2.0; format ascii; class dictionary; object decomposeParDict; }\n"
+                f"numberOfSubdomains {self.nprocs};\nmethod scotch;\n")
+            run = (f"decomposePar > log.decomposePar 2>&1 && mpirun -np {self.nprocs} "
+                   f"--bind-to none {binary} -parallel > log.symFoam 2>&1")
+        r = _apptainer(f"cd {case}; blockMesh > log.blockMesh 2>&1 && {run}",
                        binds=[case.parent, binary.parent], capture_output=True,
                        text=True)
         if r.returncode != 0:
             raise RuntimeError(f"symFoam failed, see {case}/log.symFoam:\n"
                                + (case / "log.symFoam").read_text()[-3000:])
+        parts = ([case] if self.nprocs == 1 else
+                 [case / f"processor{k}" for k in range(self.nprocs)])
+        cells = [None] if self.nprocs == 1 else [
+            _read_labels(d / "constant" / "polyMesh" / "cellProcAddressing") for d in parts]
         inv = np.empty_like(order)
         inv[order] = np.arange(len(order))
-        read = lambda f: _read_dat(f, inv)                       # noqa: E731
-        snaps = sorted((case / "out").glob("[0-9]*.dat"), key=lambda f: int(f.stem))
-        self.snapshots = [read(f) for f in snaps]
-        return read(case / "out" / "final.dat")
+
+        def read(name):
+            time, Q = None, np.empty((Q0.shape[0], len(order)))
+            for d, c in zip(parts, cells):
+                time, q = _read_dat(d / "out" / name)
+                Q[:, slice(None) if c is None else c] = q
+            return time, Q[:, inv]
+        snaps = sorted((parts[0] / "out").glob("[0-9]*.dat"), key=lambda f: int(f.stem))
+        self.snapshots = [read(f.name) for f in snaps]
+        return read("final.dat")
 
 
 def _precice_dict(c):
@@ -233,11 +268,16 @@ def _write_field(case, name, vals, patches):
         f"{len(vals)}\n(\n{body}\n);\nboundaryField {{\n{bf}\n}}\n")
 
 
-def _read_dat(path, inv):
+def _read_dat(path):
     lines = Path(path).read_text().split("\n")
     time = float(lines[0])
-    Q = np.array([[float(x) for x in ln.split()] for ln in lines[1:] if ln.strip()])
-    return time, Q[:, inv]
+    return time, np.array([[float(x) for x in ln.split()] for ln in lines[1:] if ln.strip()])
+
+
+def _read_labels(path):
+    """An OpenFOAM ascii labelList (decomposePar's cellProcAddressing)."""
+    body = Path(path).read_text().split("}", 1)[1]
+    return np.array(body[body.index("(") + 1:body.index(")")].split(), dtype=int)
 
 
 class SymbolicChorinSolverFoam(SymbolicHyperbolicSolverFoam):
@@ -259,6 +299,10 @@ class SymbolicChorinSolverFoam(SymbolicHyperbolicSolverFoam):
     pressure_newton_tol = param.Number(default=1e-10, bounds=(0, None),
                                        doc="Newton: stop at max|R| <= tol.")
     pressure_newton_maxit = param.Integer(default=10, bounds=(1, None))
+    pressure_preconditioner = param.Selector(
+        default="gamg", objects=["gamg", "none"],
+        doc="'gamg': GMRES right preconditioned per pressure row by OpenFOAM's "
+            "GAMG on a Laplacian scaled to the operator's mean diagonal.")
 
     def _systems(self, nsm):
         return [("pred", nsm), ("press", self.press), ("corr", self.corr)]
@@ -269,7 +313,8 @@ class SymbolicChorinSolverFoam(SymbolicHyperbolicSolverFoam):
                                  restart=self.pressure_restart).values
         tol = float(ell["c_elliptic_tol"])
         return dict(tol=tol, restart=int(ell["c_elliptic_restart"]),
-                    maxiter=self.pressure_maxit, accept=max(1e-6, 10.0 * tol))
+                    maxiter=self.pressure_maxit, accept=max(1e-6, 10.0 * tol),
+                    gamg=self.pressure_preconditioner == "gamg")
 
     def _print_run(self, nsm, dimension):
         Q, Qaux, p, time, time_end, mesh = sp.symbols(
