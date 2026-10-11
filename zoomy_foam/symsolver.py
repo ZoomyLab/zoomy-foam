@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 from pathlib import Path
 
 import numpy as np
 import param
 import sympy as sp
+from scipy.spatial import cKDTree
 
 from zoomy_core.numerics import NumericalSystemModel
 from zoomy_core.symsolver import CxxPrinter
@@ -183,22 +185,44 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
         snapshots in ``self.snapshots`` [(time, Q)]."""
         nsm = (model if isinstance(model, NumericalSystemModel)
                else NumericalSystemModel.from_system_model(model))
-        lo, hi, n, order, dim = _mesh_geometry(mesh)
+        structured = _structured(mesh)
+        if structured:
+            lo, hi, n, order, dim = _mesh_geometry(mesh)
+            names = _side_names(mesh, dim)
+        else:                        # gmshToFoam on the mesh extruded by one layer
+            dim, names = 2, list(mesh.boundary_conditions_sorted_names)
         binary = self.build(nsm, dim)
         case = Path(workdir)
         if case.exists():
             shutil.rmtree(case)
         for d in ("0", "system", "constant"):
             (case / d).mkdir(parents=True)
-        names = _side_names(mesh, dim)
-        _write_grid_system(case, lo, hi, n, dim, names)
-        (case / "system" / "fvSchemes").write_text(SCHEMES)
         (case / "system" / "controlDict").write_text(
             "FoamFile { version 2.0; format ascii; class dictionary; object controlDict; }\n"
             f"application symFoam; startFrom startTime; startTime 0; stopAt endTime;\n"
             f"endTime {1e30 if self.time_end is None else self.time_end!r}; deltaT 1; writeControl timeStep; "
             f"writeInterval 1; writeFormat ascii; writePrecision 17; spaceDimension {dim};\n"
             + _precice_dict(self.couple))
+        if structured:
+            _write_grid_system(case, lo, hi, n, dim, names)
+            mesher = "blockMesh > log.blockMesh 2>&1"
+        else:
+            _write_grid_system(case, [0, 1], [1, 1], [1, 1], 2, names)   # fvSolution
+            _write_extruded_msh(mesh, case / "mesh.msh")
+            _apptainer(f"cd {case}; gmshToFoam mesh.msh > log.gmshToFoam 2>&1 && foamPostProcess "
+                       "-func writeCellCentres -time 0 > log.cellCentres 2>&1",
+                       binds=[case.parent], check=True)
+            bnd = case / "constant" / "polyMesh" / "boundary"
+            bnd.write_text(re.sub(r"(frontAndBack\s*\{\s*type\s+)\w+", r"\1empty",
+                                  bnd.read_text()))
+            C = _read_vectors(case / "0" / "C")
+            xc = np.asarray(mesh.cell_centers)[:2, :int(mesh.n_inner_cells)].T
+            dist, order = cKDTree(xc).query(C[:, :2])
+            assert dist.max() < 1e-8 * np.ptp(xc), "gmshToFoam cells do not match the mesh"
+            for f in (case / "0").glob("C*"):     # C, Ccx, ...: not ours to decompose
+                f.unlink()
+            mesher = "true"
+        (case / "system" / "fvSchemes").write_text(SCHEMES)
         Q0 = np.asarray(Q0)[:, order]
         patches = {nm: "zeroGradient" for nm in names}
         patches["frontAndBack"] = "empty"
@@ -213,7 +237,7 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
                 f"numberOfSubdomains {self.nprocs};\nmethod scotch;\n")
             run = (f"decomposePar > log.decomposePar 2>&1 && mpirun -np {self.nprocs} "
                    f"--bind-to none {binary} -parallel > log.symFoam 2>&1")
-        r = _apptainer(f"cd {case}; blockMesh > log.blockMesh 2>&1 && {run}",
+        r = _apptainer(f"cd {case}; {mesher} && {run}",
                        binds=[case.parent, binary.parent], capture_output=True,
                        text=True)
         if r.returncode != 0:
@@ -243,6 +267,58 @@ def _precice_dict(c):
     return (f"precice {{ participant {c['participant']}; config \"{c['config']}\"; "
             f"mesh {c['mesh']}; write ({' '.join(c['write'])}); "
             f"read ({' '.join(c['read'])}); tag {c['tag']}; }}\n")
+
+
+def _structured(mesh):
+    """A uniform 1-D or quad grid: blockMesh; anything else: gmshToFoam."""
+    if mesh.type == "line":
+        return True
+    xc = np.round(np.asarray(mesh.cell_centers)[:2, :int(mesh.n_inner_cells)], 9)
+    return (mesh.type == "quad"
+            and len(np.unique(xc[0])) * len(np.unique(xc[1])) == int(mesh.n_inner_cells))
+
+
+def _write_extruded_msh(mesh, path):
+    """A 2-D mesh as one layer of prisms / hexahedra (z in [0, 1]), gmsh 2.2:
+    the boundary tags on the side faces, ``frontAndBack`` at z = 0 and 1."""
+    import meshio
+    X = np.asarray(mesh.vertex_coordinates)[:2].T
+    nv, nc = len(X), int(mesh.n_inner_cells)
+    cv = np.asarray(mesh.cell_vertices)[:, :nc].T.copy()
+    e = np.roll(cv, -1, axis=1)                              # counter-clockwise cells
+    area = (X[cv, 0] * X[e, 1] - X[e, 0] * X[cv, 1]).sum(axis=1)
+    cv[area < 0] = cv[area < 0, ::-1]
+    names = list(mesh.boundary_conditions_sorted_names)
+    fc = np.asarray(mesh.face_centers)
+    fc = (fc if fc.shape[0] == int(mesh.n_faces) else fc.T)[:, :2]
+    edges = {i: [] for i in range(len(names) + 1)}
+    for k, f in enumerate(np.asarray(mesh.boundary_face_face_indices)[:int(mesh.n_boundary_faces)]):
+        c = int(np.asarray(mesh.boundary_face_cells)[k])
+        a = cv[c]
+        b = np.roll(a, -1)
+        j = int(np.argmin(np.linalg.norm(0.5 * (X[a] + X[b]) - fc[f], axis=1)))
+        edges[int(mesh.boundary_face_function_numbers[k])].append((a[j], b[j]))
+    kind = {3: ("wedge", "triangle"), 4: ("hexahedron", "quad")}[cv.shape[1]]
+    pts = np.vstack([np.c_[X, np.zeros(nv)], np.c_[X, np.ones(nv)]])
+    blocks, phys = [(kind[0], np.c_[cv, cv + nv])], [np.full(nc, len(names) + 1)]
+    for t, ab in edges.items():
+        if ab:
+            ab = np.array(ab)
+            blocks.append(("quad", np.c_[ab[:, 1], ab[:, 0], ab[:, 0] + nv, ab[:, 1] + nv]))
+            phys.append(np.full(len(ab), t + 1))
+    blocks += [(kind[1], cv[:, ::-1]), (kind[1], cv + nv)]
+    phys += [np.full(nc, len(names) + 2)] * 2
+    field = {nm: [i + 1, 2] for i, nm in enumerate(names)}
+    field.update(internal=[len(names) + 1, 3], frontAndBack=[len(names) + 2, 2])
+    meshio.write(str(path), meshio.Mesh(pts, blocks, cell_data={
+        "gmsh:physical": phys, "gmsh:geometrical": phys}, field_data=field),
+        file_format="gmsh22", binary=False)
+
+
+def _read_vectors(path):
+    """The internal field of an ascii volVectorField."""
+    body = Path(path).read_text().split("internalField", 1)[1].split("boundaryField", 1)[0]
+    return np.array([v.split() for v in re.findall(r"\(([^()]*)\)", body)], dtype=float)
 
 
 def _side_names(mesh, dim):
