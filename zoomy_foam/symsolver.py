@@ -209,7 +209,8 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
         (case / "system" / "fvSchemes").write_text(SCHEMES)
         Q0 = np.asarray(Q0)[:, order]
         patches = {nm: "zeroGradient" for nm in names}
-        patches["frontAndBack"] = "empty"
+        if dim < 3:
+            patches["frontAndBack"] = "empty"
         if dim == 1:
             patches["topAndBottom"] = "empty"
         for i, q in enumerate(Q0):
@@ -254,12 +255,15 @@ def _precice_dict(c):
 
 
 def _structured(mesh):
-    """A uniform 1-D or quad grid: blockMesh; anything else: gmshToFoam."""
+    """A uniform 1-D, quad or hexahedral grid: blockMesh; anything else:
+    gmshToFoam."""
     if mesh.type == "line":
         return True
-    xc = np.round(np.asarray(mesh.cell_centers)[:2, :int(mesh.n_inner_cells)], 9)
-    return (mesh.type == "quad"
-            and len(np.unique(xc[0])) * len(np.unique(xc[1])) == int(mesh.n_inner_cells))
+    dim = {"quad": 2, "hexahedron": 3}.get(mesh.type)
+    if dim is None:
+        return False
+    xc = np.round(np.asarray(mesh.cell_centers)[:dim, :int(mesh.n_inner_cells)], 9)
+    return np.prod([len(np.unique(x)) for x in xc]) == int(mesh.n_inner_cells)
 
 
 def _write_extruded_msh(mesh, path):

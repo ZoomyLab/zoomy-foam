@@ -189,21 +189,23 @@ def _wmake_cached():
 
 # ── (c) case build ──────────────────────────────────────────────────────────
 def _default_face_names(dim):
-    """Side-patch names in axis order (x-lo, x-hi[, y-lo, y-hi]).  1-D keeps the
-    historical left/right; 2-D uses the compass tags the shared cases already
-    tag their BCs with (mesh.FACE_NAMES = West/East/South/North)."""
-    return ("left", "right") if dim == 1 else ("West", "East", "South", "North")
+    """Side-patch names in axis order (x-lo, x-hi[, y-lo, y-hi[, z-lo, z-hi]]).
+    1-D keeps the historical left/right; 2-D uses the compass tags the shared
+    cases already tag their BCs with (mesh.FACE_NAMES = West/East/South/North);
+    3-D the tags of ``BaseMesh.create_3d``."""
+    return {1: ("left", "right"), 2: ("West", "East", "South", "North"),
+            3: ("left", "right", "front", "back", "bottom", "top")}[dim]
 
 
 def _mesh_geometry(mesh):
-    """Structured-grid geometry for a uniform 1-D or 2-D LSQMesh.
+    """Structured-grid geometry for a uniform 1-, 2- or 3-D LSQMesh.
 
     Returns ``(lo, hi, n, order, dim)``: ``lo/hi/n`` are per-active-axis lists
     (x, then y), ``order`` maps the LSQMesh cell order to OpenFOAM's blockMesh
-    order (x fastest, y slowest — ``hex (nx ny 1)``), ``dim`` in {1, 2}.  The
-    foam SOLVER is dimension-agnostic (it reads the full face normal); only this
-    structured-grid builder is bounded — a 3-D or unstructured case must arrive
-    as a gmsh ``.msh`` and go through ``gmshToFoam``."""
+    order (x fastest, z slowest — ``hex (nx ny nz)``), ``dim`` in {1, 2, 3}.
+    The foam SOLVER is dimension-agnostic (it reads the full face normal); an
+    unstructured case must arrive as a gmsh ``.msh`` and go through
+    ``gmshToFoam``."""
     nc = int(mesh.n_inner_cells)
     cc = np.asarray(mesh.cell_centers)[:, :nc]
     active = [ax for ax in range(min(cc.shape[0], 3))
@@ -213,10 +215,6 @@ def _mesh_geometry(mesh):
             "zoomy_foam builds structured grids with contiguous active axes "
             "(1-D in x, 2-D in x–y); supply a gmsh .msh for anything else.")
     dim = len(active)
-    if dim > 2:
-        raise NotImplementedError(
-            "zoomy_foam structured build handles 1-D and 2-D; a 3-D or "
-            "unstructured case must come as a gmsh .msh for gmshToFoam.")
     lo, hi, n = [], [], []
     for ax in active:
         u = np.unique(np.round(cc[ax], 9))
@@ -224,19 +222,19 @@ def _mesh_geometry(mesh):
         lo.append(float(u.min() - d / 2))
         hi.append(float(u.max() + d / 2))
         n.append(int(len(u)))
-    # OF cell order for hex (nx ny 1) is x-fastest, y-slowest.  lexsort's LAST
-    # key is primary, so keys (x, y) sort by y then x — exactly that order.
+    # OF cell order for hex (nx ny nz) is x-fastest, z-slowest.  lexsort's LAST
+    # key is primary, so keys (x, y, z) sort by z, y, then x — that order.
     order = np.lexsort(tuple(cc[ax] for ax in active))
     return lo, hi, n, order, dim
 
 
 def _write_grid_system(case, lo, hi, n, dim=1, face_names=None):
-    """Structured blockMeshDict (1-D interval or 2-D quad grid) + minimal
-    fvSchemes/fvSolution, shared by the explicit and Chorin builders.
+    """Structured blockMeshDict (1-D interval, 2-D quad or 3-D hexahedral grid)
+    + minimal fvSchemes/fvSolution, shared by the explicit and Chorin builders.
 
-    The mesh box is ``[lo, hi]`` on each active axis; the y (1-D only) and z (all)
-    directions are a single ``empty`` cell so OpenFOAM's operators run in the
-    intended dimension.  ``face_names`` names the ``2*dim`` side patches in axis
+    The mesh box is ``[lo, hi]`` on each active axis; the y (1-D only) and z
+    (1-D, 2-D) directions are a single ``empty`` cell so OpenFOAM's operators
+    run in the intended dimension.  ``face_names`` names the ``2*dim`` side patches in axis
     order — they MUST match the model's BC tags, else the solver's name-based BC
     dispatch (init.H) leaves them at the field default (zeroGradient)."""
     fn = tuple(face_names) if face_names else _default_face_names(dim)
@@ -245,20 +243,26 @@ def _write_grid_system(case, lo, hi, n, dim=1, face_names=None):
         y0, y1, nx, ny = lo[1], hi[1], n[0], n[1]
     else:
         y0, y1, nx, ny = 0.0, 1.0, n[0], 1
-    # 8 hex vertices of [x0,x1]×[y0,y1]×[0,1].
-    verts = [(x0, y0, 0), (x1, y0, 0), (x1, y1, 0), (x0, y1, 0),
-             (x0, y0, 1), (x1, y0, 1), (x1, y1, 1), (x0, y1, 1)]
+    z0, z1, nz = (lo[2], hi[2], n[2]) if dim == 3 else (0.0, 1.0, 1)
+    # 8 hex vertices of [x0,x1]×[y0,y1]×[z0,z1].
+    verts = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+             (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
     vtxt = "".join(f"({vx} {vy} {vz})" for vx, vy, vz in verts)
     # Hex face vertex-loops: x-lo/x-hi, y-lo/y-hi, z-lo/z-hi.
     xlo, xhi = "(0 4 7 3)", "(1 2 6 5)"
     ylo, yhi = "(0 1 5 4)", "(3 7 6 2)"
-    zfaces = "(0 3 2 1) (4 5 6 7)"
+    zlo, zhi = "(0 3 2 1)", "(4 5 6 7)"
+    zfaces = f"{zlo} {zhi}"
     patches = [f"  {fn[0]} {{ type patch; faces ( {xlo} ); }}",
                f"  {fn[1]} {{ type patch; faces ( {xhi} ); }}"]
     if dim >= 2:
         patches += [f"  {fn[2]} {{ type patch; faces ( {ylo} ); }}",
-                    f"  {fn[3]} {{ type patch; faces ( {yhi} ); }}",
-                    f"  frontAndBack {{ type empty; faces ( {zfaces} ); }}"]
+                    f"  {fn[3]} {{ type patch; faces ( {yhi} ); }}"]
+    if dim == 3:
+        patches += [f"  {fn[4]} {{ type patch; faces ( {zlo} ); }}",
+                    f"  {fn[5]} {{ type patch; faces ( {zhi} ); }}"]
+    elif dim == 2:
+        patches += [f"  frontAndBack {{ type empty; faces ( {zfaces} ); }}"]
     else:
         patches += [f"  frontAndBack {{ type empty; faces ( {ylo} {yhi} ); }}",
                     f"  topAndBottom {{ type empty; faces ( {zfaces} ); }}"]
@@ -266,7 +270,7 @@ def _write_grid_system(case, lo, hi, n, dim=1, face_names=None):
         "FoamFile { version 2.0; format ascii; class dictionary; object blockMeshDict; }\n"
         "convertToMeters 1;\n"
         f"vertices ( {vtxt} );\n"
-        f"blocks ( hex (0 1 2 3 4 5 6 7) ({nx} {ny} 1) simpleGrading (1 1 1) );\n"
+        f"blocks ( hex (0 1 2 3 4 5 6 7) ({nx} {ny} {nz}) simpleGrading (1 1 1) );\n"
         "edges (); boundary (\n" + "\n".join(patches) + "\n); mergePatchPairs ();\n")
     (case / "system" / "fvSchemes").write_text(
         "FoamFile { version 2.0; format ascii; class dictionary; object fvSchemes; }\n"
