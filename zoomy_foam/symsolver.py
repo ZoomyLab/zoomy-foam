@@ -24,7 +24,7 @@ from scipy.spatial import cKDTree
 from zoomy_core.numerics import NumericalSystemModel
 from zoomy_core.symsolver import CxxPrinter
 from zoomy_core.solver.constants import ELLIPTIC_RTOL, elliptic_constants
-from zoomy_core.symsolver.program import _program, chorin_program, hyperbolic_program
+from zoomy_core.symsolver.program import _program, chorin_program, chorin_systems, hyperbolic_program
 from zoomy_core.symsolver import hyperbolic as T
 from zoomy_foam._pipeline import (FOAM_ROOT, _BINCACHE, _apptainer,
                                   _mesh_geometry,
@@ -387,13 +387,6 @@ class SymbolicChorinSolverFoam(SymbolicHyperbolicSolverFoam):
             **self._kw(nsm, dimension))
 
     def run(self, mesh, systems, Q0, workdir):
-        pred, press, corr = systems
-        named = []
-        for name, sm in (("pred", pred), ("press", press), ("corr", corr)):
-            nsm = (sm if isinstance(sm, NumericalSystemModel)
-                   else NumericalSystemModel.from_system_model(sm))
-            nsm._symbolic_name = name
-            named.append(nsm)
-        pred, self.press, self.corr = named
+        pred, self.press, self.corr = chorin_systems(*systems)
         self._nc = int(mesh.n_inner_cells)
         return super().run(mesh, pred, Q0, workdir)
