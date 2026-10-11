@@ -795,8 +795,10 @@ Field clean_round_off(const Field& Q, const std::tuple<I...>& rows, double tol)
     return out;
 }
 
-// the copies of other ranks' cells: none in a serial run
-inline const Field& halo(const Field& X, const Mesh&) { return X; }
+// the copies of other ranks' cells: none in a serial run (any value: a field,
+// or the scalar 0 of a zero pressure)
+template<class T>
+T halo(const T& X, const Mesh&) { return X; }   // by value: never a dangling reference
 
 template<class... I>
 Field take(const Field& Q, const std::tuple<I...>& rows)
