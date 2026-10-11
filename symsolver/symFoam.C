@@ -78,8 +78,6 @@ int main(int argc, char* argv[])
     // preCICE: controlDict precice { participant; config; mesh; write (..);
     // read (..); tag; } -- the coupled patch and the data names.
     const bool coupled = runTime.controlDict().found("precice");
-    if (coupled && Pstream::parRun())
-        FatalErrorInFunction << "preCICE coupling runs serial" << exit(FatalError);
     if (coupled)
     {
         const dictionary& d = runTime.controlDict().subDict("precice");
@@ -98,7 +96,8 @@ int main(int argc, char* argv[])
             }
         c.ids.resize(c.faces.size());
         c.participant = std::make_unique<precice::Participant>(
-            word(d.lookup("participant")), fileName(d.lookup("config")), 0, 1);
+            word(d.lookup("participant")), fileName(d.lookup("config")),
+            Pstream::myProcNo(), Pstream::nProcs());     // this rank's vertices only
         c.participant->setMeshVertices(c.mesh, xy, c.ids);
     }
 

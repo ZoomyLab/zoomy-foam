@@ -13,6 +13,7 @@ import hashlib
 import os
 import re
 import shutil
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -152,10 +153,11 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
         h = hashlib.sha256(str(PRECICE).encode())
         for k in sorted(files):
             h.update(k.encode() + files[k].encode())
-        tmp = _BINCACHE / "sym_kernels.H"
         _BINCACHE.mkdir(exist_ok=True)
-        write_kernels(self._systems(nsm), self.source, tmp)
-        files["Kernels.H"] = tmp.read_text()
+        with tempfile.TemporaryDirectory(dir=_BINCACHE) as d:   # per build: runs may be concurrent
+            tmp = Path(d) / "Kernels.H"
+            write_kernels(self._systems(nsm), self.source, tmp)
+            files["Kernels.H"] = tmp.read_text()
         h.update(files["Kernels.H"].encode())
         build = _BINCACHE / f"sym_{h.hexdigest()[:16]}"
         binary = build / "symFoam"
