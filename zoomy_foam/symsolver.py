@@ -84,7 +84,11 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
     gmres_restart = param.Integer(default=20, bounds=(1, None))
     gmres_maxiter = param.Integer(default=30, bounds=(1, None))
     nprocs = param.Integer(default=1, bounds=(1, None),
-                           doc="MPI ranks: decomposePar (scotch), mpirun -parallel.")
+                           doc="MPI ranks: decomposePar, mpirun -parallel.")
+    decomposition = param.Selector(
+        default="scotch", objects=["scotch", "simple"],
+        doc="decomposePar method: 'scotch' (graph partition), 'simple' (nprocs "
+            "slabs along x).")
 
     def _systems(self, nsm):
         return [("nsm", nsm)]
@@ -169,7 +173,10 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
         snapshots in ``self.snapshots`` [(time, Q)]."""
         nsm = (model if isinstance(model, NumericalSystemModel)
                else NumericalSystemModel.from_system_model(model))
+        from zoomy_core.mesh import ensure_lsq_mesh
+        mesh = ensure_lsq_mesh(mesh, nsm)        # its LSQ stencil: the derivatives'
         structured = _structured(mesh)
+        cyclic = _cyclic(nsm)
         if structured:
             lo, hi, n, order, dim = _mesh_geometry(mesh)
             names = _side_names(mesh, dim)
@@ -188,17 +195,22 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
             f"writeInterval 1; writeFormat ascii; writePrecision 17; spaceDimension {dim};\n"
             + self._control() + _precice_dict(self.couple))
         if structured:
-            _write_grid_system(case, lo, hi, n, dim, names)
+            _write_grid_system(case, lo, hi, n, dim, names, cyclic)
             mesher = "blockMesh > log.blockMesh 2>&1"
         else:
             _write_grid_system(case, [0, 1], [1, 1], [1, 1], 2, names)   # fvSolution
-            _write_extruded_msh(mesh, case / "mesh.msh")
+            _write_extruded_msh(mesh, case / "mesh.msh", cyclic)
             _apptainer(f"cd {case}; gmshToFoam mesh.msh > log.gmshToFoam 2>&1 && foamPostProcess "
                        "-func writeCellCentres -time 0 > log.cellCentres 2>&1",
                        binds=[case.parent], check=True)
             bnd = case / "constant" / "polyMesh" / "boundary"
-            bnd.write_text(re.sub(r"(frontAndBack\s*\{\s*type\s+)\w+", r"\1empty",
-                                  bnd.read_text()))
+            text = re.sub(r"(frontAndBack\s*\{\s*type\s+)\w+", r"\1empty", bnd.read_text())
+            for nm, partner in cyclic.items():     # the seam pairs: translational cyclics
+                text = re.sub(rf"(\n\s*{nm}\s*\{{\s*type\s+)\w+;",
+                              rf"\1cyclic; neighbourPatch {partner}; transformType "
+                              rf"translational; separation {_separation(mesh, nm, partner)};",
+                              text)
+            bnd.write_text(text)
             C = _read_vectors(case / "0" / "C")
             xc = np.asarray(mesh.cell_centers)[:2, :int(mesh.n_inner_cells)].T
             dist, order = cKDTree(xc).query(C[:, :2])
@@ -208,7 +220,7 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
             mesher = "true"
         (case / "system" / "fvSchemes").write_text(SCHEMES)
         Q0 = np.asarray(Q0)[:, order]
-        patches = {nm: "zeroGradient" for nm in names}
+        patches = {nm: "cyclic" if nm in cyclic else "zeroGradient" for nm in names}
         if dim < 3:
             patches["frontAndBack"] = "empty"
         if dim == 1:
@@ -219,21 +231,24 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
         if self.nprocs > 1:
             (case / "system" / "decomposeParDict").write_text(
                 "FoamFile { version 2.0; format ascii; class dictionary; object decomposeParDict; }\n"
-                f"numberOfSubdomains {self.nprocs};\nmethod scotch;\n")
-            run = (f"decomposePar > log.decomposePar 2>&1 && mpirun -np {self.nprocs} "
-                   f"--bind-to none {binary} -parallel > log.symFoam 2>&1")
-        r = _apptainer(f"cd {case}; {mesher} && {run}",
-                       binds=[case.parent, binary.parent], capture_output=True,
-                       text=True)
-        if r.returncode != 0:
-            raise RuntimeError(f"symFoam failed, see {case}/log.symFoam:\n"
-                               + (case / "log.symFoam").read_text()[-3000:])
+                f"numberOfSubdomains {self.nprocs};\nmethod {self.decomposition};\n"
+                f"simpleCoeffs {{ n ({self.nprocs} 1 1); }}\n")
+            mesher += " && decomposePar > log.decomposePar 2>&1"
+            run = (f"mpirun -np {self.nprocs} --bind-to none {binary} -parallel "
+                   "> log.symFoam 2>&1")
+        _apptainer(f"cd {case}; {mesher}", binds=[case.parent], check=True)
         parts = ([case] if self.nprocs == 1 else
                  [case / f"processor{k}" for k in range(self.nprocs)])
         cells = [None] if self.nprocs == 1 else [
             _read_labels(d / "constant" / "polyMesh" / "cellProcAddressing") for d in parts]
         inv = np.empty_like(order)
         inv[order] = np.arange(len(order))
+        _write_stencils(mesh, nsm, cyclic, order, inv, parts, cells)
+        r = _apptainer(f"cd {case}; {run}", binds=[case.parent, binary.parent],
+                       capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"symFoam failed, see {case}/log.symFoam:\n"
+                               + (case / "log.symFoam").read_text()[-3000:])
 
         def read(name):
             time, Q = None, np.empty((Q0.shape[0], len(order)))
@@ -254,6 +269,121 @@ def _precice_dict(c):
             f"read ({' '.join(c['read'])}); tag {c['tag']}; }}\n")
 
 
+def _cyclic(nsm):
+    """{tag: partner} of the model's Periodic BCs: OpenFOAM cyclic pairs
+    (a periodic seam is a pair, so each side must name the other)."""
+    from zoomy_core.model.boundary_conditions import Periodic
+    bcs = getattr(nsm.sm, "_bc_source", None)
+    pairs = {} if bcs is None else {
+        b.tag: b.periodic_to_physical_tag
+        for b in bcs.boundary_conditions_list if type(b) is Periodic}
+    for a, b in pairs.items():
+        if pairs.get(b) != a:
+            raise ValueError(f"Periodic {a!r} -> {b!r} needs Periodic {b!r} -> {a!r} "
+                             "(OpenFOAM's cyclic patches come in pairs)")
+    return pairs
+
+
+def _write_stencils(mesh, nsm, cyclic, order, inv, parts, cells):
+    """``constant/zoomyStencil`` of every part: per cell, the cells of its
+    derivative stencil (global cell numbers of the decomposition) and their
+    offsets.  The stencil is zoomy_core's LSQ stencil (the one JAX fits);
+    across a periodic seam the vertex ring with the seam's vertices
+    identified, offsets to the nearest periodic image."""
+    nc = int(mesh.n_inner_cells)
+    dim = int(mesh.dimension)
+    cc = np.zeros((nc, 3))
+    cc[:, :dim] = np.asarray(mesh.cell_centers)[:dim, :nc].T
+    sten = [[int(j) for j in dict.fromkeys(row) if j < nc and j != c]
+            for c, row in enumerate(np.asarray(mesh.lsq_neighbors)[:nc])]
+    period = _periods(mesh, cyclic, dim)
+    if period.any():
+        sten = _periodic_rings(mesh, nsm, sten, cc, period)
+    # global numbering of the parts' cells (OpenFOAM's globalIndex: part by part)
+    owner = np.zeros(nc, dtype=int)
+    local = np.arange(nc)
+    sizes = []
+    for p, a in enumerate(cells):
+        if a is not None:
+            owner[a], local[a] = p, np.arange(len(a))
+        sizes.append(nc if a is None else len(a))
+    gid = np.concatenate([[0], np.cumsum(sizes)])[owner] + local     # per OF cell
+    for d, a in zip(parts, cells):
+        lines = [str(nc if a is None else len(a))]
+        for k in (range(nc) if a is None else a):     # OF cells of this part
+            c = order[k]
+            off = cc[sten[c]] - cc[c]
+            off -= period * np.round(off / np.where(period > 0, period, 1))
+            lines.append(" ".join([str(len(sten[c]))] + [
+                f"{gid[inv[j]]} {float(o[0])!r} {float(o[1])!r} {float(o[2])!r}"
+                for j, o in zip(sten[c], off)]))
+        (d / "constant" / "zoomyStencil").write_text("\n".join(lines) + "\n")
+
+
+def _periods(mesh, cyclic, dim):
+    """The period along each axis (0: none) of the cyclic pairs."""
+    period = np.zeros(3)
+    for a, b in cyclic.items():
+        s = _seam(mesh, b).mean(axis=0) - _seam(mesh, a).mean(axis=0)
+        ax = int(np.argmax(np.abs(s)))
+        if np.abs(s).sum() > np.abs(s[ax]) * (1 + 1e-9):
+            raise NotImplementedError("periodic seams must be axis-aligned")
+        period[ax] = abs(s[ax])
+    return period
+
+
+def _periodic_rings(mesh, nsm, sten, cc, period):
+    """Seam cells' stencils wrapped across the seams: 1-D the ``lsq_degree``
+    nearest cells each side; else the vertex ring, vertices identified by
+    their coordinates modulo the periods."""
+    nc = len(sten)
+    if int(mesh.dimension) == 1:
+        k = int(nsm.resolved_lsq_degree())
+        o = np.argsort(cc[:, 0])
+        pos = np.empty(nc, dtype=int)
+        pos[o] = np.arange(nc)
+        return [[int(o[(pos[c] + s) % nc]) for s in range(-k, k + 1) if s]
+                for c in range(nc)]
+    from scipy import sparse
+    X = np.zeros((int(mesh.n_vertices), 3))
+    X[:, :int(mesh.dimension)] = np.asarray(mesh.vertex_coordinates)[:int(mesh.dimension)].T
+    lo = X.min(axis=0)
+    folded = np.where(period > 0, (X - lo) % np.where(period > 0, period, 1), X)
+    scale = np.ptp(X, axis=0).max()
+    folded = np.where(np.isclose(folded, np.where(period > 0, period, -1), atol=1e-9 * scale),
+                      0.0, folded)
+    _, vid = np.unique(np.round(folded / scale, 9), axis=0, return_inverse=True)
+    cv = np.asarray(mesh.cell_vertices)[:, :nc]
+    A = sparse.csr_matrix((np.ones(cv.size), (np.repeat(np.arange(nc), cv.shape[0]),
+                                               vid[cv.T.reshape(-1)])))
+    ring = (A @ A.T).tolil().rows
+    own = (sparse.csr_matrix((np.ones(cv.size), (np.repeat(np.arange(nc), cv.shape[0]),
+                                                 cv.T.reshape(-1)))))
+    plain = (own @ own.T).tolil().rows
+    # a cell whose identified ring differs from its plain ring touches a seam
+    return [([int(j) for j in ring[c] if j != c]
+             if len(ring[c]) != len(plain[c]) else sten[c]) for c in range(nc)]
+
+
+def _seam(mesh, tag):
+    """Boundary-face centres of ``tag``, in the mesh's boundary order."""
+    names = list(mesh.boundary_conditions_sorted_names)
+    nb = int(mesh.n_boundary_faces)
+    nums = np.asarray(mesh.boundary_face_function_numbers, dtype=int)[:nb]
+    faces = np.asarray(mesh.boundary_face_face_indices, dtype=int)[:nb]
+    fc = np.asarray(mesh.face_centers)
+    fc = (fc if fc.shape[0] == int(mesh.n_faces) else fc.T)[:, :int(mesh.dimension)]
+    return fc[faces[nums == names.index(tag)]]
+
+
+def _separation(mesh, tag, partner):
+    """OpenFOAM's cyclic ``separation`` of ``tag``: the vector from the
+    partner's faces to its own (as blockMesh writes it)."""
+    s = np.zeros(3)
+    s[:int(mesh.dimension)] = _seam(mesh, tag).mean(axis=0) - _seam(mesh, partner).mean(axis=0)
+    return f"({float(s[0])!r} {float(s[1])!r} {float(s[2])!r})"
+
+
 def _structured(mesh):
     """A uniform 1-D, quad or hexahedral grid: blockMesh; anything else:
     gmshToFoam."""
@@ -266,9 +396,11 @@ def _structured(mesh):
     return np.prod([len(np.unique(x)) for x in xc]) == int(mesh.n_inner_cells)
 
 
-def _write_extruded_msh(mesh, path):
+def _write_extruded_msh(mesh, path, cyclic=None):
     """A 2-D mesh as one layer of prisms / hexahedra (z in [0, 1]), gmsh 2.2:
-    the boundary tags on the side faces, ``frontAndBack`` at z = 0 and 1."""
+    the boundary tags on the side faces, ``frontAndBack`` at z = 0 and 1.
+    ``cyclic`` tags list their faces sorted along the seam, so the faces of a
+    pair correspond one by one (OpenFOAM's cyclic ordering)."""
     import meshio
     X = np.asarray(mesh.vertex_coordinates)[:2].T
     nv, nc = len(X), int(mesh.n_inner_cells)
@@ -281,7 +413,7 @@ def _write_extruded_msh(mesh, path):
     fc = (fc if fc.shape[0] == int(mesh.n_faces) else fc.T)[:, :2]
     edges = {i: [] for i in range(len(names) + 1)}
     for k, f in enumerate(np.asarray(mesh.boundary_face_face_indices)[:int(mesh.n_boundary_faces)]):
-        c = int(np.asarray(mesh.boundary_face_cells)[k])
+        c = int(np.asarray(mesh.face_cells)[0, f])   # the owner (a periodic mesh remaps boundary_face_cells)
         a = cv[c]
         b = np.roll(a, -1)
         j = int(np.argmin(np.linalg.norm(0.5 * (X[a] + X[b]) - fc[f], axis=1)))
@@ -292,6 +424,10 @@ def _write_extruded_msh(mesh, path):
     for t, ab in edges.items():
         if ab:
             ab = np.array(ab)
+            if t < len(names) and names[t] in (cyclic or {}):
+                mid = 0.5 * (X[ab[:, 0]] + X[ab[:, 1]])
+                along = int(np.ptp(mid[:, 1]) > np.ptp(mid[:, 0]))
+                ab = ab[np.argsort(mid[:, along], kind="stable")]
             blocks.append(("quad", np.c_[ab[:, 1], ab[:, 0], ab[:, 0] + nv, ab[:, 1] + nv]))
             phys.append(np.full(len(ab), t + 1))
     blocks += [(kind[1], cv[:, ::-1]), (kind[1], cv + nv)]

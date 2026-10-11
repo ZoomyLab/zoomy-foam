@@ -23,11 +23,17 @@
 #include "surfaceFields.H"
 #include "emptyPolyPatch.H"
 #include "processorPolyPatch.H"
+#include "cyclicPolyPatch.H"
+#include "processorCyclicPolyPatch.H"
+#include "distributionMap.H"
+#include "globalIndex.H"
+#include <fstream>
 #include "fvc.H"
 #include "fvm.H"
 #include "fvMatrices.H"
 
 #include <memory>
+#include <Eigen/Dense>
 #include <precice/precice.hpp>
 
 namespace zs
@@ -198,8 +204,10 @@ inline std::vector<double> dense_solve(std::vector<double> A, std::vector<double
 
 // ── mesh ────────────────────────────────────────────────────────────────────
 // Columns of a cell field: the rank's own cells, then one halo column per
-// processor-patch face (the cell across it, kept current by ``halo``).  Faces:
-// internal, physical boundary, processor (owner -> halo column).
+// coupled-patch face (processor, cyclic: the cell across it, kept current by
+// ``halo``).  Faces: internal, physical boundary, coupled (owner -> halo
+// column).  A periodic seam is a cyclic patch pair: each half is a coupled
+// patch whose halo sits at the partner cell's periodic image.
 struct Mesh;
 inline const Mesh*& active() { static const Mesh* m = nullptr; return m; }
 
@@ -217,7 +225,7 @@ struct Mesh
     std::vector<double> area, vol, inradius;
     std::vector<int> bf_face, bf_cell, bf_branch;
     std::vector<std::string> bf_tag;         // patch name of each boundary face
-    std::vector<Foam::label> physical, processor;   // patch indices
+    std::vector<Foam::label> physical, coupled;     // patch indices
     mutable Foam::volScalarField s;          // scratch, calculated patches
 
     Mesh(const Foam::fvMesh& mesh, int dim_, const std::vector<std::string>& tags)
@@ -238,9 +246,10 @@ struct Mesh
         forAll(mesh.boundaryMesh(), patchI)
         {
             const Foam::polyPatch& pp = mesh.boundaryMesh()[patchI];
-            if (Foam::isA<Foam::processorPolyPatch>(pp)) processor.push_back(patchI);
-            if (Foam::isA<Foam::emptyPolyPatch>(pp) || Foam::isA<Foam::processorPolyPatch>(pp))
-                continue;
+            const bool cpl = Foam::isA<Foam::processorPolyPatch>(pp)
+                          || Foam::isA<Foam::cyclicPolyPatch>(pp);
+            if (cpl) coupled.push_back(patchI);
+            if (cpl || Foam::isA<Foam::emptyPolyPatch>(pp)) continue;
             physical.push_back(patchI);
             int branch = 0;
             if (!tags.empty())
@@ -264,19 +273,23 @@ struct Mesh
         }
         nbf = int(bf_face.size());
         nc = nown;
-        for (const Foam::label p : processor)
+        for (const Foam::label p : coupled)
             forAll(mesh.boundaryMesh()[p], k)
                 add(mesh.boundaryMesh()[p].faceCells()[k], nc++,
                     mesh.Sf().boundaryField()[p][k], mesh.Cf().boundaryField()[p][k]);
         nf = int(own.size());
-        std::vector<double> surface(nc, 0.0);
-        for (int f = 0; f < nf; ++f) surface[own[f]] += area[f];
-        for (int f = 0; f < nfi; ++f) surface[nei[f]] += area[f];
+        // inradius as zoomy_core's mesh defines it (the CFL length): the
+        // shortest normal distance from the cell centre to a face plane
+        std::vector<double> ir(nc, std::numeric_limits<double>::infinity());
+        auto reach = [&](int c, int f)
+        { ir[c] = std::min(ir[c], std::abs((fc[f] - mesh.C()[c]) & normal[f])); };
+        for (int f = 0; f < nf; ++f) reach(own[f], f);
+        for (int f = 0; f < nfi; ++f) reach(nei[f], f);
         Field g(5, nc);                          // the halo columns' geometry
         for (int c = 0; c < nown; ++c)
         {
             g(0, c) = mesh.V()[c];
-            g(1, c) = dim*mesh.V()[c]/surface[c];
+            g(1, c) = ir[c];
             for (int a = 0; a < 3; ++a) g(2 + a, c) = mesh.C()[c][a];
         }
         exchange(g);
@@ -286,11 +299,26 @@ struct Mesh
             inradius.push_back(g(1, c));
             cc.push_back(Foam::vector(g(2, c), g(3, c), g(4, c)));
         }
+        // across a periodic seam (cyclic, processorCyclic) the halo is the
+        // partner's image: owner centre + OpenFOAM's owner-to-neighbour delta
+        int h = nown;
+        for (const Foam::label p : coupled)
+        {
+            const Foam::fvPatch& fp = mesh.boundary()[p];
+            const bool seam = Foam::isA<Foam::cyclicPolyPatch>(fp.patch())
+                           || Foam::isA<Foam::processorCyclicPolyPatch>(fp.patch());
+            const Foam::vectorField d(seam ? fp.delta()() : Foam::vectorField());
+            forAll(fp, k)
+            {
+                if (seam) cc[h] = cc[fp.faceCells()[k]] + d[k];
+                ++h;
+            }
+        }
         active() = this;
     }
 
     // row ``row`` of X into the scratch field; physical boundary faces carry
-    // the face values B (per boundary face) or the cell value; processor
+    // the face values B (per boundary face) or the cell value; coupled
     // patches the neighbours' values
     const Foam::volScalarField& load(const Field& X, int row, const Field* B) const
     {
@@ -308,19 +336,22 @@ struct Mesh
     }
 
     // row ``row`` of X from a vol field: own cells, then the neighbours'
-    // values on the processor patches
+    // values on the coupled patches
     template<class T, class C>
     void copy(Field& X, int row, const Foam::VolField<T>& f, C cmpt) const
     {
         for (int c = 0; c < nown; ++c) X(row, c) = cmpt(f[c]);
         int h = nown;
-        for (const Foam::label p : processor)
-            for (const T& v : f.boundaryField()[p]) X(row, h++) = cmpt(v);
+        for (const Foam::label p : coupled)
+        {
+            const Foam::tmp<Foam::Field<T>> nbr(f.boundaryField()[p].patchNeighbourField());
+            for (const T& v : nbr()) X(row, h++) = cmpt(v);
+        }
     }
 
     void exchange(Field& X) const
     {
-        if (!Foam::Pstream::parRun()) return;
+        if (!Foam::Pstream::parRun() && coupled.empty()) return;
         for (int i = 0; i < X.nq; ++i)
             copy(X, i, load(X, i, nullptr), [](double v) { return v; });
     }
@@ -617,10 +648,139 @@ Field edge_source(K k, const Field& Q, const Field& QL, const Field& QR,
 }
 
 // ── whole-domain operations ─────────────────────────────────────────────────
-// Derivatives (orders 1, 2) by OpenFOAM operators: fvc::grad (fvSchemes
-// default), second order the Gauss integral of the face gradient (cell
-// gradients interpolated, the normal part from the two cell values: compact).
-// Boundary faces carry Qb (the face value), else the cell value.
+// Derivative aux: the least-squares fit of zoomy_core's mesh
+// (geometry_xp._lsq_matrices), polynomial degree = the model's LSQ degree, on
+// zoomy_core's stencil (the driver writes it: constant/zoomyStencil, per cell
+// the stencil cells in global numbering and their offsets; across periodic
+// seams the wrapped vertex ring), values gathered across ranks by a
+// distributionMap; plus one ghost per own physical boundary face at the
+// mirror image of the cell centre, value 2 Qb - Q.  (OpenFOAM's compact Gauss
+// integral of the face gradient is inconsistent off orthogonal grids: on
+// triangles its second-derivative error does not shrink with the mesh.)
+struct Fit
+{
+    std::vector<std::array<int, 2>> mon;          // (a, -1): d/dx_a; (a, b): d2/dx_a dx_b
+    Foam::labelListList stencil;                  // per own cell: compact indices
+    std::unique_ptr<Foam::distributionMap> map;
+    std::vector<std::vector<int>> bfs;            // per own cell: own boundary faces
+    std::vector<Eigen::MatrixXd> A;               // per own cell: the fit's pinv
+
+    explicit Fit(const Mesh& M, int degree)
+    {
+        for (int a = 0; a < M.dim; ++a) mon.push_back({a, -1});
+        for (int a = 0; a < M.dim && degree >= 2; ++a)
+            for (int b = a; b < M.dim; ++b) mon.push_back({a, b});
+        const std::string path = M.m.time().path()/"constant"/"zoomyStencil";
+        std::ifstream in(path);
+        int n = -1;
+        in >> n;
+        if (!in || n != M.nown)
+            FatalErrorInFunction << "no derivative stencil for " << M.nown << " cells in "
+                << path << Foam::exit(Foam::FatalError);
+        stencil.setSize(M.nown);
+        std::vector<std::vector<Foam::vector>> off(M.nown);
+        for (int c = 0; c < M.nown; ++c)
+        {
+            int k;
+            in >> k;
+            stencil[c].setSize(k);
+            for (int j = 0; j < k; ++j)
+            {
+                Foam::vector d;
+                in >> stencil[c][j] >> d[0] >> d[1] >> d[2];
+                off[c].push_back(d);
+            }
+        }
+        Foam::List<Foam::Map<Foam::label>> compact;
+        map.reset(new Foam::distributionMap(Foam::globalIndex(M.nown), stencil, compact));
+        bfs.resize(M.nown);
+        for (int i = 0; i < M.nbf; ++i) bfs[M.bf_cell[i]].push_back(i);
+        for (int c = 0; c < M.nown; ++c)
+        {
+            std::vector<Foam::vector> d = off[c];
+            const int ni = int(d.size()), nb = int(bfs[c].size());
+            for (const int i : bfs[c])
+            {
+                const Foam::vector& n = M.normal[M.bf_face[i]];
+                d.push_back(2*((M.fc[M.bf_face[i]] - M.cc[c]) & n)*n);
+            }
+            Eigen::MatrixXd V(d.size(), mon.size());
+            for (size_t r = 0; r < d.size(); ++r)
+                for (size_t k = 0; k < mon.size(); ++k)
+                {
+                    const auto [a, b] = mon[k];
+                    V(r, k) = b < 0 ? d[r][a] : d[r][a]*d[r][b]*(a == b ? 0.5 : 1.0);
+                }
+            auto pinv = [](const Eigen::MatrixXd& W)
+            { return Eigen::MatrixXd(W.completeOrthogonalDecomposition().pseudoInverse()); };
+            if (M.dim == 1 || nb == 0)            // the full stencil
+            {
+                A.push_back(pinv(V));
+                continue;
+            }
+            // >= 2-D boundary cell (zoomy_core's REQ-174b): every row from the
+            // interior samples; the rows pure along a ghost's axis (d/dx_a,
+            // d2/dx_a2) from the interior samples plus that ghost
+            Eigen::MatrixXd P = Eigen::MatrixXd::Zero(mon.size(), d.size());
+            if (ni) P.leftCols(ni) = pinv(V.topRows(ni));
+            for (int j = 0; j < nb; ++j)
+            {
+                const Foam::vector& g = d[ni + j];
+                int ax = 0;
+                for (int a = 1; a < M.dim; ++a) if (std::abs(g[a]) > std::abs(g[ax])) ax = a;
+                Eigen::MatrixXd W(ni + 1, mon.size());
+                W.topRows(ni) = V.topRows(ni);
+                W.row(ni) = V.row(ni + j);
+                const Eigen::MatrixXd Pj = pinv(W);
+                for (size_t k = 0; k < mon.size(); ++k)
+                    if (mon[k][0] == ax && (mon[k][1] < 0 || mon[k][1] == ax))
+                    {
+                        P.row(k).setZero();
+                        P.row(k).head(ni) = Pj.row(k).head(ni);
+                        P(k, ni + j) = Pj(k, ni);
+                    }
+            }
+            A.push_back(P);
+        }
+    }
+
+    // the derivative along ``ax`` (one or two axes) of row ``row`` of X
+    // (boundary faces: B, else the cell value), own cells and halo
+    Field derivative(const Mesh& M, const Field& Xf, int row, const Field* B,
+                     const std::vector<int>& ax) const
+    {
+        const std::array<int, 2> key = ax.size() == 1 ? std::array<int, 2>{ax[0], -1}
+            : std::array<int, 2>{std::min(ax[0], ax[1]), std::max(ax[0], ax[1])};
+        const int k = int(std::find(mon.begin(), mon.end(), key) - mon.begin());
+        if (k == int(mon.size()))
+            FatalErrorInFunction << "derivative_aux: axis beyond the mesh dimension"
+                << Foam::exit(Foam::FatalError);
+        Foam::List<Foam::scalar> v(map->constructSize(), 0.0);
+        for (int c = 0; c < M.nown; ++c) v[c] = Xf(row, c);
+        map->distribute(v);
+        Field out(1, M.nc);
+        for (int c = 0; c < M.nown; ++c)
+        {
+            const double x = Xf(row, c);
+            Eigen::VectorXd r(stencil[c].size() + bfs[c].size());
+            int m = 0;
+            for (const Foam::label j : stencil[c]) r(m++) = v[j] - x;
+            for (const int i : bfs[c]) r(m++) = 2*((B ? (*B)(row, i) : x) - x);
+            out(0, c) = A[c].row(k).dot(r);
+        }
+        M.exchange(out);
+        return out;
+    }
+};
+inline const Fit& fit(const Mesh& M)
+{
+    static std::unique_ptr<Fit> q;
+    if (!q) q.reset(new Fit(M, settings().lsq_degree));
+    return *q;
+}
+
+// Derivatives (orders 1, 2) by the fit above.  Boundary faces carry Qb (the
+// face value), else the cell value.
 template<class S>
 Field derivatives(const S& spec, const Field& Q, Field out, const Mesh& M,
                   const Field* Qb, const std::vector<int>& rows)
@@ -633,19 +793,8 @@ Field derivatives(const S& spec, const Field& Q, Field out, const Mesh& M,
         if (int(ax.size()) > std::min(2, settings().lsq_degree))
             FatalErrorInFunction << "derivative_aux: order " << ax.size() << " > 2 or above the LSQ degree "
                 << settings().lsq_degree << Foam::exit(Foam::FatalError);
-        const Foam::volScalarField& s = M.load(Q, e[1], Qb);
-        const Foam::volVectorField g(Foam::fvc::grad(s));
-        if (ax.size() == 1)
-            M.copy(out, e[0], g, [&](const Foam::vector& v) { return v[ax[0]]; });
-        else
-        {
-            const Foam::surfaceVectorField n(M.m.nf());
-            Foam::surfaceVectorField gf(Foam::fvc::interpolate(g));
-            gf += n*(Foam::fvc::snGrad(s) - (n & gf));
-            const Foam::volTensorField H(Foam::fvc::surfaceIntegrateExtrapolate(M.m.Sf()*gf));
-            M.copy(out, e[0], H, [&](const Foam::tensor& t)
-                   { return 0.5*(t[3*ax[0] + ax[1]] + t[3*ax[1] + ax[0]]); });
-        }
+        const Field D = fit(M).derivative(M, Q, e[1], Qb, ax);
+        for (int c = 0; c < M.nc; ++c) out(e[0], c) = D(0, c);
     }
     return out;
 }
@@ -709,7 +858,7 @@ Field clean_round_off(const Field& Q, const std::tuple<I...>& rows, double tol)
     return out;
 }
 
-// the halo columns from their owners (processor patches); a number (the
+// the halo columns from their owners (coupled patches); a number (the
 // zero pressure) has none.  By value: never a dangling reference.
 inline Field halo(const Field& X, const Mesh& M) { Field Y = X; M.exchange(Y); return Y; }
 template<class T, std::enable_if_t<std::is_arithmetic_v<T>, int> = 0>
@@ -797,7 +946,8 @@ Field root(F f, Field x)
 
 // Right preconditioner of the pressure solve.  The compact part of the
 // operator (own cell and face neighbours, per pair of rows) assembled by
-// probing with distance-2 cell colours; rows whose own block is diagonally
+// probing with cell colours distance-2 apart in the vertex-ring graph (the
+// reach of the second derivatives); rows whose own block is diagonally
 // dominant are eliminated cell by cell, the others (elliptic) are solved by
 // OpenFOAM's GAMG on their Schur complement (its two-ring part lumped into
 // the diagonal; elliptic rows among each other, and ranks: block Jacobi).
@@ -806,12 +956,15 @@ inline const std::vector<int>& colours(const Mesh& M)
     static std::vector<int> col;
     if (!col.empty() || M.nown == 0) return col;
     col.assign(M.nown, -1);
-    const auto& cc = M.m.cellCells();
+    std::vector<std::vector<int>> cc(M.nown);   // the operator's reach: the vertex rings
+    const auto& S = fit(M).stencil;             // (compact: local cells first)
+    for (int c = 0; c < M.nown; ++c)
+        for (const Foam::label j : S[c]) if (j < M.nown && j != c) cc[c].push_back(j);
     for (int c = 0; c < M.nown; ++c)
     {
         std::vector<bool> used;
         auto mark = [&](int x) { if (col[x] >= 0) { used.resize(std::max<size_t>(used.size(), col[x] + 1)); used[col[x]] = true; } };
-        for (const Foam::label n : cc[c]) { mark(n); for (const Foam::label n2 : cc[n]) mark(n2); }
+        for (const int n : cc[c]) { mark(n); for (const int n2 : cc[n]) mark(n2); }
         col[c] = int(std::find(used.begin(), used.end(), false) - used.begin());
     }
     return col;

@@ -216,19 +216,20 @@ def _mesh_geometry(mesh):
             "(1-D in x, 2-D in x–y); supply a gmsh .msh for anything else.")
     dim = len(active)
     lo, hi, n = [], [], []
+    # the box from the vertices (exact); rounded centres only count the cells
+    # (box ends from rounded centres were off by ~1e-10: e.g. 1/12 -> 9 digits)
+    X = np.asarray(mesh.vertex_coordinates)
     for ax in active:
-        u = np.unique(np.round(cc[ax], 9))
-        d = float(np.mean(np.diff(u))) if len(u) > 1 else 1.0
-        lo.append(float(u.min() - d / 2))
-        hi.append(float(u.max() + d / 2))
-        n.append(int(len(u)))
+        lo.append(float(X[ax].min()))
+        hi.append(float(X[ax].max()))
+        n.append(int(len(np.unique(np.round(cc[ax], 9)))))
     # OF cell order for hex (nx ny nz) is x-fastest, z-slowest.  lexsort's LAST
     # key is primary, so keys (x, y, z) sort by z, y, then x — that order.
     order = np.lexsort(tuple(cc[ax] for ax in active))
     return lo, hi, n, order, dim
 
 
-def _write_grid_system(case, lo, hi, n, dim=1, face_names=None):
+def _write_grid_system(case, lo, hi, n, dim=1, face_names=None, cyclic=None):
     """Structured blockMeshDict (1-D interval, 2-D quad or 3-D hexahedral grid)
     + minimal fvSchemes/fvSolution, shared by the explicit and Chorin builders.
 
@@ -236,7 +237,8 @@ def _write_grid_system(case, lo, hi, n, dim=1, face_names=None):
     (1-D, 2-D) directions are a single ``empty`` cell so OpenFOAM's operators
     run in the intended dimension.  ``face_names`` names the ``2*dim`` side patches in axis
     order — they MUST match the model's BC tags, else the solver's name-based BC
-    dispatch (init.H) leaves them at the field default (zeroGradient)."""
+    dispatch (init.H) leaves them at the field default (zeroGradient).
+    ``cyclic``: {patch: partner} of the periodic sides (OpenFOAM cyclic pairs)."""
     fn = tuple(face_names) if face_names else _default_face_names(dim)
     x0, x1 = lo[0], hi[0]
     if dim >= 2:
@@ -253,14 +255,17 @@ def _write_grid_system(case, lo, hi, n, dim=1, face_names=None):
     ylo, yhi = "(0 1 5 4)", "(3 7 6 2)"
     zlo, zhi = "(0 3 2 1)", "(4 5 6 7)"
     zfaces = f"{zlo} {zhi}"
-    patches = [f"  {fn[0]} {{ type patch; faces ( {xlo} ); }}",
-               f"  {fn[1]} {{ type patch; faces ( {xhi} ); }}"]
+    cyclic = cyclic or {}
+
+    def side(name, loop):
+        kind = (f"cyclic; neighbourPatch {cyclic[name]}" if name in cyclic
+                else "patch")
+        return f"  {name} {{ type {kind}; faces ( {loop} ); }}"
+    patches = [side(fn[0], xlo), side(fn[1], xhi)]
     if dim >= 2:
-        patches += [f"  {fn[2]} {{ type patch; faces ( {ylo} ); }}",
-                    f"  {fn[3]} {{ type patch; faces ( {yhi} ); }}"]
+        patches += [side(fn[2], ylo), side(fn[3], yhi)]
     if dim == 3:
-        patches += [f"  {fn[4]} {{ type patch; faces ( {zlo} ); }}",
-                    f"  {fn[5]} {{ type patch; faces ( {zhi} ); }}"]
+        patches += [side(fn[4], zlo), side(fn[5], zhi)]
     elif dim == 2:
         patches += [f"  frontAndBack {{ type empty; faces ( {zfaces} ); }}"]
     else:
