@@ -49,7 +49,7 @@ int main(int argc, char* argv[])
     fedisableexcept(FE_DIVBYZERO | FE_INVALID | FE_OVERFLOW);
 
     zs::configure();
-    zs::implicit().ls_gamg =
+    zs::krylov().gamg =
         runTime.controlDict().lookupOrDefault<word>("pressurePreconditioner", "none") == "gamg";
     const int dim = runTime.controlDict().lookupOrDefault<label>("spaceDimension", 1);
     const zs::Mesh M(mesh, dim, std::vector<std::string>(zs::sys.bc_tags.begin(), zs::sys.bc_tags.end()));
@@ -92,11 +92,11 @@ int main(int argc, char* argv[])
         for (int i = 0; i < M.nbf; ++i)
             if (M.bf_tag[i] == tag)
             {
-                c.faces.push_back(M.bf_face[i]);
+                zs::interface().faces.push_back(M.bf_face[i]);
                 xy.push_back(M.fc[M.bf_face[i]].x());
                 xy.push_back(M.fc[M.bf_face[i]].y());
             }
-        c.ids.resize(c.faces.size());
+        c.ids.resize(zs::interface().faces.size());
         c.participant = std::make_unique<precice::Participant>(
             word(d.lookup("participant")), fileName(d.lookup("config")),
             Pstream::myProcNo(), Pstream::nProcs());     // this rank's vertices only
@@ -111,9 +111,9 @@ int main(int argc, char* argv[])
         << " s" << endl;
     if (coupled) zs::coupling().participant->finalize();
     dump(out + "/final.dat", std::get<0>(res), std::get<1>(res), M.nown);
-    if (zs::implicit().ls_solves)
-        Info<< "symFoam: linsolve " << zs::implicit().ls_solves << " solves, "
-            << zs::implicit().ls_iters << " GMRES iterations" << endl;
+    if (zs::krylov().solves)
+        Info<< "symFoam: linsolve " << zs::krylov().solves << " solves, "
+            << zs::krylov().iters << " GMRES iterations" << endl;
     Info<< "symFoam: t = " << std::get<0>(res) << nl << "End" << endl;
     return 0;
 }

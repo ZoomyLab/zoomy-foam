@@ -4,8 +4,8 @@
     time, Q = solver.run(mesh, nsm, Q0, workdir)        # Q in the mesh's order
 
 The printed C++ (``Solver.H``), the kernels (``Kernels.H``) and the app
-(``symsolver/symFoam.C`` + ``rt.H``) are compiled in the OpenFOAM-13
-apptainer, cached by a hash of the sources.
+(``symsolver/symFoam.C`` + ``rt.H`` + zoomy_core's ``rt_common.H``) are
+compiled in the OpenFOAM-13 apptainer, cached by a hash of the sources.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ import numpy as np
 import param
 from scipy.spatial import cKDTree
 
-from zoomy_core.symsolver.backend_cxx import CxxBackend, CxxChorinBackend
+from zoomy_core.symsolver.backend_cxx import RUNTIME_HEADER, CxxBackend, CxxChorinBackend
 from zoomy_foam._pipeline import (FOAM_ROOT, _BINCACHE, _apptainer,
                                   _mesh_geometry,
                                   _write_grid_system)
@@ -69,7 +69,8 @@ class FoamDriver(param.Parameterized):
         self.source = self._print(nsm, dimension)
         files = {"Solver.H": self.source,
                  "symFoam.C": (APP / "symFoam.C").read_text(),
-                 "rt.H": (APP / "rt.H").read_text()}
+                 "rt.H": (APP / "rt.H").read_text(),
+                 RUNTIME_HEADER.name: RUNTIME_HEADER.read_text()}
         h = hashlib.sha256(str(PRECICE).encode())
         for k in sorted(files):
             h.update(k.encode() + files[k].encode())
@@ -92,7 +93,8 @@ class FoamDriver(param.Parameterized):
             inc = f"-I{PRECICE}/include "
             lib = f"-L{PRECICE}/lib -Wl,-rpath,{PRECICE}/lib -lprecice"
         (build / "Make" / "options").write_text(
-            f"EXE_INC = -std=c++17 {inc}-I{build} -I{FOAM_ROOT} -I/usr/include/eigen3 \\\n"
+            f"EXE_INC = -std=c++17 -DZS_PRECICE {inc}-I{build} -I{FOAM_ROOT} "
+            "-I/usr/include/eigen3 \\\n"
             "    -I$(LIB_SRC)/finiteVolume/lnInclude -I$(LIB_SRC)/meshTools/lnInclude\n"
             f"EXE_LIBS = -lfiniteVolume -lmeshTools {lib}\n")
         r = _apptainer(f"cd {build}; wmake > wmake.log 2>&1; rc=$?; "

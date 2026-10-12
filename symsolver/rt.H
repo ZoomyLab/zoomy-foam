@@ -5,7 +5,8 @@
 
     Arrays are value types: Field(rows, n) over cells or over faces.  Faces are
     the internal faces, then the faces of every non-empty boundary patch, in
-    OpenFOAM order.  Kernels come from Kernels.H (struct nsm_t).
+    OpenFOAM order.  Kernels come from Kernels.H (struct nsm_t).  What every
+    C++ runtime shares is zoomy_core's rt_common.H.
 \*---------------------------------------------------------------------------*/
 #include <algorithm>
 #include <array>
@@ -34,12 +35,17 @@
 
 #include <memory>
 #include <Eigen/Dense>
-#include <precice/precice.hpp>
+
+#include "rt_common.H"
 
 namespace zs
 {
 using Vec = Foam::List<Foam::scalar>;
-constexpr double NaN = std::numeric_limits<double>::quiet_NaN();
+
+inline void warn(const std::string& message)
+{
+    Foam::Warning << message.c_str() << Foam::endl;
+}
 
 // ── arrays ──────────────────────────────────────────────────────────────────
 struct Field
@@ -52,7 +58,8 @@ struct Field
     double operator()(int i, int c) const { return d[size_t(i)*n + c]; }
 };
 
-// one row broadcasts against many (a cell mask against a state)
+// elementwise (rt_common.H's functors); one row broadcasts against many (a
+// cell mask against a state), a number against all
 template<class F> Field zip(const Field& a, const Field& b, F f)
 {
     Field r(std::max(a.nq, b.nq), a.n);
@@ -61,35 +68,38 @@ template<class F> Field zip(const Field& a, const Field& b, F f)
             r(i, c) = f(a(a.nq == 1 ? 0 : i, c), b(b.nq == 1 ? 0 : i, c));
     return r;
 }
-template<class F> Field map(const Field& a, F f)
+template<class F> Field zip(const Field& a, double s, F f)
 {
     Field r(a.nq, a.n);
-    for (size_t k = 0; k < r.d.size(); ++k) r.d[k] = f(a.d[k]);
+    for (size_t k = 0; k < r.d.size(); ++k) r.d[k] = f(a.d[k], s);
     return r;
 }
-inline Field operator+(const Field& a, const Field& b) { return zip(a, b, [](double x, double y) { return x + y; }); }
-inline Field operator-(const Field& a, const Field& b) { return zip(a, b, [](double x, double y) { return x - y; }); }
-inline Field operator*(const Field& a, const Field& b) { return zip(a, b, [](double x, double y) { return x*y; }); }
-inline Field operator/(const Field& a, const Field& b) { return zip(a, b, [](double x, double y) { return x/y; }); }
-inline Field operator+(const Field& a, double s) { return map(a, [s](double x) { return x + s; }); }
-inline Field operator+(double s, const Field& a) { return a + s; }
-inline Field operator-(const Field& a, double s) { return map(a, [s](double x) { return x - s; }); }
-inline Field operator-(double s, const Field& a) { return map(a, [s](double x) { return s - x; }); }
-inline Field operator*(const Field& a, double s) { return map(a, [s](double x) { return x*s; }); }
-inline Field operator*(double s, const Field& a) { return a*s; }
-inline Field operator/(const Field& a, double s) { return map(a, [s](double x) { return x/s; }); }
-inline Field operator/(double s, const Field& a) { return map(a, [s](double x) { return s/x; }); }
-inline Field operator-(const Field& a) { return map(a, [](double x) { return -x; }); }
-inline Field abs(const Field& a) { return map(a, [](double x) { return std::abs(x); }); }
-inline Field pow(const Field& a, double e) { return map(a, [e](double x) { return std::pow(x, e); }); }
+template<class F> Field zip(double s, const Field& a, F f)
+{
+    Field r(a.nq, a.n);
+    for (size_t k = 0; k < r.d.size(); ++k) r.d[k] = f(s, a.d[k]);
+    return r;
+}
+inline Field operator+(const Field& a, const Field& b) { return zip(a, b, Add{}); }
+inline Field operator-(const Field& a, const Field& b) { return zip(a, b, Sub{}); }
+inline Field operator*(const Field& a, const Field& b) { return zip(a, b, Mul{}); }
+inline Field operator/(const Field& a, const Field& b) { return zip(a, b, Div{}); }
+inline Field operator+(const Field& a, double s) { return zip(a, s, Add{}); }
+inline Field operator+(double s, const Field& a) { return zip(s, a, Add{}); }
+inline Field operator-(const Field& a, double s) { return zip(a, s, Sub{}); }
+inline Field operator-(double s, const Field& a) { return zip(s, a, Sub{}); }
+inline Field operator*(const Field& a, double s) { return zip(a, s, Mul{}); }
+inline Field operator*(double s, const Field& a) { return zip(s, a, Mul{}); }
+inline Field operator/(const Field& a, double s) { return zip(a, s, Div{}); }
+inline Field operator/(double s, const Field& a) { return zip(s, a, Div{}); }
+inline Field operator-(const Field& a) { return zip(a, -1.0, Mul{}); }
+inline Field abs(const Field& a) { return zip(a, 0.0, Abs{}); }
+inline Field pow(const Field& a, double e) { return zip(a, e, Pow{}); }
 using std::abs;
 using std::floor;
 using std::fmod;
 using std::pow;
 
-// NaN propagates (std::min / std::max would swallow it)
-inline double minimum(double a, double b) { return (a != a || b != b) ? NaN : std::min(a, b); }
-inline double maximum(double a, double b) { return (a != a || b != b) ? NaN : std::max(a, b); }
 // over all ranks (OpenFOAM's minOp / maxOp would swallow a NaN)
 inline double global(double m, bool lowest)
 {
@@ -132,10 +142,7 @@ Field select(const Field& m, const A& a, const B& b)
             r(i, c) = at(m, i, c) != 0.0 ? at(a, i, c) : at(b, i, c);
     return r;
 }
-inline Field minimum(const Field& a, const Field& b)
-{
-    return zip(a, b, [](double x, double y) { return minimum(x, y); });
-}
+inline Field minimum(const Field& a, const Field& b) { return zip(a, b, Min{}); }
 
 inline Vec col(const Field& F, int c)
 {
@@ -166,43 +173,6 @@ template<int N> std::array<Field, N> split(const Field& F)
             for (int c = 0; c < F.n; ++c) out[g](i, c) = F(g*r + i, c);
     }
     return out;
-}
-
-// Backend configuration from the NSM (set by the printed configure()).
-struct Settings
-{
-    int lsq_degree = 1;       // highest derivative order the model asks for
-    double tpfa_cos_floor = NaN;   // two-point fluxes: |n.e| raised to this
-};
-inline Settings& settings() { static Settings s; return s; }
-
-// x with A x = b, n x n row-major, partial pivoting
-inline std::vector<double> dense_solve(std::vector<double> A, std::vector<double> b)
-{
-    const int n = int(b.size());
-    for (int k = 0; k < n; ++k)
-    {
-        int piv = k;
-        for (int i = k + 1; i < n; ++i)
-            if (std::abs(A[i*n + k]) > std::abs(A[piv*n + k])) piv = i;
-        if (piv != k)
-        {
-            for (int j = 0; j < n; ++j) std::swap(A[k*n + j], A[piv*n + j]);
-            std::swap(b[k], b[piv]);
-        }
-        for (int i = k + 1; i < n; ++i)
-        {
-            const double m = A[i*n + k]/A[k*n + k];
-            for (int j = k; j < n; ++j) A[i*n + j] -= m*A[k*n + j];
-            b[i] -= m*b[k];
-        }
-    }
-    for (int i = n - 1; i >= 0; --i)
-    {
-        for (int j = i + 1; j < n; ++j) b[i] -= A[i*n + j]*b[j];
-        b[i] /= A[i*n + i];
-    }
-    return b;
 }
 
 // ── mesh ────────────────────────────────────────────────────────────────────
@@ -884,18 +854,15 @@ Field take(const Field& Q, const std::tuple<I...>& rows)
     return out;
 }
 
-// ── implicit solves (settings from the driver) ──────────────────────────────
-struct Implicit
+// ── implicit solves (rt_common.H's implicit() from the driver) ──────────────
+// linsolve: the preconditioner (controlDict pressurePreconditioner) and its
+// statistics
+struct Krylov
 {
-    double tol = 1e-8;        // Newton: ||R||_2 <= tol
-    int maxiter = 6;
-    double ls_tol = 1e-7;     // GMRES: ||A x - b|| <= ls_tol ||b||
-    int ls_restart = 20, ls_maxiter = 30;
-    double ls_accept = -1;    // > 0: abort above this relative residual
-    bool ls_gamg = false;     // controlDict pressurePreconditioner gamg
-    long ls_solves = 0, ls_iters = 0;   // statistics
+    bool gamg = false;
+    long solves = 0, iters = 0;
 };
-inline Implicit& implicit() { static Implicit s; return s; }
+inline Krylov& krylov() { static Krylov k; return k; }
 
 // cell fields, over the own cells of all ranks
 inline double vdot(const Field& a, const Field& b)
@@ -907,52 +874,38 @@ inline double vdot(const Field& a, const Field& b)
 }
 inline double norm(const Field& a) { return std::sqrt(vdot(a, a)); }
 
-// Newton on a cell-local residual f (x -> R, same shape).  Each cell's
-// n x n Jacobian by one-sided differences, one variable at a time in all
-// cells at once (JAX: the exact jvp, same block structure).
-template<class F>
-Field root(F f, Field x)
+// x + h e_k (h = fd_step(x_k)) and h
+inline std::pair<Field, Field> perturb(const Field& x, int k)
 {
-    const auto& o = implicit();
-    Field r = f(x);
-    int it = 0;
-    for (; it < o.maxiter && norm(r) > o.tol; ++it)
+    Field xk = x, h(1, x.n);
+    for (int c = 0; c < x.n; ++c)
     {
-        const int n = x.nq;
-        std::vector<Field> col(n);
-        std::vector<std::vector<double>> h(n, std::vector<double>(x.n));
-        for (int k = 0; k < n; ++k)
-        {
-            Field xk = x;
-            for (int c = 0; c < x.n; ++c)
-            {
-                h[k][c] = 1.4901161193847656e-08*std::max(1.0, std::abs(x(k, c)));
-                xk(k, c) += h[k][c];
-            }
-            col[k] = f(xk);
-        }
-        for (int c = 0; c < x.n; ++c)
-        {
-            std::vector<double> J(n*n), b(n);
-            for (int i = 0; i < n; ++i)
-            {
-                b[i] = -r(i, c);
-                for (int k = 0; k < n; ++k) J[i*n + k] = (col[k](i, c) - r(i, c))/h[k][c];
-            }
-            const auto dx = dense_solve(J, b);
-            for (int i = 0; i < n; ++i) x(i, c) += dx[i];
-        }
-        r = f(x);
+        h(0, c) = fd_step(x(k, c));
+        xk(k, c) += h(0, c);
     }
-    static bool warned = false;
-    if (norm(r) > o.tol && !warned)
+    return {xk, h};
+}
+
+// the per-cell Newton update from the residual r and the perturbed columns
+inline Field newton_update(Field x, const Field& r, const std::vector<Field>& cols,
+                           const std::vector<Field>& hs)
+{
+    const int n = x.nq;
+    std::vector<double> J(n*n), b(n);
+    for (int c = 0; c < x.n; ++c)
     {
-        warned = true;
-        Foam::Warning << "root: not converged after " << it << " Newton updates, ||R|| = "
-                      << norm(r) << " (warned once)" << Foam::endl;
+        for (int i = 0; i < n; ++i)
+        {
+            b[i] = -r(i, c);
+            for (int k = 0; k < n; ++k) J[i*n + k] = (cols[k](i, c) - r(i, c))/hs[k](0, c);
+        }
+        solve_small(J.data(), b.data(), n);
+        for (int i = 0; i < n; ++i) x(i, c) += b[i];
     }
     return x;
 }
+
+template<class F> Field root(F f, Field x) { return newton_cellwise(f, std::move(x)); }
 
 // Right preconditioner of the pressure solve.  The compact part of the
 // operator (own cell and face neighbours, per pair of rows) assembled by
@@ -1060,8 +1013,8 @@ std::function<Field(const Field&)> gamg_preconditioner(Op op, const Field& b, co
             for (int a = 0; a < na; ++a)
                 for (int c = 0; c < na; ++c) D[a*na + c] = T[Aa[a]][Aa[c]].d[i];
             r[q] = 1.0;
-            const auto x = dense_solve(D, r);
-            for (int a = 0; a < na; ++a) P->Dinv[i][a*na + q] = x[a];
+            solve_small(D.data(), r.data(), na);
+            for (int a = 0; a < na; ++a) P->Dinv[i][a*na + q] = r[a];
         }
     // S_e = T_ee - T_eA Dinv T_Ae through each cell l: i -> l -> j, i and j
     // l itself or across one of its faces; i, j two apart: lumped
@@ -1151,13 +1104,14 @@ std::function<Field(const Field&)> gamg_preconditioner(Op op, const Field& b, co
 template<class A>
 Field linsolve(A op, const Field& b)
 {
-    auto& o = implicit();
+    const auto& o = implicit();
+    auto& kr = krylov();
     const double nb = norm(b);
     Field x(b.nq, b.n);
-    ++o.ls_solves;
+    ++kr.solves;
     if (nb == 0.0) return x;
     std::function<Field(const Field&)> prec = [](const Field& v) { return v; };
-    if (o.ls_gamg) prec = gamg_preconditioner(op, b, *active());
+    if (kr.gamg) prec = gamg_preconditioner(op, b, *active());
     const int m = o.ls_restart;
     for (int outer = 0; outer < o.ls_maxiter; ++outer)
     {
@@ -1169,7 +1123,7 @@ Field linsolve(A op, const Field& b)
         std::vector<double> cs(m), sn(m), g(m + 1, 0.0);
         g[0] = beta;
         int j = 0;
-        for (; j < m; ++j, ++o.ls_iters)
+        for (; j < m; ++j, ++kr.iters)
         {
             Z.push_back(prec(V[j]));
             Field w = op(Z[j]);
@@ -1318,39 +1272,6 @@ Field diffusion(K k, G ghost, const Field& X, const Field& Qaux, const Vec& p,
     return out;
 }
 
-// Newton on a global residual R (x -> R, same shape), ``implicit()`` tol /
-// maxiter on ||R||_2; each update a linsolve on the Jacobian action by a
-// directional difference (Jacobian-free Newton-Krylov; JAX: the exact jvp)
-template<class F>
-Field newton_krylov(F R, Field x)
-{
-    const auto& o = implicit();
-    Field r = R(x);
-    int it = 0;
-    for (; it < o.maxiter && norm(r) > o.tol; ++it)
-    {
-        const Field x0 = x, r0 = r;
-        const double nx = norm(x0);
-        auto J = [&R, x0, r0, nx](const Field& v) -> Field
-        {
-            const double nv = norm(v);
-            if (!(nv > 0.0)) return Field(v.nq, v.n);
-            const double h = std::sqrt(std::numeric_limits<double>::epsilon())*(1.0 + nx)/nv;
-            return (R(x0 + h*v) - r0)/h;
-        };
-        x = x0 + linsolve(J, -r0);
-        r = R(x);
-    }
-    static bool warned = false;
-    if (norm(r) > o.tol && !warned)
-    {
-        warned = true;
-        Foam::Warning << "newton_krylov: not converged after " << it
-                      << " Newton updates, ||R|| = " << norm(r) << " (warned once)" << Foam::endl;
-    }
-    return x;
-}
-
 // one Crank-Nicolson step of ``diffusion`` from ``time`` to ``time + dt``:
 // R(X) = X - Q - dt/2 (D(X) + D(Q)) = 0, the ghosts of Q at ``time``, of X
 // at ``time + dt``, A at X (Qaux frozen)
@@ -1378,57 +1299,27 @@ S while_loop(C c, B b, S s)
 template<class A, class B>
 auto cond(bool p, A a, B b) { return p ? a() : b(); }
 
-// ── effects ─────────────────────────────────────────────────────────────────
-inline std::function<void(double, const Field&, const Field&)>& writer()
-{
-    static std::function<void(double, const Field&, const Field&)> w;
-    return w;
-}
-
-inline std::tuple<long> io_write(long tok, double time, const Field& Q, const Field& Qaux)
-{
-    if (writer()) writer()(time, Q, Qaux);
-    return {tok + 1};
-}
-
-inline std::tuple<long> check_cfl(long tok, double dt_cfl, double dt)
-{
-    static bool warned = false;
-    if (dt > dt_cfl*(1 + 1e-12) && !warned)
-    {
-        warned = true;
-        Foam::Warning << "time step " << dt << " exceeds the CFL step " << dt_cfl
-                      << " (warned once)" << Foam::endl;
-    }
-    return {tok + 1};
-}
-
 // ── preCICE ─────────────────────────────────────────────────────────────────
-// The driver fills ``coupling()`` (participant, faces of the coupled patch);
-// the effects only make preCICE API calls.
-struct Coupling
-{
-    std::unique_ptr<precice::Participant> participant;
-    std::string mesh;
-    std::vector<std::string> write, read;
-    std::vector<int> faces;
-    std::vector<precice::VertexID> ids;
-};
-inline Coupling& coupling() { static Coupling c; return c; }
+// The app fills ``coupling()`` (rt_common.H: the participant, the data names,
+// the vertices) and ``interface()``: the faces of the coupled patch, one
+// preCICE vertex each.
+struct Interface { std::vector<int> faces; };
+inline Interface& interface() { static Interface i; return i; }
 
 inline Field coupled_faces(const Mesh& M)
 {
     Field out(1, M.nf);
-    for (const int f : coupling().faces) out(0, f) = 1.0;
+    for (const int f : interface().faces) out(0, f) = 1.0;
     return out;
 }
 
-inline Field interface_states(const Field& Q, const Mesh& M)
+inline Vertices interface_states(const Field& Q, const Mesh& M)
 {
-    const auto& F = coupling().faces;
-    Field out(Q.nq, int(F.size()));
-    for (size_t j = 0; j < F.size(); ++j)
-        for (int q = 0; q < Q.nq; ++q) out(q, int(j)) = Q(q, M.own[F[j]]);
+    const auto& F = interface().faces;
+    const int n = int(F.size());
+    Vertices out{Q.nq, n, std::vector<double>(size_t(Q.nq)*n)};
+    for (int j = 0; j < n; ++j)
+        for (int q = 0; q < Q.nq; ++q) out.v[size_t(q)*n + j] = Q(q, M.own[F[j]]);
     return out;
 }
 
@@ -1437,9 +1328,9 @@ inline Field interface_states(const Field& Q, const Mesh& M)
 // of each state from the pointwise kernel on a zero template (false: zero).
 template<class K, class KA>
 Field interface_flux(K k, KA kaux, int side, const Field& Q, const Field& Qaux,
-                     const Field& peer, const Vec& p, const Mesh& M)
+                     const Vertices& peer, const Vec& p, const Mesh& M)
 {
-    const auto& F = coupling().faces;
+    const auto& F = interface().faces;
     Field out(Q.nq, M.nf);
     const Vec zero(Qaux.nq, 0.0);
     auto aux = [&](const Vec& q, const Foam::vector& X)
@@ -1456,7 +1347,9 @@ Field interface_flux(K k, KA kaux, int side, const Field& Q, const Field& Qaux,
     for (size_t j = 0; j < F.size(); ++j)
     {
         const int f = F[j];
-        const Vec own = col(Q, M.own[f]), other = col(peer, int(j));
+        const Vec own = col(Q, M.own[f]);
+        Vec other(peer.nq);
+        for (int q = 0; q < peer.nq; ++q) other[q] = peer.v[size_t(q)*peer.n + j];
         const Vec& lo = side == 0 ? own : other;
         const Vec& hi = side == 0 ? other : own;
         const Foam::vector n = side == 0 ? M.normal[f] : Foam::vector(-M.normal[f]);
@@ -1464,56 +1357,6 @@ Field interface_flux(K k, KA kaux, int side, const Field& Q, const Field& Qaux,
         for (int q = 0; q < Q.nq; ++q) out(q, f) = W[side*Q.nq + q];
     }
     return out;
-}
-
-inline void couple_write_data(const Field& states)
-{
-    auto& c = coupling();
-    for (size_t i = 0; i < c.write.size(); ++i)
-    {
-        std::vector<double> v(states.n);
-        for (int j = 0; j < states.n; ++j) v[j] = states(int(i), j);
-        c.participant->writeData(c.mesh, c.write[i], c.ids, v);
-    }
-}
-
-inline std::tuple<long, bool> couple_init(long tok, const Field& states)
-{
-    auto& c = coupling();
-    if (c.participant->requiresInitialData()) couple_write_data(states);
-    c.participant->initialize();
-    return {tok + 1, c.participant->isCouplingOngoing()};
-}
-
-inline std::tuple<long, double> couple_max_dt(long tok)
-{
-    return {tok + 1, coupling().participant->getMaxTimeStepSize()};
-}
-
-inline std::tuple<long, Field> couple_read(long tok)
-{
-    auto& c = coupling();
-    Field peer(int(c.read.size()), int(c.ids.size()));
-    std::vector<double> v(c.ids.size());
-    for (size_t i = 0; i < c.read.size(); ++i)
-    {
-        c.participant->readData(c.mesh, c.read[i], c.ids, 0.0, v);
-        for (size_t j = 0; j < v.size(); ++j) peer(int(i), int(j)) = v[j];
-    }
-    return {tok + 1, peer};
-}
-
-inline std::tuple<long> couple_write(long tok, const Field& states)
-{
-    couple_write_data(states);
-    return {tok + 1};
-}
-
-inline std::tuple<long, bool> couple_advance(long tok, double dt)
-{
-    auto& c = coupling();
-    c.participant->advance(dt);
-    return {tok + 1, c.participant->isCouplingOngoing()};
 }
 
 } // namespace zs
