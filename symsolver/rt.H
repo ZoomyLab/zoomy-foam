@@ -34,7 +34,6 @@
 #include "fvMatrices.H"
 
 #include <memory>
-#include <Eigen/Dense>
 
 #include "rt_common.H"
 
@@ -628,105 +627,113 @@ Field edge_source(K k, const Field& Q, const Field& QL, const Field& QR,
 }
 
 // ── whole-domain operations ─────────────────────────────────────────────────
-// Derivative aux: the least-squares fit of zoomy_core's mesh
-// (geometry_xp._lsq_matrices), polynomial degree = the model's LSQ degree, on
-// zoomy_core's stencil (the driver writes it: constant/zoomyStencil, per cell
-// the stencil cells in global numbering and their offsets; across periodic
-// seams the wrapped vertex ring), values gathered across ranks by a
-// distributionMap; plus one sample per own physical boundary face at the
-// mirror image of the cell centre: its ghost Qg (else the cell value).  (OpenFOAM's compact Gauss
-// integral of the face gradient is inconsistent off orthogonal grids: on
-// triangles its second-derivative error does not shrink with the mesh.)
+// Derivative aux: zoomy_core's least-squares fit, the one JAX evaluates.  The
+// driver writes its tables per own cell (constant/zoomyStencil): the stencil
+// cells (global numbering, values gathered across ranks by a distributionMap),
+// the base table T (R x n_mon, the stencil rows then the boundary slots, the
+// scale factors folded in) and, per boundary-closure class that constrains the
+// cell (ANALYSIS 40, 41), the class table.  The samples are
+//     delta = [u_nbr - u_c ; ghost - u_c],   deriv_m = sum_r T[r][m] delta_r,
+// the ghost of a boundary slot at the mirror image of the cell centre (else
+// the cell value).  Table slot j is zoomy_core's j-th sampled boundary face of
+// the cell; the driver writes its centre, matched here to the cell's own
+// boundary face.  (OpenFOAM's compact Gauss integral of the face gradient is
+// inconsistent off orthogonal grids: on triangles its second-derivative error
+// does not shrink with the mesh.)
 struct Fit
 {
-    std::vector<std::array<int, 2>> mon;          // (a, -1): d/dx_a; (a, b): d2/dx_a dx_b
+    std::vector<std::array<int, 2>> mon;          // per column: (a, -1) d/dx_a, (a, b) d2/dx_a dx_b, (-2, -2) higher
+    int nnbr = 0, nM = 0;                         // stencil rows, monomials
     Foam::labelListList stencil;                  // per own cell: compact indices
     std::unique_ptr<Foam::distributionMap> map;
-    std::vector<std::vector<int>> bfs;            // per own cell: own boundary faces
-    std::vector<Eigen::MatrixXd> A;               // per own cell: the fit's pinv
+    std::vector<std::vector<int>> bfs;            // per own cell: own boundary face of each table slot
+    std::vector<std::vector<double>> A;           // per own cell: the base table, (nnbr + slots) x nM
+    std::vector<std::vector<std::pair<int, std::vector<double>>>> Acl;  // per own cell: class -> table
 
-    explicit Fit(const Mesh& M, int degree)
+    explicit Fit(const Mesh& M)
     {
-        for (int a = 0; a < M.dim; ++a) mon.push_back({a, -1});
-        for (int a = 0; a < M.dim && degree >= 2; ++a)
-            for (int b = a; b < M.dim; ++b) mon.push_back({a, b});
         const std::string path = M.m.time().path()/"constant"/"zoomyStencil";
         std::ifstream in(path);
-        int n = -1;
-        in >> n;
+        int n = -1, maxb = 0;
+        in >> n >> nnbr >> maxb >> nM;
         if (!in || n != M.nown)
             FatalErrorInFunction << "no derivative stencil for " << M.nown << " cells in "
                 << path << Foam::exit(Foam::FatalError);
+        for (int k = 0; k < nM; ++k)
+        {
+            int p[3];
+            in >> p[0] >> p[1] >> p[2];
+            std::vector<int> ax;
+            for (int a = 0; a < 3; ++a) ax.insert(ax.end(), p[a], a);
+            mon.push_back(ax.size() == 1 ? std::array<int, 2>{ax[0], -1}
+                          : ax.size() == 2 ? std::array<int, 2>{ax[0], ax[1]}
+                          : std::array<int, 2>{-2, -2});
+        }
+        std::vector<std::vector<int>> own_bf(M.nown);
+        for (int i = 0; i < M.nbf; ++i) own_bf[M.bf_cell[i]].push_back(i);
         stencil.setSize(M.nown);
-        std::vector<std::vector<Foam::vector>> off(M.nown);
+        bfs.resize(M.nown);
+        A.resize(M.nown);
+        Acl.resize(M.nown);
         for (int c = 0; c < M.nown; ++c)
         {
-            int k;
-            in >> k;
-            stencil[c].setSize(k);
-            for (int j = 0; j < k; ++j)
+            int nb;
+            in >> nb;
+            if (nb != int(own_bf[c].size()))
+                FatalErrorInFunction << "cell " << c << ": " << nb << " boundary faces in the "
+                    "derivative tables, " << own_bf[c].size() << " in the mesh"
+                    << Foam::exit(Foam::FatalError);
+            std::vector<int> free = own_bf[c];
+            for (int j = 0; j < nb; ++j)         // slot j: the own face at its centre
             {
-                Foam::vector d;
-                in >> stencil[c][j] >> d[0] >> d[1] >> d[2];
-                off[c].push_back(d);
+                Foam::vector x;
+                in >> x[0] >> x[1] >> x[2];
+                auto d2 = [&](int i)
+                {
+                    Foam::vector d = M.fc[M.bf_face[i]] - x;
+                    for (int a = M.dim; a < 3; ++a) d[a] = 0;
+                    return Foam::magSqr(d);
+                };
+                auto it = std::min_element(free.begin(), free.end(),
+                                           [&](int a, int b) { return d2(a) < d2(b); });
+                bfs[c].push_back(*it);
+                free.erase(it);
+            }
+            stencil[c].setSize(nnbr);
+            for (int m = 0; m < nnbr; ++m) in >> stencil[c][m];
+            const size_t size = size_t(nnbr + maxb)*nM;
+            A[c].resize(size);
+            for (double& x : A[c]) in >> x;
+            int nact;
+            in >> nact;
+            Acl[c].resize(nact);
+            for (auto& [k, T] : Acl[c])
+            {
+                in >> k;
+                T.resize(size);
+                for (double& x : T) in >> x;
             }
         }
+        if (!in)
+            FatalErrorInFunction << "truncated derivative tables in " << path
+                << Foam::exit(Foam::FatalError);
         Foam::List<Foam::Map<Foam::label>> compact;
         map.reset(new Foam::distributionMap(Foam::globalIndex(M.nown), stencil, compact));
-        bfs.resize(M.nown);
-        for (int i = 0; i < M.nbf; ++i) bfs[M.bf_cell[i]].push_back(i);
-        for (int c = 0; c < M.nown; ++c)
-        {
-            std::vector<Foam::vector> d = off[c];
-            const int ni = int(d.size()), nb = int(bfs[c].size());
-            for (const int i : bfs[c])
-            {
-                const Foam::vector& n = M.normal[M.bf_face[i]];
-                d.push_back(2*((M.fc[M.bf_face[i]] - M.cc[c]) & n)*n);
-            }
-            Eigen::MatrixXd V(d.size(), mon.size());
-            for (size_t r = 0; r < d.size(); ++r)
-                for (size_t k = 0; k < mon.size(); ++k)
-                {
-                    const auto [a, b] = mon[k];
-                    V(r, k) = b < 0 ? d[r][a] : d[r][a]*d[r][b]*(a == b ? 0.5 : 1.0);
-                }
-            auto pinv = [](const Eigen::MatrixXd& W)
-            { return Eigen::MatrixXd(W.completeOrthogonalDecomposition().pseudoInverse()); };
-            if (M.dim == 1 || nb == 0)            // the full stencil
-            {
-                A.push_back(pinv(V));
-                continue;
-            }
-            // >= 2-D boundary cell (zoomy_core's REQ-174b): every row from the
-            // interior samples; the rows pure along a ghost's axis (d/dx_a,
-            // d2/dx_a2) from the interior samples plus that ghost
-            Eigen::MatrixXd P = Eigen::MatrixXd::Zero(mon.size(), d.size());
-            if (ni) P.leftCols(ni) = pinv(V.topRows(ni));
-            for (int j = 0; j < nb; ++j)
-            {
-                const Foam::vector& g = d[ni + j];
-                int ax = 0;
-                for (int a = 1; a < M.dim; ++a) if (std::abs(g[a]) > std::abs(g[ax])) ax = a;
-                Eigen::MatrixXd W(ni + 1, mon.size());
-                W.topRows(ni) = V.topRows(ni);
-                W.row(ni) = V.row(ni + j);
-                const Eigen::MatrixXd Pj = pinv(W);
-                for (size_t k = 0; k < mon.size(); ++k)
-                    if (mon[k][0] == ax && (mon[k][1] < 0 || mon[k][1] == ax))
-                    {
-                        P.row(k).setZero();
-                        P.row(k).head(ni) = Pj.row(k).head(ni);
-                        P(k, ni + j) = Pj(k, ni);
-                    }
-            }
-            A.push_back(P);
-        }
     }
 
-    // the derivative along ``ax`` (one or two axes) of row ``row`` of X
-    // (boundary faces: the ghosts G, else the cell value), own cells and halo
-    Field derivative(const Mesh& M, const Field& Xf, int row, const Field* G,
+    // the table of cell ``c`` for closure class ``cls`` (< 0, or a class that
+    // does not constrain the cell: the base table)
+    const std::vector<double>& table(int c, int cls) const
+    {
+        if (cls >= 0)
+            for (const auto& [k, T] : Acl[c]) if (k == cls) return T;
+        return A[c];
+    }
+
+    // the derivative along ``ax`` (one or two axes) of row ``row`` of X, with
+    // the boundary closure class ``cls`` of that row (boundary faces: the
+    // ghosts G, else the cell value), own cells and halo
+    Field derivative(const Mesh& M, const Field& Xf, int row, int cls, const Field* G,
                      const std::vector<int>& ax) const
     {
         const std::array<int, 2> key = ax.size() == 1 ? std::array<int, 2>{ax[0], -1}
@@ -742,11 +749,12 @@ struct Fit
         for (int c = 0; c < M.nown; ++c)
         {
             const double x = Xf(row, c);
-            Eigen::VectorXd r(stencil[c].size() + bfs[c].size());
-            int m = 0;
-            for (const Foam::label j : stencil[c]) r(m++) = v[j] - x;
-            for (const int i : bfs[c]) r(m++) = (G ? (*G)(row, i) : x) - x;
-            out(0, c) = A[c].row(k).dot(r);
+            const std::vector<double>& T = table(c, cls);
+            double d = 0;
+            for (int m = 0; m < nnbr; ++m) d += T[size_t(m)*nM + k]*(v[stencil[c][m]] - x);
+            for (size_t j = 0; j < bfs[c].size(); ++j)
+                d += T[(nnbr + j)*nM + k]*((G ? (*G)(row, bfs[c][j]) : x) - x);
+            out(0, c) = d;
         }
         M.exchange(out);
         return out;
@@ -755,7 +763,7 @@ struct Fit
 inline const Fit& fit(const Mesh& M)
 {
     static std::unique_ptr<Fit> q;
-    if (!q) q.reset(new Fit(M, settings().lsq_degree));
+    if (!q) q.reset(new Fit(M));
     return *q;
 }
 
@@ -773,7 +781,7 @@ Field derivatives(const S& spec, const Field& Q, Field out, const Mesh& M,
         if (int(ax.size()) > std::min(2, settings().lsq_degree))
             FatalErrorInFunction << "derivative_aux: order " << ax.size() << " > 2 or above the LSQ degree "
                 << settings().lsq_degree << Foam::exit(Foam::FatalError);
-        const Field D = fit(M).derivative(M, Q, e[1], Qg, ax);
+        const Field D = fit(M).derivative(M, Q, e[1], e[5], Qg, ax);
         for (int c = 0; c < M.nc; ++c) out(e[0], c) = D(0, c);
     }
     return out;

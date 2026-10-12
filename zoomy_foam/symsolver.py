@@ -20,6 +20,7 @@ import numpy as np
 import param
 from scipy.spatial import cKDTree
 
+from zoomy_core.mesh.geometry_xp import build_topology, compute_geometry
 from zoomy_core.symsolver.backend_cxx import RUNTIME_HEADER, CxxBackend, CxxChorinBackend
 from zoomy_foam._pipeline import (FOAM_ROOT, _BINCACHE, _apptainer,
                                   _mesh_geometry,
@@ -64,8 +65,10 @@ class FoamDriver(param.Parameterized):
         """Run-time settings of this solver in the controlDict."""
         return ""
 
-    def build(self, nsm, dimension):
-        """Print, write the build tree, wmake (cached).  Returns the binary."""
+    def build(self, nsm, dimension, topo):
+        """Print, write the build tree, wmake (cached).  Returns the binary.
+        ``topo``: the mesh's topology (the kernels carry its boundary-closure
+        classes)."""
         self.source = self._print(nsm, dimension)
         files = {"Solver.H": self.source,
                  "symFoam.C": (APP / "symFoam.C").read_text(),
@@ -77,7 +80,7 @@ class FoamDriver(param.Parameterized):
         _BINCACHE.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=_BINCACHE) as d:   # per build: runs may be concurrent
             tmp = Path(d) / "Kernels.H"
-            write_kernels(self._systems(nsm), self.source, tmp)
+            write_kernels(self._systems(nsm), self.source, tmp, topo)
             files["Kernels.H"] = tmp.read_text()
         h.update(files["Kernels.H"].encode())
         build = _BINCACHE / f"sym_{h.hexdigest()[:16]}"
@@ -117,7 +120,9 @@ class FoamDriver(param.Parameterized):
             names = _side_names(mesh, dim)
         else:                        # gmshToFoam on the mesh extruded by one layer
             dim, names = 2, list(mesh.boundary_conditions_sorted_names)
-        binary = self.build(nsm, dim)
+        topo = build_topology(mesh, nsm=nsm,
+                              systems=[sm for _, sm in self._systems(nsm)[1:]])
+        binary = self.build(nsm, dim, topo)
         case = Path(workdir)
         if case.exists():
             shutil.rmtree(case)
@@ -178,7 +183,7 @@ class FoamDriver(param.Parameterized):
             _read_labels(d / "constant" / "polyMesh" / "cellProcAddressing") for d in parts]
         inv = np.empty_like(order)
         inv[order] = np.arange(len(order))
-        _write_stencils(mesh, nsm, order, inv, parts, cells)
+        _write_stencils(mesh, topo, order, inv, parts, cells)
         r = _apptainer(f"cd {case}; {run}", binds=[case.parent, binary.parent],
                        capture_output=True, text=True)
         if r.returncode != 0:
@@ -243,22 +248,34 @@ def _cyclic(nsm):
     return pairs
 
 
-def _write_stencils(mesh, nsm, order, inv, parts, cells):
-    """``constant/zoomyStencil`` of every part: per cell, the cells of its
-    derivative stencil (global cell numbers of the decomposition) and their
-    offsets: zoomy_core's LSQ stencil (:func:`geometry_xp.build_topology`,
-    the one JAX fits; across a periodic seam the wrapped ring, offsets to
-    the nearest periodic image)."""
-    from zoomy_core.mesh.geometry_xp import build_topology
-    topo = build_topology(mesh, nsm=nsm)
+def _write_stencils(mesh, topo, order, inv, parts, cells):
+    """``constant/zoomyStencil`` of every part: zoomy_core's LSQ fit of the
+    derivative aux, per cell (:func:`geometry_xp.compute_geometry`, the one
+    JAX evaluates).  Header: ``n_cells  max_nbr  max_bdy  n_mon`` and the
+    monomials' powers.  Per cell: the centres of its ``n_b`` sampled
+    boundary faces (zoomy_core's slots; the runtime matches them to its own
+    boundary faces), the ``max_nbr`` stencil cells (global numbers of the
+    decomposition; padding: the cell itself), the base table
+    ``lsq_gradQ * lsq_scale_factors`` ``(R, n_mon)`` and, per active closure
+    class, ``class table`` (``lsq_closure * lsq_scale_factors``, same layout,
+    boundary slots last).  Across a periodic seam the stencil is the wrapped
+    ring (offsets to the nearest image: in the tables)."""
     nc = int(mesh.n_inner_cells)
     dim = int(mesh.dimension)
-    cc = np.zeros((nc, 3))
-    cc[:, :dim] = np.asarray(mesh.cell_centers)[:dim, :nc].T
+    geom = compute_geometry(topo, np.asarray(mesh.vertex_coordinates)[:dim])
+    scale = np.asarray(topo.lsq_scale_factors)
+    base = np.asarray(geom["lsq_gradQ"])[:nc] * scale             # (nc, R, M)
     nbr = np.asarray(topo.lsq_neighbors)[:nc]
-    shift = np.zeros(nbr.shape + (3,))
-    if topo.lsq_shift is not None:
-        shift[..., :dim] = np.asarray(topo.lsq_shift)[:nc]
+    bdy = np.asarray(topo.lsq_boundary_face_neighbors)[:nc]
+    bfc = np.zeros((int(mesh.n_boundary_faces), 3))
+    bfc[:, :dim] = np.asarray(geom["face_centers"])[np.asarray(topo.boundary_faces), :dim]
+    R, M = base.shape[1:]
+    cl = topo.lsq_plan.get("closure")
+    where, active, table = {}, np.zeros((0, 0), dtype=bool), None
+    if cl is not None and len(cl["cells"]):
+        where = {int(c): i for i, c in enumerate(cl["cells"])}
+        active = np.asarray(cl["active"])                         # (n_class, n_cc)
+        table = np.asarray(geom["lsq_closure"]) * scale           # (n_class, n_cc, R, M)
     # global numbering of the parts' cells (OpenFOAM's globalIndex: part by part)
     owner = np.zeros(nc, dtype=int)
     local = np.arange(nc)
@@ -268,16 +285,23 @@ def _write_stencils(mesh, nsm, order, inv, parts, cells):
             owner[a], local[a] = p, np.arange(len(a))
         sizes.append(nc if a is None else len(a))
     gid = np.concatenate([[0], np.cumsum(sizes)])[owner] + local     # per OF cell
+
+    def row(values):
+        return " ".join(repr(float(v)) for v in np.ravel(values))
     for d, a in zip(parts, cells):
-        lines = [str(nc if a is None else len(a))]
+        lines = [f"{nc if a is None else len(a)} {nbr.shape[1]} {bdy.shape[1]} {M}",
+                 " ".join(str(int(p)) for mi in topo.lsq_monomial_multi_index
+                          for p in (tuple(mi) + (0, 0, 0))[:3])]
         for k in (range(nc) if a is None else a):     # OF cells of this part
             c = order[k]
-            slots = [m for m in dict((int(j), m) for m, j in enumerate(nbr[c])).values()
-                     if nbr[c, m] != c and nbr[c, m] < nc]
-            off = cc[nbr[c, slots]] - cc[c] + shift[c, slots]
-            lines.append(" ".join([str(len(slots))] + [
-                f"{gid[inv[nbr[c, m]]]} {float(o[0])!r} {float(o[1])!r} {float(o[2])!r}"
-                for m, o in zip(slots, off)]))
+            b = bdy[c][bdy[c] >= 0]
+            near = np.where(nbr[c] < nc, nbr[c], c)   # (padding is the cell itself)
+            parts_c = [str(len(b)), row(bfc[b]), " ".join(str(int(gid[inv[j]])) for j in near),
+                       row(base[c])]
+            act = np.flatnonzero(active[:, where[c]]) if c in where else []
+            parts_c.append(str(len(act)))
+            parts_c += [f"{int(j)} {row(table[j, where[c]])}" for j in act]
+            lines.append(" ".join(parts_c))
         (d / "constant" / "zoomyStencil").write_text("\n".join(lines) + "\n")
 
 
