@@ -5,7 +5,9 @@ per system, one static member per kernel the printed solver references
 The kernels are the system's ``call`` table -- the same ``Function`` objects
 the JAX runtime lambdifies -- printed in Foam syntax.  Every kernel of a
 family takes the family's full argument list, so a block calls all of them
-alike; a kernel ignores the arguments it does not declare.
+alike; a kernel ignores the arguments it does not declare.  The ghost
+kernel's ``boundary_data`` is the BC's input state ``Q`` (the template
+default: no coupling data).
 """
 import re
 
@@ -22,6 +24,7 @@ _ARG = {
     "parameters": ("p", _L), "p": ("p", _L), "normal": ("n", _V),
     "position": ("X", _V), "time": ("time", _S), "dt": ("dt", _S),
     "distance": ("dX", _S), "idx": ("bc_idx", "const int"),
+    "boundary_data": ("Q", _L),
     "reconstruction": ("W", _L),
     "q_minus": ("Q_minus", _L), "q_plus": ("Q_plus", _L),
     "aux_minus": ("Qaux_minus", _L), "aux_plus": ("Qaux_plus", _L),
@@ -97,7 +100,6 @@ def write_kernels(systems, source, path):
            '#include "UserFunctions.H"', "", "namespace zs", "{"]
     for name, nsm in systems:
         call, n_state = nsm.call, len(nsm.state)
-        functions = {f.name: f for f in _functions(nsm)}
         tags = list(getattr(getattr(nsm, "_bc_source", None),
                             "list_sorted_function_names", []) or [])
         pv = nsm.parameter_values
@@ -119,20 +121,13 @@ def write_kernels(systems, source, path):
             elif call[k] is None:
                 raise ValueError(f"{name}.{k} is used but empty")
             else:
-                out.append(pr.kernel(functions[k], n_state))
+                out.append(pr.kernel(call[k].functions[k], n_state))
         out += ["};", f"inline constexpr {name}_t {name}{{}};", ""]
     first = systems[0][0]
     out += [f"using System = {first}_t;", f"inline constexpr const System& sys = {first};",
             "} // namespace zs", ""]
     path.write_text("\n".join(out))
     return path
-
-
-def _functions(nsm):
-    from zoomy_core.systemmodel.system_model import OPERATOR_ARG_SLOTS
-    fs = [nsm.operator(n) for n in OPERATOR_ARG_SLOTS]
-    fs += [nsm.boundary_conditions, *nsm.build_numerics().functions.values()]
-    return [f for f in fs if f is not None]
 
 
 def _axes(multi_index):

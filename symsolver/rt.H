@@ -425,9 +425,12 @@ inline Field face_inradius(const Mesh& M)
 }
 
 // ── boundary ────────────────────────────────────────────────────────────────
-// A ghost sits at the mirror image of the cell centre: the BC is evaluated at
-// the foot of the perpendicular with the normal distance; a face trace
-// (boundary_traces) at the face centre.  (Equal on orthogonal cells.)
+// Two kernels, two values.  ``ghost = true``: the GHOST kernel
+// (boundary_ghost_state) of the inner cell, at the mirror image of the cell
+// centre -- evaluated at the foot of the perpendicular with the normal
+// distance (boundary_states / boundary_ghosts).  ``false``: the FACE kernel
+// (boundary_conditions) of the inner trace, at the face centre
+// (boundary_traces).  (Foot and face centre are equal on orthogonal cells.)
 template<class K>
 Field bc_states(K bc, const Field& states, const Field& Qaux, const Vec& p,
                       double time, const Mesh& M, bool ghost = true)
@@ -447,27 +450,27 @@ Field bc_states(K bc, const Field& states, const Field& Qaux, const Vec& p,
 }
 
 template<class K>
-Field boundary_ghosts(K bc, const Field& Q, const Field& Qaux, const Vec& p,
+Field boundary_ghosts(K ghost, const Field& Q, const Field& Qaux, const Vec& p,
                       double time, const Mesh& M)
 {
     Field inner(Q.nq, M.nbf);
     for (int i = 0; i < M.nbf; ++i)
         for (int q = 0; q < Q.nq; ++q) inner(q, i) = Q(q, M.bf_cell[i]);
-    return bc_states(bc, inner, Qaux, p, time, M);
+    return bc_states(ghost, inner, Qaux, p, time, M);
 }
 
-// Qauxb is the inner cell's aux
+// the ghosts and the inner cells' aux
 template<int N = 2, class K>
-std::tuple<Field, Field> boundary_states(K bc, const Field& Q, const Field& Qaux,
+std::tuple<Field, Field> boundary_states(K ghost, const Field& Q, const Field& Qaux,
                                          const Vec& p, double time, const Mesh& M)
 {
-    Field inner(Q.nq, M.nbf), Ab(Qaux.nq, M.nbf);
+    Field inner(Q.nq, M.nbf), Ag(Qaux.nq, M.nbf);
     for (int i = 0; i < M.nbf; ++i)
     {
         for (int q = 0; q < Q.nq; ++q) inner(q, i) = Q(q, M.bf_cell[i]);
-        for (int q = 0; q < Qaux.nq; ++q) Ab(q, i) = Qaux(q, M.bf_cell[i]);
+        for (int q = 0; q < Qaux.nq; ++q) Ag(q, i) = Qaux(q, M.bf_cell[i]);
     }
-    return {bc_states(bc, inner, Qaux, p, time, M), Ab};
+    return {bc_states(ghost, inner, Qaux, p, time, M), Ag};
 }
 
 template<class K>
@@ -507,40 +510,38 @@ Field pointwise(K k, const Field& X, const Field& Xaux, const Vec& p)
     return out;
 }
 
-inline std::tuple<Field, Field> cell_traces(const Field& Q, const Field& Qb,
-                                            const Mesh& M)
+// a boundary face's outer slot holds the inner trace until boundary_traces
+// sets the BC's face state
+inline std::tuple<Field, Field> cell_traces(const Field& Q, const Mesh& M)
 {
     Field L(Q.nq, M.nf), R(Q.nq, M.nf);
     for (int q = 0; q < Q.nq; ++q)
-    {
         for (int f = 0; f < M.nf; ++f)
         {
             L(q, f) = Q(q, M.own[f]);
-            R(q, f) = M.nei[f] >= 0 ? Q(q, M.nei[f]) : 0.0;
+            R(q, f) = Q(q, M.nei[f] >= 0 ? M.nei[f] : M.own[f]);
         }
-        for (int i = 0; i < M.nbf; ++i) R(q, M.bf_face[i]) = Qb(q, i);
-    }
     return {L, R};
 }
 
-// The boundary ghost Wb sits at twice the cell-to-face offset: the face
-// carries (W + Wb)/2.
-inline Field face_values(const Field& W, const Field& Wb, const Mesh& M)
+// The ghost Wg sits at the mirror image of the cell centre: OpenFOAM's
+// boundary face value is (W + Wg)/2.
+inline Field face_values(const Field& W, const Field& Wg, const Mesh& M)
 {
     Field F(W.nq, M.nbf);
     for (int q = 0; q < W.nq; ++q)
-        for (int i = 0; i < M.nbf; ++i) F(q, i) = 0.5*(W(q, M.bf_cell[i]) + Wb(q, i));
+        for (int i = 0; i < M.nbf; ++i) F(q, i) = 0.5*(W(q, M.bf_cell[i]) + Wg(q, i));
     return F;
 }
 
 // OpenFOAM's gradient scheme ``scheme`` (fvSchemes) of every row in ``rows``:
 // row 3 q + a of the result holds d/dx_a of row q
 template<class R>
-Field fv_gradient(const R& rows, const Field& W, const Field& Wb, const Mesh& M,
+Field fv_gradient(const R& rows, const Field& W, const Field& Wg, const Mesh& M,
                   const char* scheme)
 {
     Field G(3*W.nq, M.nc);
-    const Field F = face_values(W, Wb, M);
+    const Field F = face_values(W, Wg, M);
     for (const int q : rows)
     {
         const Foam::volVectorField g(Foam::fvc::grad(M.load(W, q, &F), scheme));
@@ -550,11 +551,11 @@ Field fv_gradient(const R& rows, const Field& W, const Field& Wb, const Mesh& M,
     return G;
 }
 
-inline Field gradient(const Field& W, const Field& Wb, const Mesh& M)
+inline Field gradient(const Field& W, const Field& Wg, const Mesh& M)
 {
     std::vector<int> rows(W.nq);
     for (int q = 0; q < W.nq; ++q) rows[q] = q;
-    return fv_gradient(rows, W, Wb, M, "grad");
+    return fv_gradient(rows, W, Wg, M, "grad");
 }
 
 inline double slope_dot(const Field& G, int q, int c, const Foam::vector& r, int dim)
@@ -568,10 +569,10 @@ inline double slope_dot(const Field& G, int q, int c, const Foam::vector& r, int
 // (fvSchemes ``limited(<name>)``) is phi G.
 template<class... I>
 Field limiter_factors(const char* scheme, const std::tuple<I...>& rows,
-                      const Field& W, const Field& Wb, const Field& G, const Mesh& M)
+                      const Field& W, const Field& Wg, const Field& G, const Mesh& M)
 {
     Field phi(W.nq, M.nc, 1.0);
-    const Field L = fv_gradient(ints(rows), W, Wb, M, scheme);
+    const Field L = fv_gradient(ints(rows), W, Wg, M, scheme);
     for (const int q : ints(rows))
         for (int c = 0; c < M.nc; ++c)
         {
@@ -586,22 +587,23 @@ Field limiter_factors(const char* scheme, const std::tuple<I...>& rows,
     return phi;
 }
 template<class... I>
-Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wb,
+Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
              const Field& G, const Mesh& M)
-{ return limiter_factors("limited(minmod)", rows, W, Wb, G, M); }
+{ return limiter_factors("limited(minmod)", rows, W, Wg, G, M); }
 template<class... I>
 Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W,
-                      const Field& Wb, const Field& G, const Mesh& M)
-{ return limiter_factors("limited(venkatakrishnan)", rows, W, Wb, G, M); }
+                      const Field& Wg, const Field& G, const Mesh& M)
+{ return limiter_factors("limited(venkatakrishnan)", rows, W, Wg, G, M); }
 template<class... I>
 Field barth_jespersen(const std::tuple<I...>& rows, const Field& W,
-                      const Field& Wb, const Field& G, const Mesh& M)
-{ return limiter_factors("limited(barth_jespersen)", rows, W, Wb, G, M); }
+                      const Field& Wg, const Field& G, const Mesh& M)
+{ return limiter_factors("limited(barth_jespersen)", rows, W, Wg, G, M); }
 
-// each cell's W moved to the face centre by phi G; WR = Wb on boundary faces
+// each cell's W moved to the face centre by phi G; a boundary face's outer
+// slot holds the inner trace until boundary_traces sets the BC's face state
 template<class P>
-std::tuple<Field, Field> extrapolate(const Field& W, const Field& Wb,
-                                     const Field& G, const P& phi, const Mesh& M)
+std::tuple<Field, Field> extrapolate(const Field& W, const Field& G, const P& phi,
+                                     const Mesh& M)
 {
     Field L(W.nq, M.nf), R(W.nq, M.nf);
     for (int q = 0; q < W.nq; ++q)
@@ -613,9 +615,8 @@ std::tuple<Field, Field> extrapolate(const Field& W, const Field& Wb,
         for (int f = 0; f < M.nf; ++f)
         {
             L(q, f) = val(M.own[f], f);
-            R(q, f) = M.nei[f] >= 0 ? val(M.nei[f], f) : 0.0;
+            R(q, f) = M.nei[f] >= 0 ? val(M.nei[f], f) : L(q, f);
         }
-        for (int i = 0; i < M.nbf; ++i) R(q, M.bf_face[i]) = Wb(q, i);
     }
     return {L, R};
 }
@@ -659,8 +660,8 @@ Field edge_source(K k, const Field& Q, const Field& QL, const Field& QR,
 // zoomy_core's stencil (the driver writes it: constant/zoomyStencil, per cell
 // the stencil cells in global numbering and their offsets; across periodic
 // seams the wrapped vertex ring), values gathered across ranks by a
-// distributionMap; plus one ghost per own physical boundary face at the
-// mirror image of the cell centre, value 2 Qb - Q.  (OpenFOAM's compact Gauss
+// distributionMap; plus one sample per own physical boundary face at the
+// mirror image of the cell centre: its ghost Qg (else the cell value).  (OpenFOAM's compact Gauss
 // integral of the face gradient is inconsistent off orthogonal grids: on
 // triangles its second-derivative error does not shrink with the mesh.)
 struct Fit
@@ -751,8 +752,8 @@ struct Fit
     }
 
     // the derivative along ``ax`` (one or two axes) of row ``row`` of X
-    // (boundary faces: B, else the cell value), own cells and halo
-    Field derivative(const Mesh& M, const Field& Xf, int row, const Field* B,
+    // (boundary faces: the ghosts G, else the cell value), own cells and halo
+    Field derivative(const Mesh& M, const Field& Xf, int row, const Field* G,
                      const std::vector<int>& ax) const
     {
         const std::array<int, 2> key = ax.size() == 1 ? std::array<int, 2>{ax[0], -1}
@@ -771,7 +772,7 @@ struct Fit
             Eigen::VectorXd r(stencil[c].size() + bfs[c].size());
             int m = 0;
             for (const Foam::label j : stencil[c]) r(m++) = v[j] - x;
-            for (const int i : bfs[c]) r(m++) = 2*((B ? (*B)(row, i) : x) - x);
+            for (const int i : bfs[c]) r(m++) = (G ? (*G)(row, i) : x) - x;
             out(0, c) = A[c].row(k).dot(r);
         }
         M.exchange(out);
@@ -785,11 +786,11 @@ inline const Fit& fit(const Mesh& M)
     return *q;
 }
 
-// Derivatives (orders 1, 2) by the fit above.  Boundary faces carry Qb (the
-// face value), else the cell value.
+// Derivatives (orders 1, 2) by the fit above.  Boundary faces carry the
+// ghosts Qg, else the cell value.
 template<class S>
 Field derivatives(const S& spec, const Field& Q, Field out, const Mesh& M,
-                  const Field* Qb, const std::vector<int>& rows)
+                  const Field* Qg, const std::vector<int>& rows)
 {
     for (const auto& e : spec)
     {
@@ -799,7 +800,7 @@ Field derivatives(const S& spec, const Field& Q, Field out, const Mesh& M,
         if (int(ax.size()) > std::min(2, settings().lsq_degree))
             FatalErrorInFunction << "derivative_aux: order " << ax.size() << " > 2 or above the LSQ degree "
                 << settings().lsq_degree << Foam::exit(Foam::FatalError);
-        const Field D = fit(M).derivative(M, Q, e[1], Qb, ax);
+        const Field D = fit(M).derivative(M, Q, e[1], Qg, ax);
         for (int c = 0; c < M.nc; ++c) out(e[0], c) = D(0, c);
     }
     return out;
@@ -812,13 +813,13 @@ Field derivative_aux(const S& spec, const Field& Q, const Field& Qaux, const Mes
     return derivatives(spec, Q, Qaux, M, nullptr, {});
 }
 
-// Only the derivatives of state ``rows``; the boundary faces carry Qb.
+// Only the derivatives of state ``rows``; the boundary faces carry the ghosts Qg.
 template<class S, class... I>
 Field derivative_aux(const S& spec, const Field& Q, const Field& Qaux,
-                     const Mesh& M, const Field& Qb, const std::tuple<I...>& rows)
+                     const Mesh& M, const Field& Qg, const std::tuple<I...>& rows)
 {
     const auto r = ints(rows);
-    return derivatives(spec, Q, Qaux, M, &Qb, std::vector<int>(r.begin(), r.end()));
+    return derivatives(spec, Q, Qaux, M, &Qg, std::vector<int>(r.begin(), r.end()));
 }
 
 template<class K>
