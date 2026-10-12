@@ -211,6 +211,45 @@ inline Foam::scalar eigensystem(I idx_, Ts... a_flat_args)
     return cache_out[idx];
 }
 
+// ── spectral_radius(k, safety, *A_flat) ───────────────────────────────────
+// safety * sqrt(rho(A^2)) of the row-major n x n A_flat, rho(A^2) by k power
+// steps on A^2 from x = 1/sqrt(n) (kernel_functions.spectral_radius; the
+// arithmetic of the JAX runtime's).  Matvecs only, the same on every device.
+// No cache, no heap: a few dozen flops per call.
+template <typename K, typename S, typename... Ts>
+inline Foam::scalar spectral_radius(K k_, S safety, Ts... a_flat_args)
+{
+    constexpr int M = sizeof...(Ts);
+    const int N = static_cast<int>(std::lround(std::sqrt(double(M))));
+
+    const double A[M] = { static_cast<double>(a_flat_args)... };
+    double x[16], z[16];                              // n <= 16
+    for (int i = 0; i < N; ++i) x[i] = 1.0 / std::sqrt(double(N));
+    double lam = 0.0;
+    for (int s = 0; s < static_cast<int>(k_); ++s)
+    {
+        for (int i = 0; i < N; ++i)
+        {
+            double t = 0.0;
+            for (int j = 0; j < N; ++j) t += A[i*N + j]*x[j];
+            z[i] = t;
+        }
+        double ny = 0.0;
+        for (int i = 0; i < N; ++i)
+        {
+            double t = 0.0;
+            for (int j = 0; j < N; ++j) t += A[i*N + j]*z[j];
+            x[i] = t;
+            ny += t*t;
+        }
+        ny = std::sqrt(ny);
+        const double d = ny > 0.0 ? ny : 1.0;
+        for (int i = 0; i < N; ++i) x[i] /= d;
+        lam = ny;
+    }
+    return static_cast<Foam::scalar>(static_cast<double>(safety)*std::sqrt(lam));
+}
+
 // ── eigenvalues — λ-only companion of eigensystem, for the wave speed ─────
 //
 // ``eigenvalues(idx, *A_flat)`` -> real part of the idx-th eigenvalue of the
