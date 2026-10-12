@@ -22,10 +22,9 @@ import sympy as sp
 from scipy.spatial import cKDTree
 
 from zoomy_core.numerics import NumericalSystemModel
-from zoomy_core.symsolver import CxxPrinter
 from zoomy_core.solver.constants import ELLIPTIC_RTOL, elliptic_constants
-from zoomy_core.symsolver.program import _program, chorin_program, chorin_systems, hyperbolic_program
-from zoomy_core.symsolver import hyperbolic as T
+from zoomy_core.symsolver.program import (chorin_program, chorin_systems,
+                                          hyperbolic_precice_program, hyperbolic_program)
 from zoomy_foam._pipeline import (FOAM_ROOT, _BINCACHE, _apptainer,
                                   _mesh_geometry,
                                   _write_grid_system)
@@ -120,15 +119,8 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
         kw = self._kw(nsm, dimension)
         if not self.couple:
             return hyperbolic_program(nsm, **kw)
-        implicit, linsolve = kw.pop("implicit"), kw.pop("linsolve")
-        kw["dt_constant"] = None if self.dt is None else sp.Float(self.dt)
-        Q, Qaux, p, time, time_end, mesh = sp.symbols("Q Qaux p time time_end mesh")
-        run = CxxPrinter().procedure(
-            "run", (Q, Qaux, p, time, time_end, mesh),
-            lambda Q, Qaux, p, time, time_end, mesh: T.hyperbolic_precice(
-                nsm, Q, Qaux, p, time, mesh, side=self.couple["side"],
-                subcycling=self.subcycling, **kw))
-        return _program(nsm, run, implicit, linsolve, nsm.resolved_lsq_degree())
+        return hyperbolic_precice_program(nsm, side=self.couple["side"],
+                                          subcycling=self.subcycling, **kw)
 
     def build(self, nsm, dimension):
         """Print, write the build tree, wmake (cached).  Returns the binary."""

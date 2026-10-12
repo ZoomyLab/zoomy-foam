@@ -485,7 +485,7 @@ Field boundary_traces(K bc, const Field& Q, const Field& QL, const Field& QR,
 }
 
 // ── reconstruction and assembly ─────────────────────────────────────────────
-// The blocks of zoomy_core.symsolver.reconstruction.  A gradient field holds
+// The blocks of zoomy_core.symsolver.discretization.reconstruction.  A gradient field holds
 // d/dx_a of row q in row 3 q + a.
 
 // a kernel in every column; a cell-family kernel gets time = dt = 0 and no position
