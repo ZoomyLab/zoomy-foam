@@ -1,7 +1,6 @@
-"""C++ kernels of the symbolic solvers on foam: one ``struct <system>_t`` per system with one
-static member per kernel the printed solver references.
-The kernels are the NumericalSystemModel's ``call`` table (the Functions the JAX runtime
-lambdifies) printed in Foam syntax.
+"""C++ kernels of the symbolic solvers on foam: one ``struct <system>_t`` per system with one static
+member per kernel the printed solver references.  The kernels are the NumericalSystemModel's
+``call`` table (the Functions the JAX runtime lambdifies) printed in Foam syntax.
 """
 import re
 
@@ -62,8 +61,8 @@ class FoamKernelPrinter(FoamNumericsPrinter):
         GenericCppBase.__init__(self)
 
     def kernel(self, f, n_state):
-        """Print one ``Function`` as a ``static`` member taking the full argument list of its
-        family (unused arguments are ignored).
+        """Print one ``Function`` as a ``static`` member taking the full argument list of its family
+        (unused arguments are ignored).
         """
         self.symbol_maps = []
         for key, group in f.args.items():

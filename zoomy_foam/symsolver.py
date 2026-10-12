@@ -1,7 +1,6 @@
 """Foam driver of the symbolic solvers: prints the C++ solver, builds it with wmake in the OpenFOAM
-apptainer, runs the case.
-Sits at the end of Model -> SystemModel -> NumericalSystemModel -> C++ template -> foam runtime
-(``symsolver/rt.H``).
+apptainer, runs the case.  Sits at the end of Model -> SystemModel -> NumericalSystemModel -> C++
+template -> foam runtime (``symsolver/rt.H``).
 """
 from __future__ import annotations
 
@@ -70,8 +69,8 @@ class FoamDriver(param.Parameterized):
         Args:
             nsm: the NumericalSystemModel (or the tuple of systems of a split template)
             dimension: spatial dimension of the case
-            topo: mesh topology whose boundary-closure classes the kernels carry; None
-                (precompile): none
+            topo: mesh topology whose boundary-closure classes the kernels carry; None (precompile):
+                none
         Returns:
             Path of the ``symFoam`` binary.
         """
@@ -222,11 +221,10 @@ class SymbolicHyperbolicSolverFoam(FoamDriver, CxxBackend):
 
 
 class SymbolicChorinSolverFoam(FoamDriver, CxxChorinBackend):
-    """The Chorin projection template on foam, run with ``(pred, press, corr)`` in place of
-    ``nsm``.
+    """The Chorin projection template on foam, run with ``(pred, press, corr)`` in place of ``nsm``.
 
-    ``pred`` is the predictor NSM on the full state, ``press`` / ``corr`` the pressure and
-    corrector systems of the model's split.
+    ``pred`` is the predictor NSM on the full state, ``press`` / ``corr`` the pressure and corrector
+    systems of the model's split.
 
     References:
         Chorin 1968, https://doi.org/10.1090/S0025-5718-1968-0242392-2
@@ -348,8 +346,8 @@ def _structured(mesh):
 
 
 def _write_extruded_msh(mesh, path, cyclic=None):
-    """Write a 2-D mesh as one layer of prisms or hexahedra (gmsh 2.2) with the boundary tags on
-    the side faces and ``frontAndBack`` at z = 0, 1; cyclic faces are sorted along the seam.
+    """Write a 2-D mesh as one layer of prisms or hexahedra (gmsh 2.2) with the boundary tags on the
+    side faces and ``frontAndBack`` at z = 0, 1; cyclic faces are sorted along the seam.
     """
     import meshio
     X = np.asarray(mesh.vertex_coordinates)[:2].T
