@@ -18,13 +18,9 @@ from pathlib import Path
 
 import numpy as np
 import param
-import sympy as sp
 from scipy.spatial import cKDTree
 
-from zoomy_core.numerics import NumericalSystemModel
-from zoomy_core.solver.constants import ELLIPTIC_RTOL, elliptic_constants
-from zoomy_core.symsolver.program import (chorin_program, chorin_systems,
-                                          hyperbolic_precice_program, hyperbolic_program)
+from zoomy_core.symsolver.backend_cxx import CxxBackend, CxxChorinBackend
 from zoomy_foam._pipeline import (FOAM_ROOT, _BINCACHE, _apptainer,
                                   _mesh_geometry,
                                   _write_grid_system)
@@ -53,35 +49,10 @@ PRECICE = Path(os.environ.get("ZOOMY_PRECICE_PREFIX",
                               Path.home() / "of_build" / "precice-3.4.0"))
 
 
-class SymbolicHyperbolicSolverFoam(param.Parameterized):
-    time_end = param.Number(default=None, allow_None=True)
-    cfl = param.Number(default=0.9, bounds=(0, None))
-    dt = param.Number(default=None, allow_None=True,
-                      doc="Constant time step; None = adaptive CFL step.")
-    cfl_check_every = param.Integer(default=10, bounds=(0, None),
-                                    doc="Constant dt: CFL test every N steps "
-                                        "(1: each step, 0: never).")
-    cfl_wave_speed = param.Selector(
-        default="faces", objects=["faces", "cells"],
-        doc="CFL wave speeds: 'faces' from the first RK stage's Riemann "
-            "problem, 'cells' from the cell states of each face.")
-    mood = param.Boolean(default=True,
-                         doc="A-posteriori MOOD at order >= 2 (cells failing "
-                             "the model's admissibility redo at order 1).")
-    dt_write = param.Number(default=None, allow_None=True,
-                            doc="Output interval; None = final state only.")
-    couple = param.Dict(default=None, allow_None=True,
-                        doc="preCICE: dict(participant=, config=, mesh=, "
-                            "write=[..], read=[..], tag=, side=).")
-    subcycling = param.Boolean(default=False,
-                               doc="preCICE: adaptive steps inside a window.")
-    imex = param.Boolean(default=False,
-                         doc="IMEX (Lie): implicit source slot by Newton.")
-    implicit_tol = param.Number(default=1e-8, bounds=(0, None))
-    implicit_maxiter = param.Integer(default=6, bounds=(1, None))
-    gmres_tol = param.Number(default=1e-7, bounds=(0, None))
-    gmres_restart = param.Integer(default=20, bounds=(1, None))
-    gmres_maxiter = param.Integer(default=30, bounds=(1, None))
+class FoamDriver(param.Parameterized):
+    """The foam runtime of a C++ solver backend (:mod:`zoomy_core.symsolver.backend_cxx`):
+    the build tree (wmake), the case (blockMesh / gmshToFoam, fields, stencils),
+    the launch (``mpirun -parallel``) and the read-back."""
     nprocs = param.Integer(default=1, bounds=(1, None),
                            doc="MPI ranks: decomposePar, mpirun -parallel.")
     decomposition = param.Selector(
@@ -89,38 +60,9 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
         doc="decomposePar method: 'scotch' (graph partition), 'simple' (nprocs "
             "slabs along x).")
 
-    def _systems(self, nsm):
-        return [("nsm", nsm)]
-
-    def _mood(self, nsm):
-        return bool(self.mood and nsm.reconstruction.order >= 2
-                    and nsm.call.admissible is not None)
-
-    def _linsolve(self, nsm):
-        return dict(tol=self.gmres_tol, restart=self.gmres_restart,
-                    maxiter=self.gmres_maxiter, accept=-1.0)
-
-    def _kw(self, nsm, dimension):
-        return dict(dimension=dimension, cfl=self.cfl, mood=self._mood(nsm),
-                    dt_write=self.dt_write, imex=self.imex,
-                    cfl_check_every=self.cfl_check_every,
-                    wave_speed=self.cfl_wave_speed, dt_constant=self.dt,
-                    implicit=dict(tol=self.implicit_tol, maxiter=self.implicit_maxiter),
-                    linsolve=self._linsolve(nsm))
-
     def _control(self):
         """Run-time settings of this solver in the controlDict."""
         return ""
-
-    def _print(self, nsm, dimension):
-        """The host program (:mod:`zoomy_core.symsolver.program`); coupled:
-        the preCICE march as its ``run`` (``time_end`` unused, preCICE ends
-        the loop)."""
-        kw = self._kw(nsm, dimension)
-        if not self.couple:
-            return hyperbolic_program(nsm, **kw)
-        return hyperbolic_precice_program(nsm, side=self.couple["side"],
-                                          subcycling=self.subcycling, **kw)
 
     def build(self, nsm, dimension):
         """Print, write the build tree, wmake (cached).  Returns the binary."""
@@ -163,8 +105,7 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
     def run(self, mesh, model, Q0, workdir):
         """March ``Q0`` (mesh order); returns ``(time, Q)`` and keeps the
         snapshots in ``self.snapshots`` [(time, Q)]."""
-        nsm = (model if isinstance(model, NumericalSystemModel)
-               else NumericalSystemModel.from_system_model(model))
+        nsm = self._prepare(mesh, model)
         from zoomy_core.mesh import ensure_lsq_mesh
         mesh = ensure_lsq_mesh(mesh, nsm)        # its LSQ stencil: the derivatives'
         structured = _structured(mesh)
@@ -251,6 +192,30 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
         snaps = sorted((parts[0] / "out").glob("[0-9]*.dat"), key=lambda f: int(f.stem))
         self.snapshots = [read(f.name) for f in snaps]
         return read("final.dat")
+
+
+class SymbolicHyperbolicSolverFoam(FoamDriver, CxxBackend):
+    """The explicit hyperbolic template on foam.
+
+        time, Q = SymbolicHyperbolicSolverFoam(time_end=0.1).run(
+            mesh, nsm, Q0, workdir)       # Q in the mesh's order"""
+
+
+class SymbolicChorinSolverFoam(FoamDriver, CxxChorinBackend):
+    """The Chorin projection template on foam.
+
+        time, Q = SymbolicChorinSolverFoam(time_end=0.5, dt=2**-7).run(
+            mesh, (pred, press, corr), Q0, workdir)
+
+    ``pred``: predictor NSM on the full state; ``press`` / ``corr``: the
+    pressure and corrector systems of the model's split (zoomy's ``dt``)."""
+    pressure_preconditioner = param.Selector(
+        default="gamg", objects=["gamg", "none"],
+        doc="'gamg': GMRES right preconditioned per pressure row by OpenFOAM's "
+            "GAMG on a Laplacian scaled to the operator's mean diagonal.")
+
+    def _control(self):
+        return f"pressurePreconditioner {self.pressure_preconditioner};\n"
 
 
 def _precice_dict(c):
@@ -427,55 +392,3 @@ def _read_labels(path):
     """An OpenFOAM ascii labelList (decomposePar's cellProcAddressing)."""
     body = Path(path).read_text().split("}", 1)[1]
     return np.array(body[body.index("(") + 1:body.index(")")].split(), dtype=int)
-
-
-class SymbolicChorinSolverFoam(SymbolicHyperbolicSolverFoam):
-    """The Chorin projection template on foam.
-
-        time, Q = SymbolicChorinSolverFoam(time_end=0.5, dt=2**-7).run(
-            mesh, (pred, press, corr), Q0, workdir)
-
-    ``pred``: predictor NSM on the full state; ``press`` / ``corr``: the
-    pressure and corrector systems of the model's split (zoomy's ``dt``)."""
-    time_order = param.Integer(default=1, bounds=(1, 2))
-    pressure_tol = param.Number(default=ELLIPTIC_RTOL, bounds=(0, None))
-    pressure_maxit = param.Integer(default=100, bounds=(1, None))
-    pressure_restart = param.Integer(default=None, allow_None=True, bounds=(1, None))
-    pressure_solve = param.Selector(
-        default="linear", objects=["linear", "newton"],
-        doc="'linear': the constraint is affine in the pressure, one linear "
-            "solve.  'newton': a nonlinear constraint, Newton iterations.")
-    pressure_newton_tol = param.Number(default=1e-10, bounds=(0, None),
-                                       doc="Newton: stop at max|R| <= tol.")
-    pressure_newton_maxit = param.Integer(default=10, bounds=(1, None))
-    pressure_preconditioner = param.Selector(
-        default="gamg", objects=["gamg", "none"],
-        doc="'gamg': GMRES right preconditioned per pressure row by OpenFOAM's "
-            "GAMG on a Laplacian scaled to the operator's mean diagonal.")
-
-    def _systems(self, nsm):
-        return [("pred", nsm), ("press", self.press), ("corr", self.corr)]
-
-    def _linsolve(self, nsm):
-        n = len(self.press.equation_to_state_index) * self._nc
-        ell = elliptic_constants(n_unknowns=n, tol=self.pressure_tol,
-                                 restart=self.pressure_restart).values
-        tol = float(ell["c_elliptic_tol"])
-        return dict(tol=tol, restart=int(ell["c_elliptic_restart"]),
-                    maxiter=self.pressure_maxit, accept=max(1e-6, 10.0 * tol))
-
-    def _control(self):
-        return f"pressurePreconditioner {self.pressure_preconditioner};\n"
-
-    def _print(self, nsm, dimension):
-        return chorin_program(
-            nsm, self.press, self.corr, time_order=self.time_order,
-            pressure_newton=(None if self.pressure_solve == "linear" else
-                             (sp.Float(self.pressure_newton_tol),
-                              int(self.pressure_newton_maxit))),
-            **self._kw(nsm, dimension))
-
-    def run(self, mesh, systems, Q0, workdir):
-        pred, self.press, self.corr = chorin_systems(*systems)
-        self._nc = int(mesh.n_inner_cells)
-        return super().run(mesh, pred, Q0, workdir)
