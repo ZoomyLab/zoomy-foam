@@ -976,7 +976,6 @@ struct Schur
 
 /// Right preconditioner of the pressure solve: algebraic rows cell by cell, elliptic rows by OpenFOAM's GAMG on their Schur complement.
 /// Ref: Weller et al. 1998, https://doi.org/10.1063/1.168744
-/// Ref: Ruge, Stuben 1987, https://doi.org/10.1137/1.9781611971057.ch4
 template<class Op>
 std::function<Field(const Field&)> gamg_preconditioner(Op op, const Field& b, const Mesh& M)
 {
