@@ -243,7 +243,7 @@ class SymbolicHyperbolicSolverFoam(param.Parameterized):
             _read_labels(d / "constant" / "polyMesh" / "cellProcAddressing") for d in parts]
         inv = np.empty_like(order)
         inv[order] = np.arange(len(order))
-        _write_stencils(mesh, nsm, cyclic, order, inv, parts, cells)
+        _write_stencils(mesh, nsm, order, inv, parts, cells)
         r = _apptainer(f"cd {case}; {run}", binds=[case.parent, binary.parent],
                        capture_output=True, text=True)
         if r.returncode != 0:
@@ -284,21 +284,22 @@ def _cyclic(nsm):
     return pairs
 
 
-def _write_stencils(mesh, nsm, cyclic, order, inv, parts, cells):
+def _write_stencils(mesh, nsm, order, inv, parts, cells):
     """``constant/zoomyStencil`` of every part: per cell, the cells of its
     derivative stencil (global cell numbers of the decomposition) and their
-    offsets.  The stencil is zoomy_core's LSQ stencil (the one JAX fits);
-    across a periodic seam the vertex ring with the seam's vertices
-    identified, offsets to the nearest periodic image."""
+    offsets: zoomy_core's LSQ stencil (:func:`geometry_xp.build_topology`,
+    the one JAX fits; across a periodic seam the wrapped ring, offsets to
+    the nearest periodic image)."""
+    from zoomy_core.mesh.geometry_xp import build_topology
+    topo = build_topology(mesh, nsm=nsm)
     nc = int(mesh.n_inner_cells)
     dim = int(mesh.dimension)
     cc = np.zeros((nc, 3))
     cc[:, :dim] = np.asarray(mesh.cell_centers)[:dim, :nc].T
-    sten = [[int(j) for j in dict.fromkeys(row) if j < nc and j != c]
-            for c, row in enumerate(np.asarray(mesh.lsq_neighbors)[:nc])]
-    period = _periods(mesh, cyclic, dim)
-    if period.any():
-        sten = _periodic_rings(mesh, nsm, sten, cc, period)
+    nbr = np.asarray(topo.lsq_neighbors)[:nc]
+    shift = np.zeros(nbr.shape + (3,))
+    if topo.lsq_shift is not None:
+        shift[..., :dim] = np.asarray(topo.lsq_shift)[:nc]
     # global numbering of the parts' cells (OpenFOAM's globalIndex: part by part)
     owner = np.zeros(nc, dtype=int)
     local = np.arange(nc)
@@ -312,57 +313,13 @@ def _write_stencils(mesh, nsm, cyclic, order, inv, parts, cells):
         lines = [str(nc if a is None else len(a))]
         for k in (range(nc) if a is None else a):     # OF cells of this part
             c = order[k]
-            off = cc[sten[c]] - cc[c]
-            off -= period * np.round(off / np.where(period > 0, period, 1))
-            lines.append(" ".join([str(len(sten[c]))] + [
-                f"{gid[inv[j]]} {float(o[0])!r} {float(o[1])!r} {float(o[2])!r}"
-                for j, o in zip(sten[c], off)]))
+            slots = [m for m in dict((int(j), m) for m, j in enumerate(nbr[c])).values()
+                     if nbr[c, m] != c and nbr[c, m] < nc]
+            off = cc[nbr[c, slots]] - cc[c] + shift[c, slots]
+            lines.append(" ".join([str(len(slots))] + [
+                f"{gid[inv[nbr[c, m]]]} {float(o[0])!r} {float(o[1])!r} {float(o[2])!r}"
+                for m, o in zip(slots, off)]))
         (d / "constant" / "zoomyStencil").write_text("\n".join(lines) + "\n")
-
-
-def _periods(mesh, cyclic, dim):
-    """The period along each axis (0: none) of the cyclic pairs."""
-    period = np.zeros(3)
-    for a, b in cyclic.items():
-        s = _seam(mesh, b).mean(axis=0) - _seam(mesh, a).mean(axis=0)
-        ax = int(np.argmax(np.abs(s)))
-        if np.abs(s).sum() > np.abs(s[ax]) * (1 + 1e-9):
-            raise NotImplementedError("periodic seams must be axis-aligned")
-        period[ax] = abs(s[ax])
-    return period
-
-
-def _periodic_rings(mesh, nsm, sten, cc, period):
-    """Seam cells' stencils wrapped across the seams: 1-D the ``lsq_degree``
-    nearest cells each side; else the vertex ring, vertices identified by
-    their coordinates modulo the periods."""
-    nc = len(sten)
-    if int(mesh.dimension) == 1:
-        k = int(nsm.resolved_lsq_degree())
-        o = np.argsort(cc[:, 0])
-        pos = np.empty(nc, dtype=int)
-        pos[o] = np.arange(nc)
-        return [[int(o[(pos[c] + s) % nc]) for s in range(-k, k + 1) if s]
-                for c in range(nc)]
-    from scipy import sparse
-    X = np.zeros((int(mesh.n_vertices), 3))
-    X[:, :int(mesh.dimension)] = np.asarray(mesh.vertex_coordinates)[:int(mesh.dimension)].T
-    lo = X.min(axis=0)
-    folded = np.where(period > 0, (X - lo) % np.where(period > 0, period, 1), X)
-    scale = np.ptp(X, axis=0).max()
-    folded = np.where(np.isclose(folded, np.where(period > 0, period, -1), atol=1e-9 * scale),
-                      0.0, folded)
-    _, vid = np.unique(np.round(folded / scale, 9), axis=0, return_inverse=True)
-    cv = np.asarray(mesh.cell_vertices)[:, :nc]
-    A = sparse.csr_matrix((np.ones(cv.size), (np.repeat(np.arange(nc), cv.shape[0]),
-                                               vid[cv.T.reshape(-1)])))
-    ring = (A @ A.T).tolil().rows
-    own = (sparse.csr_matrix((np.ones(cv.size), (np.repeat(np.arange(nc), cv.shape[0]),
-                                                 cv.T.reshape(-1)))))
-    plain = (own @ own.T).tolil().rows
-    # a cell whose identified ring differs from its plain ring touches a seam
-    return [([int(j) for j in ring[c] if j != c]
-             if len(ring[c]) != len(plain[c]) else sten[c]) for c in range(nc)]
 
 
 def _seam(mesh, tag):
