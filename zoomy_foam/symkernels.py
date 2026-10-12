@@ -91,12 +91,13 @@ def referenced(source, system):
     return sorted(set(re.findall(rf"\b{system}\.(\w+)", source)))
 
 
-def write_kernels(systems, source, path, topo):
+def write_kernels(systems, source, path, topo=None):
     """``Kernels.H``: ``struct <name>_t`` + ``constexpr <name>_t <name>`` for
     each ``(name, nsm)`` in ``systems``, with the kernels ``source`` uses.
     ``topo``: the mesh's topology; the derivative aux entries carry the
     boundary-closure class of their state row (``topo.lsq_closure_class``,
-    -1: the ghost-sample fit)."""
+    -1: the ghost-sample fit; ``topo`` None: -1 everywhere, a degree-2
+    case then recompiles at run)."""
     pr = FoamKernelPrinter()
     out = ["#pragma once", "#include <array>", '#include "List.H"',
            '#include "vector.H"', '#include "scalar.H"',
@@ -115,7 +116,8 @@ def write_kernels(systems, source, path, topo):
                 f" = {{{', '.join(chr(34) + t + chr(34) for t in tags)}}};"]
         for k in referenced(source, name):
             if k == "aux_derivatives":
-                classes = topo.lsq_closure_class.get((name, "state"), ())
+                classes = (topo.lsq_closure_class.get((name, "state"), ())
+                           if topo is not None else ())
                 rows = [(e["row"], e["state_index"], *_axes(e["multi_index"]),
                          int(classes[e["state_index"]]) if len(classes) else -1)
                         for e in nsm.aux_derivatives

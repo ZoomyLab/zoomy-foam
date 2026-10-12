@@ -65,10 +65,10 @@ class FoamDriver(param.Parameterized):
         """Run-time settings of this solver in the controlDict."""
         return ""
 
-    def build(self, nsm, dimension, topo):
+    def build(self, nsm, dimension, topo=None):
         """Print, write the build tree, wmake (cached).  Returns the binary.
         ``topo``: the mesh's topology (the kernels carry its boundary-closure
-        classes)."""
+        classes); None (a precompile): no closure classes."""
         self.source = self._print(nsm, dimension)
         files = {"Solver.H": self.source,
                  "symFoam.C": (APP / "symFoam.C").read_text(),

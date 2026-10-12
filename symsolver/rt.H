@@ -1091,7 +1091,16 @@ std::function<Field(const Field&)> gamg_preconditioner(Op op, const Field& b, co
                 const auto t = P->mul(M, e, P->A[a], yA[a]);
                 for (int i = 0; i < n; ++i) r[i] -= t[i];
             }
-            P->gamg[q]->solve(x, r);
+            // GAMG on the lumped Schur complement can diverge (C10 n120: the
+            // flexible GMRES then ends at a residual of 1e107); a diverged
+            // cycle (residual grown, or not finite) falls back to Jacobi on
+            // S's diagonal -- the flexible GMRES takes a varying preconditioner
+            const Foam::solverPerformance sp = P->gamg[q]->solve(x, r);
+            if (!(sp.finalResidual() <= sp.initialResidual()))
+            {
+                const Foam::scalarField& d = P->S[q]->diag();
+                for (int i = 0; i < n; ++i) x[i] = d[i] != 0.0 ? r[i]/d[i] : r[i];
+            }
             for (int i = 0; i < n; ++i) out(e, i) = x[i];
         }
         for (int a = 0; a < na; ++a)
