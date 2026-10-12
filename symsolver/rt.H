@@ -143,14 +143,16 @@ inline Vec col(const Field& F, int c)
     for (int i = 0; i < F.nq; ++i) r[i] = F(i, c);
     return r;
 }
-inline std::vector<double> flat(const Foam::List<Foam::scalar>& r)
+// a kernel's (nested) result, row-major
+inline void flat_into(std::vector<double>& v, Foam::scalar x) { v.push_back(x); }
+template<class T> void flat_into(std::vector<double>& v, const Foam::List<T>& r)
 {
-    return std::vector<double>(r.begin(), r.end());
+    for (const auto& e : r) flat_into(v, e);
 }
-inline std::vector<double> flat(const Foam::List<Foam::List<Foam::scalar>>& r)
+template<class T> std::vector<double> flat(const Foam::List<T>& r)
 {
     std::vector<double> v;
-    for (const auto& row : r) v.insert(v.end(), row.begin(), row.end());
+    flat_into(v, r);
     return v;
 }
 template<int N> std::array<Field, N> split(const Field& F)
@@ -170,6 +172,7 @@ template<int N> std::array<Field, N> split(const Field& F)
 struct Settings
 {
     int lsq_degree = 1;       // highest derivative order the model asks for
+    double tpfa_cos_floor = NaN;   // two-point fluxes: |n.e| raised to this
 };
 inline Settings& settings() { static Settings s; return s; }
 
@@ -1207,6 +1210,161 @@ Field linsolve(A op, const Field& b)
                 << " > accept gate " << o.ls_accept << Foam::exit(Foam::FatalError);
     }
     return x;
+}
+
+// ── diffusion ───────────────────────────────────────────────────────────────
+// The two-point geometry of div(A : grad X) (JAX's TPFA): per face, |f| / d.
+// A face with a neighbour column: d = |x_n - x_o| max(|n.e|, floor), e the
+// unit vector between the centres (``configure()``'s floor); across a
+// periodic seam the sum of the two normal distances, (x_image - x_o).n.  A
+// physical boundary face: d = 2 dn, the ghost at the mirror image.
+struct Tpfa
+{
+    std::vector<double> w;
+
+    explicit Tpfa(const Mesh& M) : w(M.nf, 0.0)
+    {
+        const double floor = settings().tpfa_cos_floor;
+        if (!(floor >= 0.0))
+            FatalErrorInFunction << "diffusion: no tpfa_cos_floor from configure()"
+                << Foam::exit(Foam::FatalError);
+        std::vector<bool> seam(M.nf, false);
+        int f = M.nfi + M.nbf;
+        for (const Foam::label p : M.coupled)
+        {
+            const Foam::polyPatch& pp = M.m.boundaryMesh()[p];
+            const bool s = Foam::isA<Foam::cyclicPolyPatch>(pp)
+                        || Foam::isA<Foam::processorCyclicPolyPatch>(pp);
+            forAll(pp, k) seam[f++] = s;
+        }
+        for (f = 0; f < M.nf; ++f)
+        {
+            const int o = M.own[f], n = M.nei[f];
+            if (n < 0)
+            {
+                w[f] = M.area[f]/(2*((M.fc[f] - M.cc[o]) & M.normal[f]));
+                continue;
+            }
+            const Foam::vector dx = M.cc[n] - M.cc[o];
+            if (seam[f]) { w[f] = M.area[f]/(dx & M.normal[f]); continue; }
+            const double dist = Foam::mag(dx);
+            w[f] = M.area[f]/dist/std::max(std::abs((dx/dist) & M.normal[f]), floor);
+        }
+    }
+};
+inline const Tpfa& tpfa(const Mesh& M)
+{
+    static std::unique_ptr<Tpfa> t;
+    if (!t) t.reset(new Tpfa(M));
+    return *t;
+}
+
+// div(A : grad X) per own cell (zoomy_core's ``diffusion`` block): per face
+// n.A.n (X_out - X_in) |f| / (d |V|), A the mean of the two cells' tensors
+// (``k`` = the diffusion tensor kernel, rows (i, j, d, e)); across a
+// physical boundary face X_out the ghost kernel's ghost (boundary_ghosts:
+// the foot of the perpendicular, dn), A the inner cell's.  A coupled face
+// (processor, cyclic) adds to its own cell only.
+template<class K, class G>
+Field diffusion(K k, G ghost, const Field& X, const Field& Qaux, const Vec& p,
+                double time, const Mesh& M)
+{
+    const int n = X.nq, dm = M.dim;
+    const Field A = cells(k, X, Qaux, p, time, 0.0, M);
+    if (A.nq != n*n*dm*dm)
+        FatalErrorInFunction << "diffusion: a tensor of " << A.nq << " entries, not ("
+            << n << ", " << n << ", " << dm << ", " << dm << ")" << Foam::exit(Foam::FatalError);
+    const Field Xg = boundary_ghosts(ghost, X, Qaux, p, time, M);
+    const auto& w = tpfa(M).w;
+    Field out(n, M.nc);
+    std::vector<double> flux(n);
+    // the face fluxes sum_j n.A.n (y_j - X_j(a)), A = (A(a) + A(b)) / 2
+    auto face = [&](int f, int a, int b, auto y)
+    {
+        const Foam::vector& nf = M.normal[f];
+        for (int i = 0; i < n; ++i)
+        {
+            flux[i] = 0.0;
+            for (int j = 0; j < n; ++j)
+            {
+                double T = 0.0;
+                for (int d = 0; d < dm; ++d)
+                    for (int e = 0; e < dm; ++e)
+                    {
+                        const int r = ((i*n + j)*dm + d)*dm + e;
+                        T += 0.5*(A(r, a) + A(r, b))*nf[d]*nf[e];
+                    }
+                flux[i] += T*(y(j) - X(j, a));
+            }
+        }
+    };
+    for (int f = 0; f < M.nf; ++f)
+    {
+        const int o = M.own[f], nb = M.nei[f];
+        if (nb < 0) continue;
+        face(f, o, nb, [&](int j) { return X(j, nb); });
+        for (int i = 0; i < n; ++i)
+        {
+            out(i, o) += flux[i]*w[f]/M.vol[o];
+            if (f < M.nfi) out(i, nb) -= flux[i]*w[f]/M.vol[nb];
+        }
+    }
+    for (int b = 0; b < M.nbf; ++b)
+    {
+        const int f = M.bf_face[b], c = M.bf_cell[b];
+        face(f, c, c, [&](int j) { return Xg(j, b); });
+        for (int i = 0; i < n; ++i) out(i, c) += flux[i]*w[f]/M.vol[c];
+    }
+    return out;
+}
+
+// Newton on a global residual R (x -> R, same shape), ``implicit()`` tol /
+// maxiter on ||R||_2; each update a linsolve on the Jacobian action by a
+// directional difference (Jacobian-free Newton-Krylov; JAX: the exact jvp)
+template<class F>
+Field newton_krylov(F R, Field x)
+{
+    const auto& o = implicit();
+    Field r = R(x);
+    int it = 0;
+    for (; it < o.maxiter && norm(r) > o.tol; ++it)
+    {
+        const Field x0 = x, r0 = r;
+        const double nx = norm(x0);
+        auto J = [&R, x0, r0, nx](const Field& v) -> Field
+        {
+            const double nv = norm(v);
+            if (!(nv > 0.0)) return Field(v.nq, v.n);
+            const double h = std::sqrt(std::numeric_limits<double>::epsilon())*(1.0 + nx)/nv;
+            return (R(x0 + h*v) - r0)/h;
+        };
+        x = x0 + linsolve(J, -r0);
+        r = R(x);
+    }
+    static bool warned = false;
+    if (norm(r) > o.tol && !warned)
+    {
+        warned = true;
+        Foam::Warning << "newton_krylov: not converged after " << it
+                      << " Newton updates, ||R|| = " << norm(r) << " (warned once)" << Foam::endl;
+    }
+    return x;
+}
+
+// one Crank-Nicolson step of ``diffusion`` from ``time`` to ``time + dt``:
+// R(X) = X - Q - dt/2 (D(X) + D(Q)) = 0, the ghosts of Q at ``time``, of X
+// at ``time + dt``, A at X (Qaux frozen)
+template<class K, class G>
+Field implicit_diffusion(K k, G ghost, const Field& Q, const Field& Qaux, const Vec& p,
+                         double time, double dt, const Mesh& M)
+{
+    const Field b = Q + 0.5*dt*diffusion(k, ghost, Q, Qaux, p, time, M);
+    auto R = [&](const Field& X)
+    {
+        const Field Y = halo(X, M);
+        return Y - b - 0.5*dt*diffusion(k, ghost, Y, Qaux, p, time + dt, M);
+    };
+    return halo(newton_krylov(R, Q), M);
 }
 
 // ── control ─────────────────────────────────────────────────────────────────
