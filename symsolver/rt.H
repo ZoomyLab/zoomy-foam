@@ -1185,14 +1185,15 @@ Field linsolve(A op, const Field& b)
 }
 
 // ── diffusion ───────────────────────────────────────────────────────────────
-/// Two-point flux weights ``|f| / d`` of div(A : grad X) per face (cosine floor inside, normal distances at seams and boundaries).
+/// Two-point flux weights ``|f| / d`` of div(A : grad X) per face (cosine floor inside, normal distances at seams and boundaries), and the cell-to-cell geometry of the correction.
 /// Ref: Eymard, Gallouet, Herbin 2000, https://doi.org/10.1016/s1570-8659(00)07005-8
 struct Tpfa
 {
-    std::vector<double> w;
+    std::vector<double> w, dist, cosf;      // cosf: the floored |n.e| of w (1 at seams and boundaries)
+    std::vector<Foam::vector> e;            // unit cell-to-cell vector (the normal at seams and boundaries)
 
-    /// Compute the weight ``w[f]`` of every face.
-    explicit Tpfa(const Mesh& M) : w(M.nf, 0.0)
+    /// Compute the weight ``w[f]`` and the geometry of every face.
+    explicit Tpfa(const Mesh& M) : w(M.nf, 0.0), dist(M.nf, 0.0), cosf(M.nf, 1.0), e(M.normal)
     {
         const double floor = settings().tpfa_cos_floor;
         if (!(floor >= 0.0))
@@ -1217,8 +1218,10 @@ struct Tpfa
             }
             const Foam::vector dx = M.cc[n] - M.cc[o];
             if (seam[f]) { w[f] = M.area[f]/(dx & M.normal[f]); continue; }
-            const double dist = Foam::mag(dx);
-            w[f] = M.area[f]/dist/std::max(std::abs((dx/dist) & M.normal[f]), floor);
+            dist[f] = Foam::mag(dx);
+            e[f] = dx/dist[f];
+            cosf[f] = std::max(std::abs((dx/dist[f]) & M.normal[f]), floor);
+            w[f] = M.area[f]/dist[f]/cosf[f];
         }
     }
 };
@@ -1230,10 +1233,13 @@ inline const Tpfa& tpfa(const Mesh& M)
     return *t;
 }
 
-/// ``div(A : grad X)`` per own cell by two-point fluxes (the ``diffusion`` block); ghosts give ``X_out`` at boundaries.
+/// ``(D, C)`` per own cell of div(A : grad X): ``D`` the two-point fluxes (ghosts give ``X_out`` at boundaries), ``C`` the rest of the flux ``n.A.grad_f`` (zero without ``correction`` or in 1-D).
+/// ``grad_f``: the mean of the two cells' LSQ gradients (the derivative-aux fit, ghosts sampled) plus ``((X_b - X_a)/|d| - mean.e) e``; at seams and boundaries ``e = n``, i.e. the tangential part of the cell gradients.
+/// Ref: Eymard, Gallouet, Herbin 2000, https://doi.org/10.1016/s1570-8659(00)07005-8
 template<class K, class G>
-Field diffusion(K k, G ghost, const Field& X, const Field& Qaux, const Vec& p,
-                double time, const Mesh& M)
+std::pair<Field, Field> diffusion_parts(K k, G ghost, const Field& X, const Field& Qaux,
+                                        const Vec& p, double time, const Mesh& M,
+                                        bool correction)
 {
     const int n = X.nq, dm = M.dim;
     const Field A = cells(k, X, Qaux, p, time, 0.0, M);
@@ -1242,7 +1248,7 @@ Field diffusion(K k, G ghost, const Field& X, const Field& Qaux, const Vec& p,
             << n << ", " << n << ", " << dm << ", " << dm << ")" << Foam::exit(Foam::FatalError);
     const Field Xg = boundary_ghosts(ghost, X, Qaux, p, time, M);
     const auto& w = tpfa(M).w;
-    Field out(n, M.nc);
+    Field out(n, M.nc), C(n, M.nc);
     std::vector<double> flux(n);
     // the face fluxes sum_j n.A.n (y_j - X_j(a)), A = (A(a) + A(b)) / 2
     auto face = [&](int f, int a, int b, auto y)
@@ -1281,20 +1287,83 @@ Field diffusion(K k, G ghost, const Field& X, const Field& Qaux, const Vec& p,
         face(f, c, c, [&](int j) { return Xg(j, b); });
         for (int i = 0; i < n; ++i) out(i, c) += flux[i]*w[f]/M.vol[c];
     }
-    return out;
+    if (!correction || dm < 2) return {out, C};
+    Field Gr(n*dm, M.nc);                     // row dm j + a: d/dx_a of row j
+    for (int j = 0; j < n; ++j)
+        for (int a = 0; a < dm; ++a)
+        {
+            const Field D = fit(M).derivative(M, X, j, -1, &Xg, {a});
+            for (int c = 0; c < M.nc; ++c) Gr(dm*j + a, c) = D(0, c);
+        }
+    const Tpfa& t = tpfa(M);
+    // the flux beyond the two-point part: sum_j m.(g - (g.e) e) + (m.e - n.A.n/cosf) (X_j(b) - X_j(a))/|d|,
+    // m = n.A, A and g the means of the two cells (b = a on a boundary face, no second term)
+    auto rest = [&](int f, int a, int b)
+    {
+        const Foam::vector& nf = M.normal[f];
+        const Foam::vector& ef = t.e[f];
+        for (int i = 0; i < n; ++i)
+        {
+            flux[i] = 0.0;
+            for (int j = 0; j < n; ++j)
+            {
+                double ge = 0.0, me = 0.0, mn = 0.0, mt = 0.0;
+                for (int e = 0; e < dm; ++e) ge += 0.5*(Gr(dm*j + e, a) + Gr(dm*j + e, b))*ef[e];
+                for (int e = 0; e < dm; ++e)
+                {
+                    double m = 0.0;
+                    for (int d = 0; d < dm; ++d)
+                        m += 0.5*(A(((i*n + j)*dm + d)*dm + e, a) + A(((i*n + j)*dm + d)*dm + e, b))*nf[d];
+                    mt += m*(0.5*(Gr(dm*j + e, a) + Gr(dm*j + e, b)) - ge*ef[e]);
+                    me += m*ef[e];
+                    mn += m*nf[e];
+                }
+                flux[i] += mt;
+                if (t.dist[f] > 0) flux[i] += (me - mn/t.cosf[f])*(X(j, b) - X(j, a))/t.dist[f];
+            }
+        }
+    };
+    for (int f = 0; f < M.nf; ++f)
+    {
+        const int o = M.own[f], nb = M.nei[f];
+        if (nb < 0) continue;
+        rest(f, o, nb);
+        for (int i = 0; i < n; ++i)
+        {
+            C(i, o) += flux[i]*M.area[f]/M.vol[o];
+            if (f < M.nfi) C(i, nb) -= flux[i]*M.area[f]/M.vol[nb];
+        }
+    }
+    for (int b = 0; b < M.nbf; ++b)
+    {
+        const int f = M.bf_face[b], c = M.bf_cell[b];
+        rest(f, c, c);
+        for (int i = 0; i < n; ++i) C(i, c) += flux[i]*M.area[f]/M.vol[c];
+    }
+    return {out, C};
 }
 
-/// One Crank-Nicolson step of ``diffusion`` over ``dt`` (A at the new state) solved by Newton-Krylov.
+/// ``div(A : grad X)`` per own cell (the ``diffusion`` block): the two-point fluxes plus the correction of ``diffusion_parts``.
+template<class K, class G>
+Field diffusion(K k, G ghost, const Field& X, const Field& Qaux, const Vec& p,
+                double time, const Mesh& M)
+{
+    const auto [D, C] = diffusion_parts(k, ghost, X, Qaux, p, time, M, true);
+    return D + C;
+}
+
+/// One Crank-Nicolson step of the two-point part of ``diffusion`` over ``dt`` (A at the new state) solved by Newton-Krylov, the correction explicit at ``Q`` (deferred).
 /// Ref: Knoll, Keyes 2004, https://doi.org/10.1016/j.jcp.2003.08.010
 template<class K, class G>
 Field implicit_diffusion(K k, G ghost, const Field& Q, const Field& Qaux, const Vec& p,
                          double time, double dt, const Mesh& M)
 {
-    const Field b = Q + 0.5*dt*diffusion(k, ghost, Q, Qaux, p, time, M);
+    const auto [D, C] = diffusion_parts(k, ghost, Q, Qaux, p, time, M, true);
+    const Field b = Q + 0.5*dt*(D + 2.0*C);
     auto R = [&](const Field& X)
     {
         const Field Y = halo(X, M);
-        return Y - b - 0.5*dt*diffusion(k, ghost, Y, Qaux, p, time + dt, M);
+        return Y - b - 0.5*dt*diffusion_parts(k, ghost, Y, Qaux, p, time + dt, M, false).first;
     };
     return halo(newton_krylov(R, Q), M);
 }
