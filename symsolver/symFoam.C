@@ -1,10 +1,7 @@
 /*---------------------------------------------------------------------------*\
-    symFoam -- runs a printed symbolic solver (Solver.H) on an OpenFOAM mesh.
-
-    Reads 0/Q<i>, computes the initial aux (printed ``initial_aux``), marches
-    with the printed ``run``, writes every io.write snapshot and the final
-    state as text: ``out/<k>.dat`` = time, then one line per state row (cell
-    order of the mesh).
+    symFoam -- runs a printed symbolic solver (Solver.H) on an OpenFOAM mesh: reads
+    0/Q<i>, marches with the printed ``run`` and writes the snapshots and the final
+    state as text (``out/<k>.dat``: time, then one line per state row).
 \*---------------------------------------------------------------------------*/
 #include <cfenv>
 #include <chrono>
@@ -24,6 +21,7 @@ namespace zs
 #include "Solver.H"
 }
 
+/// Write ``time`` and the state rows of the first ``n`` (own) cells to a text file.
 static void dump(const std::string& path, double time, const zs::Field& Q, int n)
 {
     FILE* f = std::fopen(path.c_str(), "w");
@@ -36,6 +34,7 @@ static void dump(const std::string& path, double time, const zs::Field& Q, int n
     std::fclose(f);
 }
 
+/// Read the initial state, set up the optional preCICE participant, march the printed solver and write the results.
 int main(int argc, char* argv[])
 {
     using namespace Foam;

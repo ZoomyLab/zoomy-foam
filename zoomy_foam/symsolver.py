@@ -1,11 +1,7 @@
-"""Driver: print the symbolic solvers for foam (C++), build, run.
-
-    solver = SymbolicHyperbolicSolverFoam(time_end=0.1)
-    time, Q = solver.run(mesh, nsm, Q0, workdir)        # Q in the mesh's order
-
-The printed C++ (``Solver.H``), the kernels (``Kernels.H``) and the app
-(``symsolver/symFoam.C`` + ``rt.H`` + zoomy_core's ``rt_common.H``) are
-compiled in the OpenFOAM-13 apptainer, cached by a hash of the sources.
+"""Foam driver of the symbolic solvers: prints the C++ solver, builds it with wmake in the OpenFOAM
+apptainer, runs the case.
+Sits at the end of Model -> SystemModel -> NumericalSystemModel -> C++ template -> foam runtime
+(``symsolver/rt.H``).
 """
 from __future__ import annotations
 
@@ -51,9 +47,12 @@ PRECICE = Path(os.environ.get("ZOOMY_PRECICE_PREFIX",
 
 
 class FoamDriver(param.Parameterized):
-    """The foam runtime of a C++ solver backend (:mod:`zoomy_core.symsolver.backend_cxx`):
-    the build tree (wmake), the case (blockMesh / gmshToFoam, fields, stencils),
-    the launch (``mpirun -parallel``) and the read-back."""
+    """Foam runtime of a C++ solver backend (:mod:`zoomy_core.symsolver.backend_cxx`): build tree,
+    case, launch, read-back.
+
+    References:
+        Weller et al. 1998, https://doi.org/10.1063/1.168744
+    """
     nprocs = param.Integer(default=1, bounds=(1, None),
                            doc="MPI ranks: decomposePar, mpirun -parallel.")
     decomposition = param.Selector(
@@ -62,13 +61,20 @@ class FoamDriver(param.Parameterized):
             "slabs along x).")
 
     def _control(self):
-        """Run-time settings of this solver in the controlDict."""
+        """Extra controlDict entries of this solver (none by default)."""
         return ""
 
     def build(self, nsm, dimension, topo=None):
-        """Print, write the build tree, wmake (cached).  Returns the binary.
-        ``topo``: the mesh's topology (the kernels carry its boundary-closure
-        classes); None (a precompile): no closure classes."""
+        """Print the solver, write the build tree and wmake it (cached by a hash of the sources).
+
+        Args:
+            nsm: the NumericalSystemModel (or the tuple of systems of a split template)
+            dimension: spatial dimension of the case
+            topo: mesh topology whose boundary-closure classes the kernels carry; None
+                (precompile): none
+        Returns:
+            Path of the ``symFoam`` binary.
+        """
         self.source = self._print(nsm, dimension)
         files = {"Solver.H": self.source,
                  "symFoam.C": (APP / "symFoam.C").read_text(),
@@ -108,8 +114,17 @@ class FoamDriver(param.Parameterized):
         return binary
 
     def run(self, mesh, model, Q0, workdir):
-        """March ``Q0`` (mesh order); returns ``(time, Q)`` and keeps the
-        snapshots in ``self.snapshots`` [(time, Q)]."""
+        """Write the case (mesh, fields, stencils), launch ``symFoam`` (``mpirun -parallel`` for
+        ``nprocs > 1``) and read the result back.
+
+        Args:
+            mesh: zoomy_core mesh
+            Q0: initial state ``(n_state, n_cells)`` in the mesh order
+            workdir: case directory (recreated)
+        Returns:
+            ``(time, Q)`` with Q in the mesh order; the written snapshots are kept in
+                ``self.snapshots``.
+        """
         nsm = self._prepare(mesh, model)
         from zoomy_core.mesh import ensure_lsq_mesh
         mesh = ensure_lsq_mesh(mesh, nsm)        # its LSQ stencil: the derivatives'
@@ -191,6 +206,7 @@ class FoamDriver(param.Parameterized):
                                + (case / "log.symFoam").read_text()[-3000:])
 
         def read(name):
+            """Read ``out/<name>`` of every part into the mesh cell order."""
             time, Q = None, np.empty((Q0.shape[0], len(order)))
             for d, c in zip(parts, cells):
                 time, q = _read_dat(d / "out" / name)
@@ -202,30 +218,31 @@ class FoamDriver(param.Parameterized):
 
 
 class SymbolicHyperbolicSolverFoam(FoamDriver, CxxBackend):
-    """The explicit hyperbolic template on foam.
-
-        time, Q = SymbolicHyperbolicSolverFoam(time_end=0.1).run(
-            mesh, nsm, Q0, workdir)       # Q in the mesh's order"""
+    """The explicit hyperbolic template on foam: ``time, Q = solver.run(mesh, nsm, Q0, workdir)``."""
 
 
 class SymbolicChorinSolverFoam(FoamDriver, CxxChorinBackend):
-    """The Chorin projection template on foam.
+    """The Chorin projection template on foam, run with ``(pred, press, corr)`` in place of
+    ``nsm``.
 
-        time, Q = SymbolicChorinSolverFoam(time_end=0.5, dt=2**-7).run(
-            mesh, (pred, press, corr), Q0, workdir)
+    ``pred`` is the predictor NSM on the full state, ``press`` / ``corr`` the pressure and
+    corrector systems of the model's split.
 
-    ``pred``: predictor NSM on the full state; ``press`` / ``corr``: the
-    pressure and corrector systems of the model's split (zoomy's ``dt``)."""
+    References:
+        Chorin 1968, https://doi.org/10.1090/S0025-5718-1968-0242392-2
+    """
     pressure_preconditioner = param.Selector(
         default="gamg", objects=["gamg", "none"],
         doc="'gamg': GMRES right preconditioned per pressure row by OpenFOAM's "
             "GAMG on a Laplacian scaled to the operator's mean diagonal.")
 
     def _control(self):
+        """Pass the pressure preconditioner choice to the controlDict."""
         return f"pressurePreconditioner {self.pressure_preconditioner};\n"
 
 
 def _precice_dict(c):
+    """The ``precice`` controlDict entry of a coupled run (empty without coupling)."""
     if not c:
         return ""
     return (f"precice {{ participant {c['participant']}; config \"{c['config']}\"; "
@@ -234,8 +251,9 @@ def _precice_dict(c):
 
 
 def _cyclic(nsm):
-    """{tag: partner} of the model's Periodic BCs: OpenFOAM cyclic pairs
-    (a periodic seam is a pair, so each side must name the other)."""
+    """``{tag: partner}`` of the model's Periodic BCs as OpenFOAM cyclic pairs; each side must name
+    the other.
+    """
     from zoomy_core.model.boundary_conditions import Periodic
     bcs = getattr(nsm.sm, "_bc_source", None)
     pairs = {} if bcs is None else {
@@ -249,17 +267,9 @@ def _cyclic(nsm):
 
 
 def _write_stencils(mesh, topo, order, inv, parts, cells):
-    """``constant/zoomyStencil`` of every part: zoomy_core's LSQ fit of the
-    derivative aux, per cell (:func:`geometry_xp.compute_geometry`, the one
-    JAX evaluates).  Header: ``n_cells  max_nbr  max_bdy  n_mon`` and the
-    monomials' powers.  Per cell: the centres of its ``n_b`` sampled
-    boundary faces (zoomy_core's slots; the runtime matches them to its own
-    boundary faces), the ``max_nbr`` stencil cells (global numbers of the
-    decomposition; padding: the cell itself), the base table
-    ``lsq_gradQ * lsq_scale_factors`` ``(R, n_mon)`` and, per active closure
-    class, ``class table`` (``lsq_closure * lsq_scale_factors``, same layout,
-    boundary slots last).  Across a periodic seam the stencil is the wrapped
-    ring (offsets to the nearest image: in the tables)."""
+    """Write ``constant/zoomyStencil`` of every part: zoomy_core's LSQ tables (derivative aux fit,
+    boundary closure) per cell, in the global cell numbering of the decomposition.
+    """
     nc = int(mesh.n_inner_cells)
     dim = int(mesh.dimension)
     geom = compute_geometry(topo, np.asarray(mesh.vertex_coordinates)[:dim])
@@ -287,6 +297,7 @@ def _write_stencils(mesh, topo, order, inv, parts, cells):
     gid = np.concatenate([[0], np.cumsum(sizes)])[owner] + local     # per OF cell
 
     def row(values):
+        """Format an array as one line of repr floats."""
         return " ".join(repr(float(v)) for v in np.ravel(values))
     for d, a in zip(parts, cells):
         lines = [f"{nc if a is None else len(a)} {nbr.shape[1]} {bdy.shape[1]} {M}",
@@ -317,16 +328,16 @@ def _seam(mesh, tag):
 
 
 def _separation(mesh, tag, partner):
-    """OpenFOAM's cyclic ``separation`` of ``tag``: the vector from the
-    partner's faces to its own (as blockMesh writes it)."""
+    """OpenFOAM's cyclic ``separation`` vector of ``tag`` (from the partner's faces to its own)."""
     s = np.zeros(3)
     s[:int(mesh.dimension)] = _seam(mesh, tag).mean(axis=0) - _seam(mesh, partner).mean(axis=0)
     return f"({float(s[0])!r} {float(s[1])!r} {float(s[2])!r})"
 
 
 def _structured(mesh):
-    """A uniform 1-D, quad or hexahedral grid: blockMesh; anything else:
-    gmshToFoam."""
+    """True for a uniform 1-D, quad or hexahedral grid (blockMesh); anything else goes through
+    gmshToFoam.
+    """
     if mesh.type == "line":
         return True
     dim = {"quad": 2, "hexahedron": 3}.get(mesh.type)
@@ -337,10 +348,9 @@ def _structured(mesh):
 
 
 def _write_extruded_msh(mesh, path, cyclic=None):
-    """A 2-D mesh as one layer of prisms / hexahedra (z in [0, 1]), gmsh 2.2:
-    the boundary tags on the side faces, ``frontAndBack`` at z = 0 and 1.
-    ``cyclic`` tags list their faces sorted along the seam, so the faces of a
-    pair correspond one by one (OpenFOAM's cyclic ordering)."""
+    """Write a 2-D mesh as one layer of prisms or hexahedra (gmsh 2.2) with the boundary tags on
+    the side faces and ``frontAndBack`` at z = 0, 1; cyclic faces are sorted along the seam.
+    """
     import meshio
     X = np.asarray(mesh.vertex_coordinates)[:2].T
     nv, nc = len(X), int(mesh.n_inner_cells)
@@ -380,14 +390,15 @@ def _write_extruded_msh(mesh, path, cyclic=None):
 
 
 def _read_vectors(path):
-    """The internal field of an ascii volVectorField."""
+    """Internal field of an ascii volVectorField as an array."""
     body = Path(path).read_text().split("internalField", 1)[1].split("boundaryField", 1)[0]
     return np.array([v.split() for v in re.findall(r"\(([^()]*)\)", body)], dtype=float)
 
 
 def _side_names(mesh, dim):
-    """Boundary tag of each side (x-lo, x-hi, y-lo, y-hi), read off the
-    mesh's boundary faces by their outward normal."""
+    """Boundary tag of each side (x-lo, x-hi, y-lo, ...), read off the boundary faces by their
+    outward normal.
+    """
     names = list(mesh.boundary_conditions_sorted_names)
     nums = np.asarray(mesh.boundary_face_function_numbers, dtype=int)
     faces = np.asarray(mesh.boundary_face_face_indices, dtype=int)
@@ -400,6 +411,7 @@ def _side_names(mesh, dim):
 
 
 def _write_field(case, name, vals, patches):
+    """Write the scalar field ``0/<name>`` with the given patch types."""
     body = "\n".join(repr(float(v)) for v in vals)
     bf = "\n".join(f"  {p} {{ type {t}; }}" for p, t in patches.items())
     (case / "0" / name).write_text(
@@ -409,12 +421,13 @@ def _write_field(case, name, vals, patches):
 
 
 def _read_dat(path):
+    """Read an ``out/*.dat`` file: time on the first line, then one row per state variable."""
     lines = Path(path).read_text().split("\n")
     time = float(lines[0])
     return time, np.array([[float(x) for x in ln.split()] for ln in lines[1:] if ln.strip()])
 
 
 def _read_labels(path):
-    """An OpenFOAM ascii labelList (decomposePar's cellProcAddressing)."""
+    """Read an OpenFOAM ascii labelList (decomposePar's cellProcAddressing)."""
     body = Path(path).read_text().split("}", 1)[1]
     return np.array(body[body.index("(") + 1:body.index(")")].split(), dtype=int)

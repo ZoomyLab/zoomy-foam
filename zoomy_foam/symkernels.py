@@ -1,13 +1,7 @@
-"""C++ kernels for the symbolic solvers on foam: one ``struct <system>_t``
-per system, one static member per kernel the printed solver references
-(``nsm.source`` in C++ is the static member ``nsm_t::source``).
-
-The kernels are the system's ``call`` table -- the same ``Function`` objects
-the JAX runtime lambdifies -- printed in Foam syntax.  Every kernel of a
-family takes the family's full argument list, so a block calls all of them
-alike; a kernel ignores the arguments it does not declare.  The ghost
-kernel's ``boundary_data`` is the BC's input state ``Q`` (the template
-default: no coupling data).
+"""C++ kernels of the symbolic solvers on foam: one ``struct <system>_t`` per system with one
+static member per kernel the printed solver references.
+The kernels are the NumericalSystemModel's ``call`` table (the Functions the JAX runtime
+lambdifies) printed in Foam syntax.
 """
 import re
 
@@ -43,6 +37,9 @@ _FAMILY = {
 
 
 def family(f):
+    """Kernel family (``face``, ``bc``, ``recon``, ``normal``, ``cell``) of a ``Function``, which
+    fixes its full C++ argument list.
+    """
     keys = set(f.args.keys())
     if "q_minus" in keys:
         return "face"
@@ -56,13 +53,18 @@ def family(f):
 
 
 class FoamKernelPrinter(FoamNumericsPrinter):
-    """Foam syntax of :class:`FoamNumericsPrinter`; the symbol maps come from
-    each kernel's own argument groups."""
+    """Foam syntax of :class:`FoamNumericsPrinter`; the symbol maps come from each kernel's own
+    argument groups.
+    """
 
     def __init__(self):
+        """Initialise the generic C++ printer only."""
         GenericCppBase.__init__(self)
 
     def kernel(self, f, n_state):
+        """Print one ``Function`` as a ``static`` member taking the full argument list of its
+        family (unused arguments are ignored).
+        """
         self.symbol_maps = []
         for key, group in f.args.items():
             name = _ARG[key][0]
@@ -87,17 +89,20 @@ class FoamKernelPrinter(FoamNumericsPrinter):
 
 
 def referenced(source, system):
-    """Kernel names ``<system>.<name>`` used by the printed solver."""
+    """Kernel names ``<system>.<name>`` used by the printed solver source."""
     return sorted(set(re.findall(rf"\b{system}\.(\w+)", source)))
 
 
 def write_kernels(systems, source, path, topo=None):
-    """``Kernels.H``: ``struct <name>_t`` + ``constexpr <name>_t <name>`` for
-    each ``(name, nsm)`` in ``systems``, with the kernels ``source`` uses.
-    ``topo``: the mesh's topology; the derivative aux entries carry the
-    boundary-closure class of their state row (``topo.lsq_closure_class``,
-    -1: the ghost-sample fit; ``topo`` None: -1 everywhere, a degree-2
-    case then recompiles at run)."""
+    """Write ``Kernels.H``: ``struct <name>_t`` and ``constexpr <name>_t <name>`` for each ``(name,
+    nsm)`` in ``systems``, with the kernels ``source`` uses.
+
+    Args:
+        topo: mesh topology; derivative aux entries carry the boundary-closure class of their state
+            row (-1 without it)
+    Returns:
+        ``path``.
+    """
     pr = FoamKernelPrinter()
     out = ["#pragma once", "#include <array>", '#include "List.H"',
            '#include "vector.H"', '#include "scalar.H"',
@@ -138,6 +143,6 @@ def write_kernels(systems, source, path, topo=None):
 
 
 def _axes(multi_index):
-    """(row, state, d/dx, d/dy, d/dz) from the registry multi-index."""
+    """``(row, state, d/dx, d/dy, d/dz)`` from a registry multi-index."""
     m = list(multi_index) + [0, 0, 0]
     return m[0], m[1], m[2]

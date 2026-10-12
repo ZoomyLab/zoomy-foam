@@ -1,12 +1,9 @@
 #pragma once
 /*---------------------------------------------------------------------------*\
-    rt.H -- the foam runtime of the symbolic solvers: what every name in the
-    printed C++ (zoomy_core.symsolver.CxxPrinter) means on an OpenFOAM mesh.
-
-    Arrays are value types: Field(rows, n) over cells or over faces.  Faces are
-    the internal faces, then the faces of every non-empty boundary patch, in
-    OpenFOAM order.  Kernels come from Kernels.H (struct nsm_t).  What every
-    C++ runtime shares is zoomy_core's rt_common.H.
+    rt.H -- foam runtime of the symbolic solvers: what each name in the printed C++
+    (zoomy_core.symsolver.CxxPrinter) means on an OpenFOAM mesh.  Arrays are
+    Field(rows, n) over cells or faces; kernels come from Kernels.H, shared pieces
+    from zoomy_core's rt_common.H.
 \*---------------------------------------------------------------------------*/
 #include <algorithm>
 #include <array>
@@ -41,12 +38,14 @@ namespace zs
 {
 using Vec = Foam::List<Foam::scalar>;
 
+/// Print ``message`` through OpenFOAM's Warning stream.
 inline void warn(const std::string& message)
 {
     Foam::Warning << message.c_str() << Foam::endl;
 }
 
 // ── arrays ──────────────────────────────────────────────────────────────────
+/// Dense array of ``nq`` rows by ``n`` columns (cells or faces), row-major: the runtime's value type.
 struct Field
 {
     int nq = 0, n = 0;
@@ -57,8 +56,7 @@ struct Field
     double operator()(int i, int c) const { return d[size_t(i)*n + c]; }
 };
 
-// elementwise (rt_common.H's functors); one row broadcasts against many (a
-// cell mask against a state), a number against all
+/// Elementwise ``f`` over two fields (a one-row field broadcasts) or a field and a number.
 template<class F> Field zip(const Field& a, const Field& b, F f)
 {
     Field r(std::max(a.nq, b.nq), a.n);
@@ -79,6 +77,7 @@ template<class F> Field zip(double s, const Field& a, F f)
     for (size_t k = 0; k < r.d.size(); ++k) r.d[k] = f(s, a.d[k]);
     return r;
 }
+/// Elementwise ``+ - * /`` of fields and numbers, unary minus, ``abs`` and ``pow``.
 inline Field operator+(const Field& a, const Field& b) { return zip(a, b, Add{}); }
 inline Field operator-(const Field& a, const Field& b) { return zip(a, b, Sub{}); }
 inline Field operator*(const Field& a, const Field& b) { return zip(a, b, Mul{}); }
@@ -99,39 +98,44 @@ using std::floor;
 using std::fmod;
 using std::pow;
 
-// over all ranks (OpenFOAM's minOp / maxOp would swallow a NaN)
+/// Min or max over all ranks; a NaN anywhere gives NaN (minOp / maxOp would swallow it).
 inline double global(double m, bool lowest)
 {
     if (Foam::returnReduce(m != m, Foam::orOp<bool>())) return NaN;
     return lowest ? Foam::returnReduce(m, Foam::minOp<double>())
                   : Foam::returnReduce(m, Foam::maxOp<double>());
 }
+/// Global minimum of a field over all ranks.
 inline double reduce_min(const Field& a)
 {
     double m = std::numeric_limits<double>::infinity();
     for (double x : a.d) m = minimum(m, x);
     return global(m, true);
 }
+/// Global maximum of a field over all ranks.
 inline double reduce_max(const Field& a)
 {
     double m = -std::numeric_limits<double>::infinity();
     for (double x : a.d) m = maximum(m, x);
     return global(m, false);
 }
+/// True if any entry of a field is nonzero on any rank.
 inline bool reduce_any(const Field& a)
 {
     bool any = false;
     for (double x : a.d) any = any || x != 0.0;
     return Foam::returnReduce(any, Foam::orOp<bool>());
 }
-// entry (i, c) of a field (one row broadcasts) or of a number
+/// Entry ``(i, c)`` of a field (a one-row field broadcasts) or of a number.
 inline double at(const Field& F, int i, int c) { return F(F.nq == 1 ? 0 : i, c); }
 template<class T, std::enable_if_t<std::is_arithmetic_v<T>, int> = 0>
 double at(T x, int, int) { return double(x); }
+/// Number of rows of a field (1 for a number).
 inline int rows_of(const Field& F) { return F.nq; }
 template<class T, std::enable_if_t<std::is_arithmetic_v<T>, int> = 0>
 int rows_of(T) { return 1; }
 
+/// Where the mask ``m`` is nonzero take ``a``, else ``b`` (one-row operands broadcast).
 template<class A, class B>
 Field select(const Field& m, const A& a, const B& b)
 {
@@ -141,15 +145,17 @@ Field select(const Field& m, const A& a, const B& b)
             r(i, c) = at(m, i, c) != 0.0 ? at(a, i, c) : at(b, i, c);
     return r;
 }
+/// Elementwise minimum of two fields.
 inline Field minimum(const Field& a, const Field& b) { return zip(a, b, Min{}); }
 
+/// Column ``c`` of a field as a list: the state argument of a kernel.
 inline Vec col(const Field& F, int c)
 {
     Vec r(F.nq);
     for (int i = 0; i < F.nq; ++i) r[i] = F(i, c);
     return r;
 }
-// a kernel's (nested) result, row-major
+/// Flatten a kernel's (nested) result row-major into a vector of doubles.
 inline void flat_into(std::vector<double>& v, Foam::scalar x) { v.push_back(x); }
 template<class T> void flat_into(std::vector<double>& v, const Foam::List<T>& r)
 {
@@ -161,6 +167,7 @@ template<class T> std::vector<double> flat(const Foam::List<T>& r)
     flat_into(v, r);
     return v;
 }
+/// Split a field into ``N`` equal blocks of rows.
 template<int N> std::array<Field, N> split(const Field& F)
 {
     std::array<Field, N> out;
@@ -175,19 +182,17 @@ template<int N> std::array<Field, N> split(const Field& F)
 }
 
 // ── mesh ────────────────────────────────────────────────────────────────────
-// Columns of a cell field: the rank's own cells, then one halo column per
-// coupled-patch face (processor, cyclic: the cell across it, kept current by
-// ``halo``).  Faces: internal, physical boundary, coupled (owner -> halo
-// column).  A periodic seam is a cyclic patch pair: each half is a coupled
-// patch whose halo sits at the partner cell's periodic image.
 struct Mesh;
+/// The mesh the runtime was last built on (set by the ``Mesh`` constructor).
 inline const Mesh*& active() { static const Mesh* m = nullptr; return m; }
 
+/// A tuple of row indices as an array of ints.
 template<class... I> std::array<int, sizeof...(I)> ints(const std::tuple<I...>& t)
 {
     return std::apply([](auto... i) { return std::array<int, sizeof...(I)>{int(i)...}; }, t);
 }
 
+/// OpenFOAM mesh for the runtime: own cells plus one halo column per coupled-patch face; faces internal, boundary, coupled.
 struct Mesh
 {
     const Foam::fvMesh& m;
@@ -200,6 +205,7 @@ struct Mesh
     std::vector<Foam::label> physical, coupled;     // patch indices
     mutable Foam::volScalarField s;          // scratch, calculated patches
 
+    /// Build the face and cell tables of ``mesh`` (``tags``: BC branch per patch); registers as ``active()``.
     Mesh(const Foam::fvMesh& mesh, int dim_, const std::vector<std::string>& tags)
     :
         m(mesh), dim(dim_), nown(mesh.nCells()), nfi(mesh.nInternalFaces()),
@@ -289,9 +295,7 @@ struct Mesh
         active() = this;
     }
 
-    // row ``row`` of X into the scratch field; physical boundary faces carry
-    // the face values B (per boundary face) or the cell value; coupled
-    // patches the neighbours' values
+    /// Row ``row`` of ``X`` in the scratch vol field (boundary faces: ``B`` or the cell value), coupled patches updated.
     const Foam::volScalarField& load(const Field& X, int row, const Field* B) const
     {
         auto& in = s.primitiveFieldRef();
@@ -307,8 +311,7 @@ struct Mesh
         return s;
     }
 
-    // row ``row`` of X from a vol field: own cells, then the neighbours'
-    // values on the coupled patches
+    /// Row ``row`` of ``X`` from a vol field: own cells, then the neighbours' values on the coupled patches.
     template<class T, class C>
     void copy(Field& X, int row, const Foam::VolField<T>& f, C cmpt) const
     {
@@ -321,6 +324,7 @@ struct Mesh
         }
     }
 
+    /// Refresh the halo columns of ``X`` from their owners (no-op in serial without coupled patches).
     void exchange(Field& X) const
     {
         if (!Foam::Pstream::parRun() && coupled.empty()) return;
@@ -330,6 +334,7 @@ struct Mesh
 };
 
 // ── kernels on cells and faces ──────────────────────────────────────────────
+/// Apply a cell-family kernel in every column (own and halo).
 template<class K>
 Field cells(K k, const Field& Q, const Field& Qaux, const Vec& p, double time,
             double dt, const Mesh& M)
@@ -344,6 +349,7 @@ Field cells(K k, const Field& Q, const Field& Qaux, const Vec& p, double time,
     return out;
 }
 
+/// Apply a face-family kernel on every face; ``N > 1`` splits the stacked result into ``N`` fields.
 template<int N = 1, class K>
 auto faces(K k, const Field& QL, const Field& QR, const Field& AL,
            const Field& AR, const Vec& p, const Mesh& M)
@@ -360,6 +366,7 @@ auto faces(K k, const Field& QL, const Field& QR, const Field& AL,
     else return split<N>(out);
 }
 
+/// Aux of the owner and of the neighbour of every face (the owner twice on a boundary face).
 inline std::tuple<Field, Field> face_aux(const Field& Qaux, const Mesh& M)
 {
     Field L(Qaux.nq, M.nf), R(Qaux.nq, M.nf);
@@ -372,6 +379,7 @@ inline std::tuple<Field, Field> face_aux(const Field& Qaux, const Mesh& M)
     return {L, R};
 }
 
+/// Largest |eigenvalue| of the wave-speed kernel per face, over owner and CFL neighbour.
 template<class K>
 Field face_wavespeed(K k, const Field& Q, const Field& Qaux, const Vec& p,
                      const Mesh& M)
@@ -388,6 +396,7 @@ Field face_wavespeed(K k, const Field& Q, const Field& Qaux, const Vec& p,
     return out;
 }
 
+/// Smaller inradius of the owner and the CFL neighbour per face (the CFL length).
 inline Field face_inradius(const Mesh& M)
 {
     Field out(1, M.nf);
@@ -397,12 +406,7 @@ inline Field face_inradius(const Mesh& M)
 }
 
 // ── boundary ────────────────────────────────────────────────────────────────
-// Two kernels, two values.  ``ghost = true``: the GHOST kernel
-// (boundary_ghost_state) of the inner cell, at the mirror image of the cell
-// centre -- evaluated at the foot of the perpendicular with the normal
-// distance (boundary_states / boundary_ghosts).  ``false``: the FACE kernel
-// (boundary_conditions) of the inner trace, at the face centre
-// (boundary_traces).  (Foot and face centre are equal on orthogonal cells.)
+/// Boundary kernel on every physical boundary face: ghost kernel at the mirror image, or face kernel at the face centre.
 template<class K>
 Field bc_states(K bc, const Field& states, const Field& Qaux, const Vec& p,
                       double time, const Mesh& M, bool ghost = true)
@@ -421,6 +425,7 @@ Field bc_states(K bc, const Field& states, const Field& Qaux, const Vec& p,
     return out;
 }
 
+/// Ghost states of the boundary faces from the inner cells.
 template<class K>
 Field boundary_ghosts(K ghost, const Field& Q, const Field& Qaux, const Vec& p,
                       double time, const Mesh& M)
@@ -431,7 +436,7 @@ Field boundary_ghosts(K ghost, const Field& Q, const Field& Qaux, const Vec& p,
     return bc_states(ghost, inner, Qaux, p, time, M);
 }
 
-// the ghosts and the inner cells' aux
+/// Ghost states of the boundary faces and the aux of their inner cells.
 template<int N = 2, class K>
 std::tuple<Field, Field> boundary_states(K ghost, const Field& Q, const Field& Qaux,
                                          const Vec& p, double time, const Mesh& M)
@@ -445,6 +450,7 @@ std::tuple<Field, Field> boundary_states(K ghost, const Field& Q, const Field& Q
     return {bc_states(ghost, inner, Qaux, p, time, M), Ag};
 }
 
+/// Replace the outer trace of every boundary face by the BC's face state.
 template<class K>
 Field boundary_traces(K bc, const Field& Q, const Field& QL, const Field& QR,
                       const Field& Qaux, const Vec& p, double time, const Mesh& M)
@@ -463,7 +469,7 @@ Field boundary_traces(K bc, const Field& Q, const Field& QL, const Field& QR,
 // The blocks of zoomy_core.symsolver.discretization.reconstruction.  A gradient field holds
 // d/dx_a of row q in row 3 q + a.
 
-// a kernel in every column; a cell-family kernel gets time = dt = 0 and no position
+/// Apply a kernel in every column (a cell-family kernel gets time = dt = 0 and no position).
 template<class K>
 Field pointwise(K k, const Field& X, const Field& Xaux, const Vec& p)
 {
@@ -482,8 +488,7 @@ Field pointwise(K k, const Field& X, const Field& Xaux, const Vec& p)
     return out;
 }
 
-// a boundary face's outer slot holds the inner trace until boundary_traces
-// sets the BC's face state
+/// First-order face traces: owner and neighbour value (a boundary face's outer slot: the inner trace).
 inline std::tuple<Field, Field> cell_traces(const Field& Q, const Mesh& M)
 {
     Field L(Q.nq, M.nf), R(Q.nq, M.nf);
@@ -496,8 +501,7 @@ inline std::tuple<Field, Field> cell_traces(const Field& Q, const Mesh& M)
     return {L, R};
 }
 
-// The ghost Wg sits at the mirror image of the cell centre: OpenFOAM's
-// boundary face value is (W + Wg)/2.
+/// OpenFOAM's boundary face value, ``(W + Wg)/2`` with the ghost ``Wg`` at the mirror image of the cell centre.
 inline Field face_values(const Field& W, const Field& Wg, const Mesh& M)
 {
     Field F(W.nq, M.nbf);
@@ -506,8 +510,7 @@ inline Field face_values(const Field& W, const Field& Wg, const Mesh& M)
     return F;
 }
 
-// OpenFOAM's gradient scheme ``scheme`` (fvSchemes) of every row in ``rows``:
-// row 3 q + a of the result holds d/dx_a of row q
+/// OpenFOAM gradient scheme ``scheme`` of ``rows``; row ``3 q + a`` holds d/dx_a of row ``q``.
 template<class R>
 Field fv_gradient(const R& rows, const Field& W, const Field& Wg, const Mesh& M,
                   const char* scheme)
@@ -523,6 +526,8 @@ Field fv_gradient(const R& rows, const Field& W, const Field& Wg, const Mesh& M,
     return G;
 }
 
+/// Least-squares gradient of every row of ``W`` with the ghosts ``Wg`` on the boundary faces.
+/// Ref: Mavriplis 2003, https://doi.org/10.2514/6.2003-3986
 inline Field gradient(const Field& W, const Field& Wg, const Mesh& M)
 {
     std::vector<int> rows(W.nq);
@@ -530,6 +535,7 @@ inline Field gradient(const Field& W, const Field& Wg, const Mesh& M)
     return fv_gradient(rows, W, Wg, M, "grad");
 }
 
+/// ``G_q . r`` over the mesh dimension: slope of row ``q`` of cell ``c`` along ``r``.
 inline double slope_dot(const Field& G, int q, int c, const Foam::vector& r, int dim)
 {
     double s = 0.0;
@@ -537,8 +543,7 @@ inline double slope_dot(const Field& G, int q, int c, const Foam::vector& r, int
     return s;
 }
 
-// Limiter factors of ``rows``, 1 elsewhere: OpenFOAM's cellLimited gradient
-// (fvSchemes ``limited(<name>)``) is phi G.
+/// Limiter factors ``phi`` of ``rows`` (1 elsewhere) such that OpenFOAM's ``limited(<name>)`` gradient is ``phi G``.
 template<class... I>
 Field limiter_factors(const char* scheme, const std::tuple<I...>& rows,
                       const Field& W, const Field& Wg, const Field& G, const Mesh& M)
@@ -558,21 +563,25 @@ Field limiter_factors(const char* scheme, const std::tuple<I...>& rows,
         }
     return phi;
 }
+/// Minmod limiter factors of ``rows``.
 template<class... I>
 Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
              const Field& G, const Mesh& M)
 { return limiter_factors("limited(minmod)", rows, W, Wg, G, M); }
+/// Venkatakrishnan limiter factors of ``rows``.
 template<class... I>
 Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W,
                       const Field& Wg, const Field& G, const Mesh& M)
 { return limiter_factors("limited(venkatakrishnan)", rows, W, Wg, G, M); }
+/// Barth-Jespersen limiter factors of ``rows``.
+/// Ref: Barth, Jespersen 1989, https://doi.org/10.2514/6.1989-366
 template<class... I>
 Field barth_jespersen(const std::tuple<I...>& rows, const Field& W,
                       const Field& Wg, const Field& G, const Mesh& M)
 { return limiter_factors("limited(barth_jespersen)", rows, W, Wg, G, M); }
 
-// each cell's W moved to the face centre by phi G; a boundary face's outer
-// slot holds the inner trace until boundary_traces sets the BC's face state
+/// Face traces ``W + phi G.(x_f - x_c)`` from owner and neighbour (a boundary face's outer slot: the inner trace).
+/// Ref: van Leer 1979, https://doi.org/10.1016/0021-9991(79)90145-1
 template<class P>
 std::tuple<Field, Field> extrapolate(const Field& W, const Field& G, const P& phi,
                                      const Mesh& M)
@@ -593,6 +602,7 @@ std::tuple<Field, Field> extrapolate(const Field& W, const Field& G, const P& ph
     return {L, R};
 }
 
+/// Per-cell sum of the face values ``Wm`` (owner) and ``Wp`` (neighbour) times |f|/|V|.
 inline Field divergence(const Field& Wm, const Field& Wp, const Mesh& M)
 {
     Field out(Wm.nq, M.nc);
@@ -608,6 +618,7 @@ inline Field divergence(const Field& Wm, const Field& Wp, const Mesh& M)
     return out;
 }
 
+/// Sum a face source kernel, evaluated per side with that side's trace and normal, into the cells (times |f|/|V|).
 template<class K>
 Field edge_source(K k, const Field& Q, const Field& QL, const Field& QR,
                   const Field& Qaux, const Vec& p, const Mesh& M)
@@ -627,19 +638,8 @@ Field edge_source(K k, const Field& Q, const Field& QL, const Field& QR,
 }
 
 // ── whole-domain operations ─────────────────────────────────────────────────
-// Derivative aux: zoomy_core's least-squares fit, the one JAX evaluates.  The
-// driver writes its tables per own cell (constant/zoomyStencil): the stencil
-// cells (global numbering, values gathered across ranks by a distributionMap),
-// the base table T (R x n_mon, the stencil rows then the boundary slots, the
-// scale factors folded in) and, per boundary-closure class that constrains the
-// cell (ANALYSIS 40, 41), the class table.  The samples are
-//     delta = [u_nbr - u_c ; ghost - u_c],   deriv_m = sum_r T[r][m] delta_r,
-// the ghost of a boundary slot at the mirror image of the cell centre (else
-// the cell value).  Table slot j is zoomy_core's j-th sampled boundary face of
-// the cell; the driver writes its centre, matched here to the cell's own
-// boundary face.  (OpenFOAM's compact Gauss integral of the face gradient is
-// inconsistent off orthogonal grids: on triangles its second-derivative error
-// does not shrink with the mesh.)
+/// Least-squares derivative aux read from ``constant/zoomyStencil``: zoomy_core's fit, as evaluated on JAX.
+/// Ref: Mavriplis 2003, https://doi.org/10.2514/6.2003-3986
 struct Fit
 {
     std::vector<std::array<int, 2>> mon;          // per column: (a, -1) d/dx_a, (a, b) d2/dx_a dx_b, (-2, -2) higher
@@ -650,6 +650,7 @@ struct Fit
     std::vector<std::vector<double>> A;           // per own cell: the base table, (nnbr + slots) x nM
     std::vector<std::vector<std::pair<int, std::vector<double>>>> Acl;  // per own cell: class -> table
 
+    /// Read ``constant/zoomyStencil``; match each table's boundary slot to the cell's own boundary face.
     explicit Fit(const Mesh& M)
     {
         const std::string path = M.m.time().path()/"constant"/"zoomyStencil";
@@ -721,8 +722,7 @@ struct Fit
         map.reset(new Foam::distributionMap(Foam::globalIndex(M.nown), stencil, compact));
     }
 
-    // the table of cell ``c`` for closure class ``cls`` (< 0, or a class that
-    // does not constrain the cell: the base table)
+    /// Table of cell ``c`` for closure class ``cls`` (the base table if ``cls < 0`` or the class does not constrain it).
     const std::vector<double>& table(int c, int cls) const
     {
         if (cls >= 0)
@@ -730,9 +730,7 @@ struct Fit
         return A[c];
     }
 
-    // the derivative along ``ax`` (one or two axes) of row ``row`` of X, with
-    // the boundary closure class ``cls`` of that row (boundary faces: the
-    // ghosts G, else the cell value), own cells and halo
+    /// Derivative along ``ax`` of row ``row`` of ``Xf`` with closure class ``cls`` (boundary faces: ghosts ``G``).
     Field derivative(const Mesh& M, const Field& Xf, int row, int cls, const Field* G,
                      const std::vector<int>& ax) const
     {
@@ -760,6 +758,7 @@ struct Fit
         return out;
     }
 };
+/// The mesh's ``Fit``, read on first use.
 inline const Fit& fit(const Mesh& M)
 {
     static std::unique_ptr<Fit> q;
@@ -767,8 +766,7 @@ inline const Fit& fit(const Mesh& M)
     return *q;
 }
 
-// Derivatives (orders 1, 2) by the fit above.  Boundary faces carry the
-// ghosts Qg, else the cell value.
+/// Fill the derivative aux rows of ``spec`` (orders 1, 2) by the fit; boundary faces carry ghosts ``Qg``.
 template<class S>
 Field derivatives(const S& spec, const Field& Q, Field out, const Mesh& M,
                   const Field* Qg, const std::vector<int>& rows)
@@ -787,14 +785,14 @@ Field derivatives(const S& spec, const Field& Q, Field out, const Mesh& M,
     return out;
 }
 
-// boundary faces: no change
+/// Derivative aux of all states (boundary faces: no change).
 template<class S>
 Field derivative_aux(const S& spec, const Field& Q, const Field& Qaux, const Mesh& M)
 {
     return derivatives(spec, Q, Qaux, M, nullptr, {});
 }
 
-// Only the derivatives of state ``rows``; the boundary faces carry the ghosts Qg.
+/// Derivative aux of the state ``rows`` only; boundary faces carry the ghosts ``Qg``.
 template<class S, class... I>
 Field derivative_aux(const S& spec, const Field& Q, const Field& Qaux,
                      const Mesh& M, const Field& Qg, const std::tuple<I...>& rows)
@@ -803,6 +801,7 @@ Field derivative_aux(const S& spec, const Field& Q, const Field& Qaux,
     return derivatives(spec, Q, Qaux, M, &Qg, std::vector<int>(r.begin(), r.end()));
 }
 
+/// Mask of the cells where the admissibility kernel is negative or the state is not finite (MOOD).
 template<class K>
 Field inadmissible(K k, const Field& Q, const Field& Qaux, const Vec& p)
 {
@@ -818,6 +817,7 @@ Field inadmissible(K k, const Field& Q, const Field& Qaux, const Vec& p)
     return out;
 }
 
+/// ``Q`` with the rows ``rows`` set to ``values`` (a number or a function of (k, cell)).
 template<class... I, class V>
 Field put(const Field& Q, const std::tuple<I...>& rows, const V& values)
 {
@@ -832,9 +832,10 @@ Field put(const Field& Q, const std::tuple<I...>& rows, const V& values)
     return out;
 }
 
+/// Zero cell field of ``n`` rows.
 inline Field zeros(int n, const Mesh& M) { return Field(n, M.nc); }
 
-// entries of ``rows`` in [-tol, 0) -> 0: round-off below zero
+/// Set the entries of ``rows`` in ``[-tol, 0)`` to 0 (round-off below zero).
 template<class... I>
 Field clean_round_off(const Field& Q, const std::tuple<I...>& rows, double tol)
 {
@@ -846,12 +847,12 @@ Field clean_round_off(const Field& Q, const std::tuple<I...>& rows, double tol)
     return out;
 }
 
-// the halo columns from their owners (coupled patches); a number (the
-// zero pressure) has none.  By value: never a dangling reference.
+/// Copy of ``X`` (by value) with its halo columns refreshed from their owners; a number has none.
 inline Field halo(const Field& X, const Mesh& M) { Field Y = X; M.exchange(Y); return Y; }
 template<class T, std::enable_if_t<std::is_arithmetic_v<T>, int> = 0>
 T halo(T x, const Mesh&) { return x; }
 
+/// The rows ``rows`` of ``Q``.
 template<class... I>
 Field take(const Field& Q, const std::tuple<I...>& rows)
 {
@@ -863,16 +864,16 @@ Field take(const Field& Q, const std::tuple<I...>& rows)
 }
 
 // ── implicit solves (rt_common.H's implicit() from the driver) ──────────────
-// linsolve: the preconditioner (controlDict pressurePreconditioner) and its
-// statistics
+/// Linear-solve state: GAMG flag (controlDict ``pressurePreconditioner``) and solve / iteration counters.
 struct Krylov
 {
     bool gamg = false;
     long solves = 0, iters = 0;
 };
+/// The process-wide ``Krylov``.
 inline Krylov& krylov() { static Krylov k; return k; }
 
-// cell fields, over the own cells of all ranks
+/// Global inner product of two cell fields over the own cells of all ranks.
 inline double vdot(const Field& a, const Field& b)
 {
     double s = 0.0;
@@ -880,9 +881,10 @@ inline double vdot(const Field& a, const Field& b)
         for (int c = 0; c < active()->nown; ++c) s += a(i, c)*b(i, c);
     return Foam::returnReduce(s, Foam::sumOp<double>());
 }
+/// Global 2-norm of a cell field.
 inline double norm(const Field& a) { return std::sqrt(vdot(a, a)); }
 
-// x + h e_k (h = fd_step(x_k)) and h
+/// ``x + h e_k`` with ``h = fd_step(x_k)`` per cell, and ``h``.
 inline std::pair<Field, Field> perturb(const Field& x, int k)
 {
     Field xk = x, h(1, x.n);
@@ -894,7 +896,7 @@ inline std::pair<Field, Field> perturb(const Field& x, int k)
     return {xk, h};
 }
 
-// the per-cell Newton update from the residual r and the perturbed columns
+/// Per-cell Newton update of ``x`` from the residual ``r`` and the finite-difference columns.
 inline Field newton_update(Field x, const Field& r, const std::vector<Field>& cols,
                            const std::vector<Field>& hs)
 {
@@ -913,15 +915,10 @@ inline Field newton_update(Field x, const Field& r, const std::vector<Field>& co
     return x;
 }
 
+/// Per-cell Newton root of ``f(x) = 0`` (rt_common.H).
 template<class F> Field root(F f, Field x) { return newton_cellwise(f, std::move(x)); }
 
-// Right preconditioner of the pressure solve.  The compact part of the
-// operator (own cell and face neighbours, per pair of rows) assembled by
-// probing with cell colours distance-2 apart in the vertex-ring graph (the
-// reach of the second derivatives); rows whose own block is diagonally
-// dominant are eliminated cell by cell, the others (elliptic) are solved by
-// OpenFOAM's GAMG on their Schur complement (its two-ring part lumped into
-// the diagonal; elliptic rows among each other, and ranks: block Jacobi).
+/// Colour the own cells so that cells within two stencil rings differ (one probe per colour assembles the operator).
 inline const std::vector<int>& colours(const Mesh& M)
 {
     static std::vector<int> col;
@@ -941,8 +938,10 @@ inline const std::vector<int>& colours(const Mesh& M)
     return col;
 }
 
+/// Compact blocks of the operator and the Schur-complement data of the pressure preconditioner.
 struct Schur
 {
+    /// One block of the compact operator on the face addressing: diagonal ``d``, upper ``up`` (row owner, column neighbour), lower ``lo``.
     struct Block { Foam::scalarField d, up, lo; };   // up: row own, column nei
     std::vector<std::vector<Block>> T;               // the compact operator, row pairs
     std::vector<int> E, A;                           // elliptic and algebraic rows
@@ -952,7 +951,7 @@ struct Schur
     Foam::lduInterfaceFieldPtrsList none;
     std::vector<Foam::autoPtr<Foam::lduMatrix::solver>> gamg;
 
-    // T[m][j] v over the own cells
+    /// ``T[m][j] v`` over the own cells.
     std::vector<double> mul(const Mesh& M, int m, int j, const std::vector<double>& v) const
     {
         const auto& o = M.m.lduAddr().lowerAddr();
@@ -963,7 +962,7 @@ struct Schur
         forAll(o, f) { r[o[f]] += B.up[f]*v[u[f]]; r[u[f]] += B.lo[f]*v[o[f]]; }
         return r;
     }
-    // y_A = Dinv r_A, cell by cell
+    /// Algebraic rows ``y_A = Dinv r_A``, cell by cell.
     std::vector<std::vector<double>> local(const std::vector<std::vector<double>>& r) const
     {
         const int na = int(A.size());
@@ -975,6 +974,8 @@ struct Schur
     }
 };
 
+/// Right preconditioner of the pressure solve: algebraic rows cell by cell, elliptic rows by OpenFOAM's GAMG on their Schur complement.
+/// Ref: Weller et al. 1998, https://doi.org/10.1063/1.168744
 template<class Op>
 std::function<Field(const Field&)> gamg_preconditioner(Op op, const Field& b, const Mesh& M)
 {
@@ -1116,8 +1117,8 @@ std::function<Field(const Field&)> gamg_preconditioner(Op op, const Field& b, co
     };
 }
 
-// Restarted flexible GMRES (modified Gram-Schmidt, Givens) on the linear map
-// A, global inner products.
+/// Restarted flexible GMRES on the linear map ``A`` (global inner products, optional GAMG preconditioner).
+/// Ref: Saad 1993, https://doi.org/10.1137/0914028
 template<class A>
 Field linsolve(A op, const Field& b)
 {
@@ -1184,15 +1185,12 @@ Field linsolve(A op, const Field& b)
 }
 
 // ── diffusion ───────────────────────────────────────────────────────────────
-// The two-point geometry of div(A : grad X) (JAX's TPFA): per face, |f| / d.
-// A face with a neighbour column: d = |x_n - x_o| max(|n.e|, floor), e the
-// unit vector between the centres (``configure()``'s floor); across a
-// periodic seam the sum of the two normal distances, (x_image - x_o).n.  A
-// physical boundary face: d = 2 dn, the ghost at the mirror image.
+/// Two-point flux weights ``|f| / d`` of div(A : grad X) per face (cosine floor inside, normal distances at seams and boundaries).
 struct Tpfa
 {
     std::vector<double> w;
 
+    /// Compute the weight ``w[f]`` of every face.
     explicit Tpfa(const Mesh& M) : w(M.nf, 0.0)
     {
         const double floor = settings().tpfa_cos_floor;
@@ -1223,6 +1221,7 @@ struct Tpfa
         }
     }
 };
+/// The mesh's ``Tpfa``, built on first use.
 inline const Tpfa& tpfa(const Mesh& M)
 {
     static std::unique_ptr<Tpfa> t;
@@ -1230,12 +1229,7 @@ inline const Tpfa& tpfa(const Mesh& M)
     return *t;
 }
 
-// div(A : grad X) per own cell (zoomy_core's ``diffusion`` block): per face
-// n.A.n (X_out - X_in) |f| / (d |V|), A the mean of the two cells' tensors
-// (``k`` = the diffusion tensor kernel, rows (i, j, d, e)); across a
-// physical boundary face X_out the ghost kernel's ghost (boundary_ghosts:
-// the foot of the perpendicular, dn), A the inner cell's.  A coupled face
-// (processor, cyclic) adds to its own cell only.
+/// ``div(A : grad X)`` per own cell by two-point fluxes (the ``diffusion`` block); ghosts give ``X_out`` at boundaries.
 template<class K, class G>
 Field diffusion(K k, G ghost, const Field& X, const Field& Qaux, const Vec& p,
                 double time, const Mesh& M)
@@ -1289,9 +1283,8 @@ Field diffusion(K k, G ghost, const Field& X, const Field& Qaux, const Vec& p,
     return out;
 }
 
-// one Crank-Nicolson step of ``diffusion`` from ``time`` to ``time + dt``:
-// R(X) = X - Q - dt/2 (D(X) + D(Q)) = 0, the ghosts of Q at ``time``, of X
-// at ``time + dt``, A at X (Qaux frozen)
+/// One Crank-Nicolson step of ``diffusion`` over ``dt`` (A at the new state) solved by Newton-Krylov.
+/// Ref: Knoll, Keyes 2004, https://doi.org/10.1016/j.jcp.2003.08.010
 template<class K, class G>
 Field implicit_diffusion(K k, G ghost, const Field& Q, const Field& Qaux, const Vec& p,
                          double time, double dt, const Mesh& M)
@@ -1306,6 +1299,7 @@ Field implicit_diffusion(K k, G ghost, const Field& Q, const Field& Qaux, const 
 }
 
 // ── control ─────────────────────────────────────────────────────────────────
+/// Run the body on the state tuple while the condition holds.
 template<class C, class B, class S>
 S while_loop(C c, B b, S s)
 {
@@ -1313,16 +1307,18 @@ S while_loop(C c, B b, S s)
     return s;
 }
 
+/// Evaluate branch ``a`` if ``p``, else ``b``.
 template<class A, class B>
 auto cond(bool p, A a, B b) { return p ? a() : b(); }
 
 // ── preCICE ─────────────────────────────────────────────────────────────────
-// The app fills ``coupling()`` (rt_common.H: the participant, the data names,
-// the vertices) and ``interface()``: the faces of the coupled patch, one
-// preCICE vertex each.
+/// Faces of the coupled patch, one preCICE vertex each.
+/// Ref: Chourdakis et al. 2022, https://doi.org/10.12688/openreseurope.14445.2
 struct Interface { std::vector<int> faces; };
+/// The process-wide ``Interface``.
 inline Interface& interface() { static Interface i; return i; }
 
+/// Mask of the coupled faces.
 inline Field coupled_faces(const Mesh& M)
 {
     Field out(1, M.nf);
@@ -1330,6 +1326,7 @@ inline Field coupled_faces(const Mesh& M)
     return out;
 }
 
+/// States of the owner cells of the coupled faces, as preCICE vertices.
 inline Vertices interface_states(const Field& Q, const Mesh& M)
 {
     const auto& F = interface().faces;
@@ -1340,9 +1337,7 @@ inline Vertices interface_states(const Field& Q, const Mesh& M)
     return out;
 }
 
-// One Riemann problem per coupled face, posed low -> high (``k`` =
-// numerical_face_sides): row 0 for the low side, row 1 for the high side; aux
-// of each state from the pointwise kernel on a zero template (false: zero).
+/// Riemann problem per coupled face, posed low -> high by kernel ``k``; aux of each state from ``kaux`` on a zero template.
 template<class K, class KA>
 Field interface_flux(K k, KA kaux, int side, const Field& Q, const Field& Qaux,
                      const Vertices& peer, const Vec& p, const Mesh& M)

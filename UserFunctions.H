@@ -1,42 +1,9 @@
 #pragma once
 /*---------------------------------------------------------------------------*\
-    UserFunctions.H — backend escape hatch for the OPAQUE primitives that the
-    generated Model.H / Numerics.H depend on but cannot emit as closed-form
-    symbolic expressions.  Every backend (numpy / jax / OpenFOAM) ships its own
-    UserFunctions; the generated files `#include` it, so the dependency flows
-    Numerics.H -> Model.H -> UserFunctions.H and any consumer (solver runtime,
-    the SWE<->VOF coupling functionObject) gets the opaque leaves resolved by
-    including Numerics.H alone.
-
-    The opaque leaves foam supplies:
-      * compute_derivative — LSQ / Gauss-gradient spatial operator for the
-        aux_registry; the canonical "opaque function the printer cannot inline"
-        (the prototype the whole pattern is modelled on).
-      * eigensystem — numerical eigendecomposition (lambda, R, L) of the
-        normal-projected quasilinear matrix, for models with no closed-form
-        spectrum (SME/VAM).
-      * eigenvalues — the lambda-only companion of eigensystem (wave speed / CFL).
-      * solve — per-cell linear solve A^-1 b; the point-implicit source atom
-        (S_lin = (I - dt*J)^-1 S).
-
-    These are the complete set of opaque kernels core declares in
-    zoomy_core/model/kernel_functions.py, minus `conditional`, which the C++
-    printer emits inline as a ternary (generic_c.py) and so never reaches here.
-    tests/test_userfunctions_contract.py enumerates core's kernels and fails if
-    a new one appears unimplemented (REQ-168).
-
-    There is NO `max_wavespeed` here — core dropped it (4e3e1f9) in favour of the
-    generated `Numerics::local_max_abs_eigenvalue`, built from the model's
-    closed-form `eigenvalues` when it has one (SWE emits the exact
-    max(|u +- sqrt(g*h)|)).  When it does not, that kernel currently falls back
-    to a Gershgorin row-sum of the quasilinear matrix rather than calling
-    `eigensystem` below.  That matrix is dimensionally inhomogeneous (mass row
-    contributes a dimensionless 1, momentum row g*h), so at rest the row-sum
-    evaluates to max(1, 2*g*h) + |u| where the true speed is sqrt(g*h) + |u| —
-    too large by 2*sqrt(g*h) (3.65x at h=0.34 m, and it GROWS with depth).
-    Wiring that call site is core's (REQ-167 GAP 1); `eigensystem` below is
-    ready and dimension-agnostic, so foam needs no change when it lands.  The
-    bound is conservative: it costs dt and adds diffusion, it does not corrupt.
+    UserFunctions.H -- foam implementations of the opaque kernel primitives
+    (compute_derivative, eigensystem, eigenvalues, spectral_radius, solve) that
+    the generated Model.H / Numerics.H call but cannot emit as closed-form
+    expressions.  Included by Numerics.H -> Model.H; model-independent.
 \*---------------------------------------------------------------------------*/
 
 #include <algorithm>
@@ -53,23 +20,14 @@
 #include "fvc.H"
 #include "fvcGrad.H"
 
-// NOTE: this header is Model-INDEPENDENT and is included BEFORE the generated
-// Model.H — the new Model.H (zoomy_core >= 75d8c76) emits
-// ``update_aux_variables`` which calls ``numerics::compute_derivative`` below,
-// so the helper must be declared first.  (The old ``max_wavespeed`` helper that
-// pulled in Model.H was removed: core dropped it in favour of the generated
-// ``Numerics::local_max_abs_eigenvalue`` built from ``Model::eigenvalues``.)
+// Model-independent; included BEFORE the generated Model.H, which calls
+// ``numerics::compute_derivative``.
 
 namespace numerics
 {
 
 // ── compute_derivative ─ spatial derivative helper for aux_registry ──────
-//
-// Writes ``D^(dx,dy,dz) source`` into ``result`` over the OpenFOAM mesh.
-// Order 0 = copy; order 1 = Gauss-linear cell gradient; order 2 = the gradient
-// applied twice (∂_b ∂_a f), the Hessian component (a,b) read off the
-// multi-index.  Order 2 is REQUIRED for the VAM Chorin pressure block, whose
-// emitted aux refresh calls ``compute_derivative(P_xx, P, 2,0,0, mesh)``.
+/// Spatial derivative ``D^(dx,dy,dz) source`` (orders 0-2: copy, Gauss gradient, compact second derivative) into ``result``.
 inline void compute_derivative
 (
     Foam::volScalarField& result,
@@ -148,21 +106,7 @@ inline void compute_derivative
 }
 
 // ── eigensystem — opaque eigendecomposition leaf for the Roe scheme ───────
-//
-// Mirrors the numpy backend ``_eigensystem_numpy``: given the flat
-// row-major normal-projected quasilinear matrix ``A_flat`` (n*n entries,
-// preceded by the component index ``idx``), returns the ``idx``-th entry of
-// the stacked decomposition
-//
-//     [ eigenvalues λ (n), right eigenvectors R (n*n), left L = R⁻¹ (n*n) ]
-//
-// realised numerically via Eigen.  The printer emits the n+2n² component
-// reads of ONE face with identical ``A_flat`` args; a 1-slot cache makes
-// them share a single decomposition — essential for correctness, not just
-// speed: R, |Λ| and L must come from the SAME eigenbasis so that the Roe
-// dissipation ``|A| = R|Λ|L`` reconstructs consistently.  |A| is invariant
-// to the eigenpair ordering, so a backend-specific order (Eigen vs LAPACK)
-// is harmless.
+/// Component ``idx`` of ``[lambda, R, L = R^-1]`` of the flat n x n matrix (Eigen), cached so the components of one face share one decomposition.
 template <typename I, typename... Ts>
 inline Foam::scalar eigensystem(I idx_, Ts... a_flat_args)
 {
@@ -212,10 +156,8 @@ inline Foam::scalar eigensystem(I idx_, Ts... a_flat_args)
 }
 
 // ── spectral_radius(k, safety, *A_flat) ───────────────────────────────────
-// safety * sqrt(rho(A^2)) of the row-major n x n A_flat, rho(A^2) by k power
-// steps on A^2 from x = 1/sqrt(n) (kernel_functions.spectral_radius; the
-// arithmetic of the JAX runtime's).  Matvecs only, the same on every device.
-// No cache, no heap: a few dozen flops per call.
+/// ``safety * sqrt(rho(A^2))`` of the flat n x n matrix by ``k`` power-iteration steps on ``A^2`` (matvecs only).
+/// Ref: Golub, Van Loan 2013, https://doi.org/10.56021/9781421407944
 template <typename K, typename S, typename... Ts>
 inline Foam::scalar spectral_radius(K k_, S safety, Ts... a_flat_args)
 {
@@ -251,13 +193,7 @@ inline Foam::scalar spectral_radius(K k_, S safety, Ts... a_flat_args)
 }
 
 // ── eigenvalues — λ-only companion of eigensystem, for the wave speed ─────
-//
-// ``eigenvalues(idx, *A_flat)`` -> real part of the idx-th eigenvalue of the
-// row-major n*n matrix A_flat (n = sqrt(M)).  The wave-speed / CFL bound
-// max|lambda_i(A_n)| needs only the spectrum, so this skips eigensystem's
-// eigenvector solve and the R^-1 (the part that can fail near wet/dry) — ~2/3
-// less work per face.  Same 1-slot cache: the printer emits the n component
-// reads of ONE face with identical args, and they share a single decomposition.
+/// Real part of eigenvalue ``idx`` of the flat n x n matrix (no eigenvectors, cached per face): the wave-speed / CFL bound.
 template <typename I, typename... Ts>
 inline Foam::scalar eigenvalues(I idx_, Ts... a_flat_args)
 {
@@ -292,19 +228,7 @@ inline Foam::scalar eigenvalues(I idx_, Ts... a_flat_args)
 }
 
 // ── solve — opaque per-cell linear solve, the point-implicit source atom ──
-//
-// ``solve(idx, *A_flat, *b_flat)`` -> the idx-th component of A^-1 b, with
-// ``A`` the row-major n*n matrix (first n*n args after idx) and ``b`` the
-// length-n RHS (last n args); n is inferred from the arg count (n*n + n).
-//
-// This is the single backend-specific atom of the NSM point-implicit source
-// treatment: the linearised source ``S_lin = (I - dt*J)^-1 S`` emits one
-// ``solve(i, A_flat, b_flat)`` per row with ``A = I - dt*J``, ``b = S``.  Same
-// shape as ``eigensystem`` above: the printer emits the n component reads of
-// ONE cell with identical args, so a 1-slot cache makes them share a single
-// factorisation — and, as there, correctness depends on it, since all n
-// components must come from the SAME solve.  colPivHouseholderQr matches the
-// contract in zoomy_core/model/kernel_functions.py.
+/// Component ``idx`` of ``A^-1 b`` for the flat ``A`` (n x n) followed by ``b`` (n), by column-pivoting QR, cached per cell.
 template <typename I, typename... Ts>
 inline Foam::scalar solve(I idx_, Ts... ab_flat_args)
 {
