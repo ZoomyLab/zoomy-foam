@@ -425,15 +425,21 @@ inline Field face_inradius(const Mesh& M)
 }
 
 // ── boundary ────────────────────────────────────────────────────────────────
+// A ghost sits at the mirror image of the cell centre: the BC is evaluated at
+// the foot of the perpendicular with the normal distance; a face trace
+// (boundary_traces) at the face centre.  (Equal on orthogonal cells.)
 template<class K>
 Field bc_states(K bc, const Field& states, const Field& Qaux, const Vec& p,
-                      double time, const Mesh& M)
+                      double time, const Mesh& M, bool ghost = true)
 {
     Field out(states.nq, M.nbf);
     for (int i = 0; i < M.nbf; ++i)
     {
         const int f = M.bf_face[i], c = M.bf_cell[i];
-        const auto v = flat(bc(M.bf_branch[i], time, M.fc[f], Foam::mag(M.fc[f] - M.cc[c]),
+        const Foam::vector r = M.fc[f] - M.cc[c];
+        const double dn = r & M.normal[f];
+        const Foam::vector at = ghost ? Foam::vector(M.cc[c] + dn*M.normal[f]) : M.fc[f];
+        const auto v = flat(bc(M.bf_branch[i], time, at, ghost ? dn : Foam::mag(r),
                                col(states, i), col(Qaux, c), p, M.normal[f]));
         for (int q = 0; q < out.nq; ++q) out(q, i) = v[q];
     }
@@ -471,7 +477,7 @@ Field boundary_traces(K bc, const Field& Q, const Field& QL, const Field& QR,
     Field traces(QL.nq, M.nbf);
     for (int i = 0; i < M.nbf; ++i)
         for (int q = 0; q < QL.nq; ++q) traces(q, i) = QL(q, M.bf_face[i]);
-    const Field g = bc_states(bc, traces, Qaux, p, time, M);
+    const Field g = bc_states(bc, traces, Qaux, p, time, M, false);
     Field out = QR;
     for (int i = 0; i < M.nbf; ++i)
         for (int q = 0; q < QR.nq; ++q) out(q, M.bf_face[i]) = g(q, i);
