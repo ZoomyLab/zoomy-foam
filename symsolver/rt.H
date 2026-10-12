@@ -976,6 +976,7 @@ struct Schur
 
 /// Right preconditioner of the pressure solve: algebraic rows cell by cell, elliptic rows by OpenFOAM's GAMG on their Schur complement.
 /// Ref: Weller et al. 1998, https://doi.org/10.1063/1.168744
+/// Ref: Ruge, Stuben 1987, https://doi.org/10.1137/1.9781611971057.ch4
 template<class Op>
 std::function<Field(const Field&)> gamg_preconditioner(Op op, const Field& b, const Mesh& M)
 {
@@ -1186,6 +1187,7 @@ Field linsolve(A op, const Field& b)
 
 // ── diffusion ───────────────────────────────────────────────────────────────
 /// Two-point flux weights ``|f| / d`` of div(A : grad X) per face (cosine floor inside, normal distances at seams and boundaries).
+/// Ref: Eymard, Gallouet, Herbin 2000, https://doi.org/10.1016/s1570-8659(00)07005-8
 struct Tpfa
 {
     std::vector<double> w;

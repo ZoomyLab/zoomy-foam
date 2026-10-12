@@ -107,6 +107,7 @@ inline void compute_derivative
 
 // ── eigensystem — opaque eigendecomposition leaf for the Roe scheme ───────
 /// Component ``idx`` of ``[lambda, R, L = R^-1]`` of the flat n x n matrix (Eigen), cached so the components of one face share one decomposition.
+/// Ref: Roe 1981, https://doi.org/10.1016/0021-9991(81)90128-5
 template <typename I, typename... Ts>
 inline Foam::scalar eigensystem(I idx_, Ts... a_flat_args)
 {
