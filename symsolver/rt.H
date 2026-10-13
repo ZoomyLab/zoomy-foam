@@ -30,7 +30,17 @@
 #include "fvm.H"
 #include "fvMatrices.H"
 
+#include <chrono>
+#include <cstdlib>
 #include <memory>
+
+#ifdef ZS_HYPRE
+#include <mpi.h>
+#include <HYPRE.h>
+#include <HYPRE_IJ_mv.h>
+#include <HYPRE_krylov.h>
+#include <HYPRE_parcsr_ls.h>
+#endif
 
 #include "rt_common.H"
 
@@ -645,6 +655,7 @@ struct Fit
     std::vector<std::array<int, 2>> mon;          // per column: (a, -1) d/dx_a, (a, b) d2/dx_a dx_b, (-2, -2) higher
     int nnbr = 0, nM = 0;                         // stencil rows, monomials
     Foam::labelListList stencil;                  // per own cell: compact indices
+    Foam::labelListList gstencil;                 // per own cell: global cell numbers
     std::unique_ptr<Foam::distributionMap> map;
     std::vector<std::vector<int>> bfs;            // per own cell: own boundary face of each table slot
     std::vector<std::vector<double>> A;           // per own cell: the base table, (nnbr + slots) x nM
@@ -719,6 +730,7 @@ struct Fit
             FatalErrorInFunction << "truncated derivative tables in " << path
                 << Foam::exit(Foam::FatalError);
         Foam::List<Foam::Map<Foam::label>> compact;
+        gstencil = stencil;                      // the map renumbers stencil to compact
         map.reset(new Foam::distributionMap(Foam::globalIndex(M.nown), stencil, compact));
     }
 
@@ -864,11 +876,12 @@ Field take(const Field& Q, const std::tuple<I...>& rows)
 }
 
 // ── implicit solves (rt_common.H's implicit() from the driver) ──────────────
-/// Linear-solve state: GAMG flag (controlDict ``pressurePreconditioner``) and solve / iteration counters.
+/// Linear-solve state: the solver (controlDict ``linearSolver``: ``gmres``, ``schur-gamg``, ``hypre``), solve / iteration counters, seconds in matrix assembly, preconditioner setup and Krylov solve.
 struct Krylov
 {
-    bool gamg = false;
+    std::string solver = "gmres";
     long solves = 0, iters = 0;
+    double t_asm = 0, t_setup = 0, t_solve = 0;
 };
 /// The process-wide ``Krylov``.
 inline Krylov& krylov() { static Krylov k; return k; }
@@ -1117,7 +1130,275 @@ std::function<Field(const Field&)> gamg_preconditioner(Op op, const Field& b, co
     };
 }
 
-/// Restarted flexible GMRES on the linear map ``A`` (global inner products, optional GAMG preconditioner).
+/// Wall seconds (steady clock).
+inline double seconds()
+{
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+#ifdef ZS_HYPRE
+// ── hypre: AMG-preconditioned FlexGMRES on the assembled operator ───────────
+/// hypre's MPI state: a duplicate of MPI_COMM_WORLD, and whether the runtime initialized MPI (a serial OpenFOAM run does not).
+struct Hypre { bool up = false, own_mpi = false; MPI_Comm comm = MPI_COMM_NULL; };
+/// The process-wide ``Hypre``.
+inline Hypre& hypre() { static Hypre h; return h; }
+
+/// Initialize MPI (serial runs) and hypre, once.
+inline void hypre_init()
+{
+    auto& h = hypre();
+    if (h.up) return;
+    int on = 0;
+    MPI_Initialized(&on);
+    if (!on) { MPI_Init(nullptr, nullptr); h.own_mpi = true; }
+    MPI_Comm_dup(MPI_COMM_WORLD, &h.comm);
+#if HYPRE_RELEASE_NUMBER >= 22900
+    HYPRE_Initialize();
+#else
+    HYPRE_Init();
+#endif
+    h.up = true;
+}
+
+/// Pattern of the assembled operator: per own cell its columns (the cell, then its LSQ stencil, each cell once) by global number and their colours.
+/// Colours (``constant/zoomyColours``, the driver's distance-2 colouring of the global LSQ pattern) differ within every row, so one probe per colour and row recovers each entry.
+struct Pattern
+{
+    int ncol = 0;                        // colours over all ranks
+    Foam::label offset = 0;              // global number of own cell 0
+    std::vector<int> colour, ptr, scol;  // per own cell; its slots [ptr[c], ptr[c+1]); per slot
+    std::vector<Foam::label> gcol;       // per slot: the global cell
+};
+
+/// The mesh's ``Pattern``, read on first use.
+inline const Pattern& pattern(const Mesh& M)
+{
+    static std::unique_ptr<Pattern> P;
+    if (P) return *P;
+    P.reset(new Pattern());
+    const Fit& F = fit(M);
+    const std::string path = M.m.time().path()/"constant"/"zoomyColours";
+    std::ifstream in(path);
+    int n = -1;
+    in >> n >> P->ncol;
+    P->colour.resize(std::max(n, 0));
+    for (int& c : P->colour) in >> c;
+    if (!in || n != M.nown)
+        FatalErrorInFunction << "no colouring of " << M.nown << " cells in " << path
+            << " (linearSolver hypre)" << Foam::exit(Foam::FatalError);
+    P->offset = Foam::globalIndex(M.nown).offset(Foam::Pstream::myProcNo());
+    Foam::List<Foam::scalar> v(F.map->constructSize(), -1.0);
+    for (int c = 0; c < n; ++c) v[c] = P->colour[c];
+    F.map->distribute(v);                    // the colours of the remote stencil cells
+    P->ptr.push_back(0);
+    for (int c = 0; c < n; ++c)
+    {
+        const size_t s0 = P->gcol.size();
+        P->gcol.push_back(P->offset + c);
+        P->scol.push_back(P->colour[c]);
+        forAll(F.stencil[c], m)
+        {
+            const Foam::label g = F.gstencil[c][m];
+            if (std::find(P->gcol.begin() + s0, P->gcol.end(), g) != P->gcol.end()) continue;
+            P->gcol.push_back(g);
+            P->scol.push_back(int(v[F.stencil[c][m]]));
+        }
+        for (size_t s = s0; s < P->gcol.size(); ++s)
+            for (size_t t = s0; t < s; ++t)
+                if (P->scol[s] == P->scol[t])
+                    FatalErrorInFunction << "cell " << c << ": colour " << P->scol[s]
+                        << " twice in its stencil (" << path << ")" << Foam::exit(Foam::FatalError);
+        P->ptr.push_back(int(P->gcol.size()));
+    }
+    return *P;
+}
+
+/// v = a^-1 for the n x n row-major block a (overwritten), Gauss-Jordan with partial pivoting; a zero pivot gives a zero row.
+inline void invert_block(double* a, double* v, int n)
+{
+    for (int e = 0; e < n*n; ++e) v[e] = 0.0;
+    for (int d = 0; d < n; ++d) v[d*n + d] = 1.0;
+    for (int cc = 0; cc < n; ++cc)
+    {
+        int piv = cc;
+        for (int p = cc + 1; p < n; ++p) if (std::abs(a[p*n + cc]) > std::abs(a[piv*n + cc])) piv = p;
+        for (int q = 0; q < n; ++q)
+        {
+            std::swap(a[cc*n + q], a[piv*n + q]);
+            std::swap(v[cc*n + q], v[piv*n + q]);
+        }
+        const double ip = a[cc*n + cc] != 0.0 ? 1.0/a[cc*n + cc] : 0.0;
+        for (int q = 0; q < n; ++q) { a[cc*n + q] *= ip; v[cc*n + q] *= ip; }
+        for (int p = 0; p < n; ++p)
+        {
+            if (p == cc) continue;
+            const double f = a[p*n + cc];
+            for (int q = 0; q < n; ++q) { a[p*n + q] -= f*a[cc*n + q]; v[p*n + q] -= f*v[cc*n + q]; }
+        }
+    }
+}
+
+/// hypre solve of op(x) = b: the matrix of op on the LSQ stencil (one op application per colour and row), left-scaled by the inverse n x n cell blocks D, S = D^-1 A, rows owned per rank in OpenFOAM's global cell numbering; FlexGMRES with one BoomerAMG V-cycle (HMIS, ext+i, hybrid symmetric Gauss-Seidel) on S x = D^-1 b to 0.1 ls_tol, re-entered with a tighter tolerance until the true residual |op(x) - b| <= ls_tol |b|. Krylov space min(ls_restart, 50). rel: the true relative residual, |opx(x) - b| / |b| with opx the scale-guarded op.
+/// Ref: Henson, Yang 2002, https://doi.org/10.1016/S0168-9274(01)00115-5
+/// Ref: Saad 1993, https://doi.org/10.1137/0914028
+template<class A, class B>
+Field hypre_solve(A& op, B& opx, const Field& b, double nb, double& rel)
+{
+    const Mesh& M = *active();
+    const auto& o = implicit();
+    auto& kr = krylov();
+    hypre_init();
+    const double t0 = seconds();
+    const Pattern& P = pattern(M);
+    const int nq = b.nq, n = M.nown, nloc = n*nq;
+    // the unscaled rows: slot s, entry (p, q) at (s nq + p) nq + q
+    std::vector<double> Af(size_t(P.ptr[n])*nq*nq, 0.0);
+    for (int cl = 0; cl < P.ncol; ++cl)
+        for (int q = 0; q < nq; ++q)
+        {
+            Field e(nq, b.n);
+            for (int i = 0; i < n; ++i) if (P.colour[i] == cl) e(q, i) = 1.0;
+            const Field y = op(e);
+            for (int i = 0; i < n; ++i)
+                for (int s = P.ptr[i]; s < P.ptr[i + 1]; ++s)
+                    if (P.scol[s] == cl)
+                        for (int p = 0; p < nq; ++p) Af[(size_t(s)*nq + p)*nq + q] = y(p, i);
+        }
+    // S = D^-1 A row by row (exact zeros dropped, the diagonal kept) and D^-1 b
+    const HYPRE_BigInt ilo = HYPRE_BigInt(P.offset)*nq, ihi = ilo + nloc - 1;
+    std::vector<HYPRE_BigInt> rows(nloc), cols;
+    std::vector<HYPRE_Int> ncols(nloc, 0), nd(nloc, 0), no(nloc, 0);
+    std::vector<double> vals, bs(nloc), xs(nloc, 0.0), a(nq*nq), di(nq*nq);
+    cols.reserve(Af.size());
+    vals.reserve(Af.size());
+    for (int i = 0; i < n; ++i)
+    {
+        const int s0 = P.ptr[i];
+        for (int e = 0; e < nq*nq; ++e) a[e] = Af[size_t(s0)*nq*nq + e];
+        invert_block(a.data(), di.data(), nq);
+        for (int p = 0; p < nq; ++p)
+        {
+            const int rw = i*nq + p;
+            rows[rw] = ilo + rw;
+            bs[rw] = 0.0;
+            for (int r = 0; r < nq; ++r) bs[rw] += di[p*nq + r]*b(r, i);
+            for (int s = s0; s < P.ptr[i + 1]; ++s)
+                for (int q = 0; q < nq; ++q)
+                {
+                    double w = 0.0;
+                    for (int r = 0; r < nq; ++r) w += di[p*nq + r]*Af[(size_t(s)*nq + r)*nq + q];
+                    if (w == 0.0 && !(s == s0 && q == p)) continue;
+                    const HYPRE_BigInt c = HYPRE_BigInt(P.gcol[s])*nq + q;
+                    cols.push_back(c);
+                    vals.push_back(w);
+                    ++ncols[rw];
+                    ++(c >= ilo && c <= ihi ? nd : no)[rw];
+                }
+        }
+    }
+    std::vector<double>().swap(Af);
+    const double t1 = seconds();
+    MPI_Comm comm = hypre().comm;
+    HYPRE_IJMatrix Aij;
+    HYPRE_IJMatrixCreate(comm, ilo, ihi, ilo, ihi, &Aij);
+    HYPRE_IJMatrixSetObjectType(Aij, HYPRE_PARCSR);
+    HYPRE_IJMatrixSetDiagOffdSizes(Aij, nd.data(), no.data());
+    HYPRE_IJMatrixInitialize(Aij);
+    HYPRE_IJMatrixSetValues(Aij, nloc, ncols.data(), rows.data(), cols.data(), vals.data());
+    HYPRE_IJMatrixAssemble(Aij);
+    HYPRE_ParCSRMatrix PA;
+    HYPRE_IJMatrixGetObject(Aij, reinterpret_cast<void**>(&PA));
+    HYPRE_IJVector V[2];
+    HYPRE_ParVector PV[2];
+    for (int v = 0; v < 2; ++v)
+    {
+        HYPRE_IJVectorCreate(comm, ilo, ihi, &V[v]);
+        HYPRE_IJVectorSetObjectType(V[v], HYPRE_PARCSR);
+        HYPRE_IJVectorInitialize(V[v]);
+        HYPRE_IJVectorSetValues(V[v], nloc, rows.data(), v == 0 ? bs.data() : xs.data());
+        HYPRE_IJVectorAssemble(V[v]);
+        HYPRE_IJVectorGetObject(V[v], reinterpret_cast<void**>(&PV[v]));
+    }
+    HYPRE_Solver solver, amg;
+    HYPRE_ParCSRFlexGMRESCreate(comm, &solver);
+    HYPRE_FlexGMRESSetKDim(solver, std::min(o.ls_restart, 50));
+    HYPRE_FlexGMRESSetMaxIter(solver, o.ls_restart*o.ls_maxiter);
+    HYPRE_FlexGMRESSetAbsoluteTol(solver, 0.0);
+    HYPRE_FlexGMRESSetLogging(solver, 0);
+    HYPRE_FlexGMRESSetPrintLevel(solver, 0);
+    HYPRE_BoomerAMGCreate(&amg);
+    HYPRE_BoomerAMGSetTol(amg, 0.0);
+    HYPRE_BoomerAMGSetMaxIter(amg, 1);
+    HYPRE_BoomerAMGSetPrintLevel(amg, 0);
+    HYPRE_BoomerAMGSetCoarsenType(amg, 10);             // HMIS
+    HYPRE_BoomerAMGSetInterpType(amg, 6);               // ext+i
+    HYPRE_BoomerAMGSetPMaxElmts(amg, 4);
+    HYPRE_BoomerAMGSetStrongThreshold(amg, 0.25);
+    HYPRE_BoomerAMGSetRelaxType(amg, 6);                // hybrid symmetric Gauss-Seidel
+    HYPRE_BoomerAMGSetNumSweeps(amg, 1);
+    HYPRE_BoomerAMGSetRelaxOrder(amg, 0);
+    HYPRE_FlexGMRESSetPrecond(solver, reinterpret_cast<HYPRE_PtrToSolverFcn>(HYPRE_BoomerAMGSolve),
+                              reinterpret_cast<HYPRE_PtrToSolverFcn>(HYPRE_BoomerAMGSetup), amg);
+    HYPRE_ParCSRFlexGMRESSetup(solver, PA, PV[0], PV[1]);
+    const double t2 = seconds();
+    Field x(nq, b.n);
+    // a margin below ls_tol: a Newton loop around the solve tests its residual absolutely, and
+    // a second iteration would meet its right-hand side at the op's round-off floor
+    double tol = 0.1*o.ls_tol, last = 0.0;
+    long its = 0;
+    for (int pass = 0; pass < 4; ++pass)
+    {
+        HYPRE_FlexGMRESSetTol(solver, tol);
+        HYPRE_ParCSRFlexGMRESSolve(solver, PA, PV[0], PV[1]);
+        HYPRE_Int it = 0;
+        HYPRE_FlexGMRESGetNumIterations(solver, &it);
+        its += it;
+        HYPRE_IJVectorGetValues(V[1], nloc, rows.data(), xs.data());
+        for (int i = 0; i < n; ++i)
+            for (int p = 0; p < nq; ++p) x(p, i) = xs[i*nq + p];
+        rel = norm(opx(x) - b)/nb;
+        if (std::getenv("ZS_KRYLOV_LOG"))
+            Foam::Info<< "hypre pass " << pass << ": " << it << " iterations to " << tol
+                << ", true residual " << rel << Foam::endl;
+        // done, out of iterations, or stalled (a finite-difference op's noise floor)
+        if (!(rel > o.ls_tol) || it >= o.ls_restart*o.ls_maxiter || (pass > 0 && rel > 0.5*last))
+            break;
+        last = rel;
+        tol *= 0.5*o.ls_tol/rel;                    // the scaled residual understates the true one
+    }
+    static bool warned = false;
+    if (rel > o.ls_tol && !warned)
+    {
+        warned = true;
+        warn("hypre: true residual " + std::to_string(rel) + " > ls_tol (an op wider than the "
+             "LSQ stencil, or its round-off floor)");
+    }
+    HYPRE_BoomerAMGDestroy(amg);
+    HYPRE_ParCSRFlexGMRESDestroy(solver);
+    HYPRE_IJMatrixDestroy(Aij);
+    for (auto& v : V) HYPRE_IJVectorDestroy(v);
+    kr.iters += its;
+    kr.t_asm += t1 - t0;
+    kr.t_setup += t2 - t1;
+    kr.t_solve += seconds() - t2;
+    return x;
+}
+#endif
+
+/// Finalize hypre, and MPI if the runtime initialized it (no-op without hypre).
+inline void hypre_finalize()
+{
+#ifdef ZS_HYPRE
+    auto& h = hypre();
+    if (!h.up) return;
+    HYPRE_Finalize();
+    MPI_Comm_free(&h.comm);
+    if (h.own_mpi) MPI_Finalize();
+    h.up = false;
+#endif
+}
+
+/// Solve op(x) = b (tolerances from implicit()): hypre (``linearSolver hypre``, AMG-preconditioned FlexGMRES on the assembled operator), else restarted flexible GMRES with global inner products, right-preconditioned for ``schur-gamg`` by the Schur-complement GAMG; aborts above the accept gate.
 /// Ref: Saad 1993, https://doi.org/10.1137/0914028
 template<class A>
 Field linsolve(A op, const Field& b)
@@ -1126,10 +1407,8 @@ Field linsolve(A op, const Field& b)
     auto& kr = krylov();
     const double nb = norm(b);
     Field x(b.nq, b.n);
-    ++kr.solves;
     if (nb == 0.0) return x;
-    std::function<Field(const Field&)> prec = [](const Field& v) { return v; };
-    if (kr.gamg) prec = gamg_preconditioner(op, b, *active());
+    ++kr.solves;
     // op(x) as |x| op(x / |x|): a printed op(x) = R(x) - R(0) loses eps |R| absolutely, so a tiny
     // x (a right-hand side at round-off: an input already projected) would keep no digits
     auto opx = [&](const Field& v)
@@ -1137,6 +1416,25 @@ Field linsolve(A op, const Field& b)
         const double s = norm(v);
         return s > 0.0 ? s*op(v/s) : Field(v.nq, v.n);
     };
+    if (kr.solver == "hypre")
+    {
+#ifdef ZS_HYPRE
+        double rel = 0.0;
+        x = hypre_solve(op, opx, b, nb, rel);
+        if (o.ls_accept > 0 && !(rel <= o.ls_accept))
+            FatalErrorInFunction << "linsolve: relative residual " << rel
+                << " > accept gate " << o.ls_accept << Foam::exit(Foam::FatalError);
+        return x;
+#else
+        FatalErrorInFunction << "linearSolver hypre: symFoam built without hypre (ZS_HYPRE)"
+            << Foam::exit(Foam::FatalError);
+#endif
+    }
+    const double t0 = seconds();
+    std::function<Field(const Field&)> prec = [](const Field& v) { return v; };
+    if (kr.solver == "schur-gamg") prec = gamg_preconditioner(op, b, *active());
+    const double t1 = seconds();
+    kr.t_setup += t1 - t0;
     const int m = o.ls_restart;
     for (int outer = 0; outer < o.ls_maxiter; ++outer)
     {
@@ -1181,6 +1479,7 @@ Field linsolve(A op, const Field& b)
         }
         for (int i = 0; i < j; ++i) x = x + y[i]*Z[i];
     }
+    kr.t_solve += seconds() - t1;
     if (o.ls_accept > 0)
     {
         const double rel = norm(opx(x) - b)/nb;

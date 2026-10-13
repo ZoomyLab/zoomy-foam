@@ -4,10 +4,12 @@ template -> foam runtime (``symsolver/rt.H``).
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -43,6 +45,13 @@ snGradSchemes { default corrected; }
 # couple different versions).  Unset or missing: the container's own.
 PRECICE = Path(os.environ.get("ZOOMY_PRECICE_PREFIX",
                               Path.home() / "of_build" / "precice-3.4.0"))
+# hypre for linear_solver="hypre": the static CPU libHYPRE.a of
+# containers/zoomy_amrex/build_hypre_cuda.sh (variant cpu, built in the AMReX
+# image).  The OF13 image has the same Ubuntu 24.04, gcc 13.3 and OpenMPI 4.1.6,
+# so symFoam links it unchanged (not the image's own hypre 2.28).
+HYPRE_VERSION = "3.2.0"
+HYPRE_CACHE = Path(os.environ.get("ZOOMY_HYPRE_CACHE", Path.home() / ".cache" / "zoomy"))
+HYPRE_SCRIPT = FOAM_ROOT.parent.parent / "containers" / "zoomy_amrex" / "build_hypre_cuda.sh"
 
 
 class FoamDriver(param.Parameterized):
@@ -63,6 +72,10 @@ class FoamDriver(param.Parameterized):
         """Extra controlDict entries of this solver (none by default)."""
         return ""
 
+    def _hypre(self):
+        """True if the solver links hypre (False by default)."""
+        return False
+
     def build(self, nsm, dimension, topo=None):
         """Print the solver, write the build tree and wmake it (cached by a hash of the sources).
 
@@ -79,7 +92,8 @@ class FoamDriver(param.Parameterized):
                  "symFoam.C": (APP / "symFoam.C").read_text(),
                  "rt.H": (APP / "rt.H").read_text(),
                  RUNTIME_HEADER.name: RUNTIME_HEADER.read_text()}
-        h = hashlib.sha256(str(PRECICE).encode())
+        hypre = hypre_prefix() if self._hypre() else None
+        h = hashlib.sha256(_options(hypre, "BUILD").encode())   # the build flags, then the sources
         for k in sorted(files):
             h.update(k.encode() + files[k].encode())
         _BINCACHE.mkdir(exist_ok=True)
@@ -96,18 +110,11 @@ class FoamDriver(param.Parameterized):
         for k, v in files.items():
             (build / k).write_text(v)
         (build / "Make" / "files").write_text(f"symFoam.C\n\nEXE = {binary}\n")
-        inc, lib = "", "-lprecice"
-        if (PRECICE / "lib" / "libprecice.so").exists():
-            inc = f"-I{PRECICE}/include "
-            lib = f"-L{PRECICE}/lib -Wl,-rpath,{PRECICE}/lib -lprecice"
-        (build / "Make" / "options").write_text(
-            f"EXE_INC = -std=c++17 -DZS_PRECICE {inc}-I{build} -I{FOAM_ROOT} "
-            "-I/usr/include/eigen3 \\\n"
-            "    -I$(LIB_SRC)/finiteVolume/lnInclude -I$(LIB_SRC)/meshTools/lnInclude\n"
-            f"EXE_LIBS = -lfiniteVolume -lmeshTools {lib}\n")
+        (build / "Make" / "options").write_text(_options(hypre, build))
         r = _apptainer(f"cd {build}; wmake > wmake.log 2>&1; rc=$?; "
                        f"tail -40 wmake.log; [ $rc -eq 0 ]",
-                       binds=[build], capture_output=True, text=True)
+                       binds=[build] + ([hypre] if hypre else []),
+                       capture_output=True, text=True)
         if r.returncode != 0 or not binary.exists():
             raise RuntimeError(f"symFoam wmake failed ({build}):\n{r.stdout}\n{r.stderr}")
         return binary
@@ -198,6 +205,8 @@ class FoamDriver(param.Parameterized):
         inv = np.empty_like(order)
         inv[order] = np.arange(len(order))
         _write_stencils(mesh, topo, order, inv, parts, cells)
+        if self._hypre():
+            _write_colours(topo, int(mesh.n_inner_cells), order, parts, cells)
         r = _apptainer(f"cd {case}; {run}", binds=[case.parent, binary.parent],
                        capture_output=True, text=True)
         if r.returncode != 0:
@@ -229,14 +238,38 @@ class SymbolicChorinSolverFoam(FoamDriver, CxxChorinBackend):
     References:
         Chorin 1968, https://doi.org/10.1090/S0025-5718-1968-0242392-2
     """
-    pressure_preconditioner = param.Selector(
-        default="gamg", objects=["gamg", "none"],
-        doc="'gamg': GMRES right preconditioned per pressure row by OpenFOAM's "
-            "GAMG on a Laplacian scaled to the operator's mean diagonal.")
+    linear_solver = param.Selector(
+        default="hypre", objects=["hypre", "schur-gamg", "gmres"], doc=(
+            "Linear solves (linsolve): 'hypre' = hypre FlexGMRES + one BoomerAMG V-cycle on the "
+            "operator assembled by colouring, left-scaled by its inverse cell blocks; "
+            "'schur-gamg' = flexible GMRES right-preconditioned by OpenFOAM's GAMG on the "
+            "elliptic rows' Schur complement; 'gmres' = flexible GMRES, no preconditioner."))
 
     def _control(self):
-        """Pass the pressure preconditioner choice to the controlDict."""
-        return f"pressurePreconditioner {self.pressure_preconditioner};\n"
+        """Pass the linear solver choice to the controlDict."""
+        return f"linearSolver {self.linear_solver};\n"
+
+    def _hypre(self):
+        """True for ``linear_solver="hypre"``."""
+        return self.linear_solver == "hypre"
+
+
+def _options(hypre, build):
+    """``Make/options`` of the build tree ``build``: preCICE; with the hypre prefix ``hypre`` its
+    static library and OpenFOAM's MPI flags."""
+    inc, lib = "", "-lprecice"
+    if (PRECICE / "lib" / "libprecice.so").exists():
+        inc = f"-I{PRECICE}/include "
+        lib = f"-L{PRECICE}/lib -Wl,-rpath,{PRECICE}/lib -lprecice"
+    head = ""
+    if hypre is not None:   # static: nothing to bind at run time
+        head = "-include $(GENERAL_RULES)/mplib$(WM_MPLIB)\n"
+        inc += f"-DZS_HYPRE $(PFLAGS) $(PINC) -I{hypre}/include "
+        lib += f" {hypre}/lib/libHYPRE.a $(PLIBS) -lm"
+    return (f"{head}EXE_INC = -std=c++17 -DZS_PRECICE {inc}-I{build} -I{FOAM_ROOT} "
+            "-I/usr/include/eigen3 \\\n"
+            "    -I$(LIB_SRC)/finiteVolume/lnInclude -I$(LIB_SRC)/meshTools/lnInclude\n"
+            f"EXE_LIBS = -lfiniteVolume -lmeshTools {lib}\n")
 
 
 def _precice_dict(c):
@@ -312,6 +345,64 @@ def _write_stencils(mesh, topo, order, inv, parts, cells):
             parts_c += [f"{int(j)} {row(table[j, where[c]])}" for j in act]
             lines.append(" ".join(parts_c))
         (d / "constant" / "zoomyStencil").write_text("\n".join(lines) + "\n")
+
+
+def _write_colours(topo, nc, order, parts, cells):
+    """Write ``constant/zoomyColours`` of every part (count and number of colours, then one colour
+    per OF cell): a greedy distance-2 colouring of the global LSQ pattern in the mesh's cell order,
+    so the cells of a stencil (a matrix row) differ and rt.H's hypre_solve recovers the operator by
+    one probe per colour and row (9 colours on quads with the vertex stencil).
+    """
+    import scipy.sparse as sps
+    nbr = np.asarray(topo.lsq_neighbors)[:nc]
+    cell = np.arange(nc)[:, None]
+    stencil = np.concatenate([cell, np.where(nbr < nc, nbr, cell)], axis=1)
+    P = sps.csr_matrix((np.ones(stencil.size, np.int8),
+                        (np.repeat(np.arange(nc), stencil.shape[1]), stencil.ravel())),
+                       shape=(nc, nc))
+    C = (P.T @ P).tocsr()                          # two cells in one row
+    ptr, ind = C.indptr, C.indices
+    colour = np.full(nc, -1, np.int64)
+    used = np.zeros(int(np.diff(ptr).max()) + 1, bool)   # greedy: <= degree + 1 colours
+    for c in range(nc):
+        nb = colour[ind[ptr[c]:ptr[c + 1]]]
+        nb = nb[nb >= 0]
+        used[nb] = True
+        colour[c] = int(np.argmin(used))
+        used[nb] = False
+    ncol = int(colour.max()) + 1
+    for d, a in zip(parts, cells):
+        k = np.arange(nc) if a is None else a     # OF cells of this part
+        (d / "constant" / "zoomyColours").write_text(
+            f"{len(k)} {ncol}\n" + " ".join(map(str, colour[order[k]])) + "\n")
+
+
+def hypre_prefix():
+    """The CPU hypre install symFoam links (``~/.cache/zoomy/hypre-cpu-3.2.0``, or
+    ``ZOOMY_HYPRE_DIR``), built first by ``containers/zoomy_amrex/build_hypre_cuda.sh cpu`` when
+    missing.
+
+    References:
+        Falgout, Yang 2002, https://doi.org/10.1007/3-540-47789-6_66
+    """
+    if os.environ.get("ZOOMY_HYPRE_DIR"):
+        return Path(os.environ["ZOOMY_HYPRE_DIR"])
+    prefix = HYPRE_CACHE / f"hypre-cpu-{HYPRE_VERSION}"
+    if (prefix / "lib" / "libHYPRE.a").exists():
+        return prefix
+    if not HYPRE_SCRIPT.exists():
+        raise RuntimeError(f"no hypre in {prefix}: build it with build_hypre_cuda.sh cpu "
+                           "(Zoomy containers/zoomy_amrex), or linear_solver='schur-gamg'")
+    HYPRE_CACHE.mkdir(parents=True, exist_ok=True)
+    with open(HYPRE_CACHE / ".hypre-cpu.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not (prefix / "lib" / "libHYPRE.a").exists():
+            r = subprocess.run(["bash", str(HYPRE_SCRIPT), "cpu"], capture_output=True, text=True,
+                               env=dict(os.environ, HYPRE_VERSION=HYPRE_VERSION,
+                                        ZOOMY_HYPRE_CACHE=str(HYPRE_CACHE)))
+            if r.returncode != 0:
+                raise RuntimeError(f"hypre build failed:\n{r.stdout[-3000:]}\n{r.stderr[-3000:]}")
+    return prefix
 
 
 def _seam(mesh, tag):
