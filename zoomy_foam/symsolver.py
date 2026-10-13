@@ -47,7 +47,7 @@ snGradSchemes { default corrected; }
 # couple different versions).  Unset or missing: the container's own.
 PRECICE = Path(os.environ.get("ZOOMY_PRECICE_PREFIX",
                               Path.home() / "of_build" / "precice-3.4.0"))
-# hypre for linear_solver="hypre": the static CPU libHYPRE.a of
+# hypre for linear_solver=LinearSolver.hypre: the static CPU libHYPRE.a of
 # containers/zoomy_amrex/build_hypre_cuda.sh (variant cpu, built in the AMReX
 # image).  The OF13 image has the same Ubuntu 24.04, gcc 13.3 and OpenMPI 4.1.6,
 # so symFoam links it unchanged (not the image's own hypre 2.28).
@@ -286,7 +286,7 @@ class SymbolicChorinSolverFoam(FoamDriver, CxxChorinBackend):
         return f"linearSolver {self.linear_solver};\n"
 
     def _hypre(self):
-        """True for `linear_solver="hypre"`."""
+        """True for `linear_solver=LinearSolver.hypre`."""
         return self.linear_solver == "hypre"
 
 
@@ -428,7 +428,8 @@ def hypre_prefix():
         return prefix
     if not HYPRE_SCRIPT.exists():
         raise RuntimeError(f"no hypre in {prefix}: build it with build_hypre_cuda.sh cpu "
-                           "(Zoomy containers/zoomy_amrex), or linear_solver='schur-gamg'")
+                           "(Zoomy containers/zoomy_amrex), or "
+                           "linear_solver=LinearSolver.schur_gamg")
     HYPRE_CACHE.mkdir(parents=True, exist_ok=True)
     with open(HYPRE_CACHE / ".hypre-cpu.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
