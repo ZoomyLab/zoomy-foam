@@ -1130,10 +1130,17 @@ Field linsolve(A op, const Field& b)
     if (nb == 0.0) return x;
     std::function<Field(const Field&)> prec = [](const Field& v) { return v; };
     if (kr.gamg) prec = gamg_preconditioner(op, b, *active());
+    // op(x) as |x| op(x / |x|): a printed op(x) = R(x) - R(0) loses eps |R| absolutely, so a tiny
+    // x (a right-hand side at round-off: an input already projected) would keep no digits
+    auto opx = [&](const Field& v)
+    {
+        const double s = norm(v);
+        return s > 0.0 ? s*op(v/s) : Field(v.nq, v.n);
+    };
     const int m = o.ls_restart;
     for (int outer = 0; outer < o.ls_maxiter; ++outer)
     {
-        Field r = b - op(x);
+        Field r = b - opx(x);
         double beta = norm(r);
         if (beta <= o.ls_tol*nb) break;
         std::vector<Field> V{r/beta}, Z;
@@ -1176,7 +1183,7 @@ Field linsolve(A op, const Field& b)
     }
     if (o.ls_accept > 0)
     {
-        const double rel = norm(op(x) - b)/nb;
+        const double rel = norm(opx(x) - b)/nb;
         if (rel > o.ls_accept)
             FatalErrorInFunction << "linsolve: relative residual " << rel
                 << " > accept gate " << o.ls_accept << Foam::exit(Foam::FatalError);
