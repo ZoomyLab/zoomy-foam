@@ -1,27 +1,30 @@
-"""C++ kernels of the symbolic solvers on foam: one ``struct <system>_t`` per system with one static
-member per kernel the printed solver references.  The kernels are the NumericalSystemModel's
-``call`` table (the Functions the JAX runtime lambdifies) printed in Foam syntax.
+"""C++ kernels of the symbolic solvers on foam: one ``struct <system>_t`` per system with one
+``static constexpr`` functor per kernel the printed solver references.  The kernels are the
+NumericalSystemModel's ``call`` table (the Functions the JAX runtime lambdifies) printed in Foam
+syntax: state arguments are ``zs::Col`` views (rt.H), results fixed-size ``std::array``s, row-major.
 """
 import re
+import textwrap
 
+import numpy as np
 import sympy as sp
 
-from zoomy_core.transformation.generic_c import GenericCppBase, get_nested_shape
+from zoomy_core.transformation.generic_c import GenericCppBase, flatten_index, get_nested_shape
 from zoomy_core.transformation.to_openfoam import FoamNumericsPrinter
 
-_L, _S, _V = ("const Foam::List<Foam::scalar>&", "const Foam::scalar",
-              "const Foam::vector&")
+_C, _L, _S, _V = ("const Col", "const Foam::List<Foam::scalar>&", "const Foam::scalar",
+                  "const Foam::vector&")
 # group key -> (C++ name, C++ type)
 _ARG = {
-    "variables": ("Q", _L), "aux_variables": ("Qaux", _L),
+    "variables": ("Q", _C), "aux_variables": ("Qaux", _C),
     "parameters": ("p", _L), "p": ("p", _L), "normal": ("n", _V),
     "position": ("X", _V), "time": ("time", _S), "dt": ("dt", _S),
     "distance": ("dX", _S), "idx": ("bc_idx", "const int"),
-    "boundary_data": ("Q", _L),
-    "reconstruction": ("W", _L),
-    "q_minus": ("Q_minus", _L), "q_plus": ("Q_plus", _L),
-    "aux_minus": ("Qaux_minus", _L), "aux_plus": ("Qaux_plus", _L),
-    "Q": ("Q", _L), "Qaux": ("Qaux", _L), "n": ("n", _V),
+    "boundary_data": ("Q", _C),
+    "reconstruction": ("W", _C),
+    "q_minus": ("Q_minus", _C), "q_plus": ("Q_plus", _C),
+    "aux_minus": ("Qaux_minus", _C), "aux_plus": ("Qaux_plus", _C),
+    "Q": ("Q", _C), "Qaux": ("Qaux", _C), "n": ("n", _V),
 }
 # family -> full argument list (group keys), by what the kernel declares
 _FAMILY = {
@@ -52,17 +55,29 @@ def family(f):
 
 
 class FoamKernelPrinter(FoamNumericsPrinter):
-    """Foam syntax of :class:`FoamNumericsPrinter`; the symbol maps come from each kernel's own
-    argument groups.
+    """Foam syntax of :class:`FoamNumericsPrinter` with stack results (``std::array``, row-major);
+    the symbol maps come from each kernel's own argument groups.
     """
 
     def __init__(self):
         """Initialise the generic C++ printer only."""
         GenericCppBase.__init__(self)
 
+    def _array_type(self, shape):
+        """``std::array`` of the flattened ``shape``."""
+        return f"std::array<{self.real_type}, {int(np.prod(shape))}>"
+
+    def get_array_declaration(self, target, shape, init_zero=False):
+        """Zero-initialised stack array ``target`` of the flattened ``shape``."""
+        return f"{self._array_type(shape)} {target}{{}};"
+
+    def format_assignment(self, target, indices, value, shape):
+        """Row-major flat entry of ``indices``."""
+        return f"{target}[{flatten_index(indices, shape)}] = {value};"
+
     def kernel(self, f, n_state):
-        """Print one ``Function`` as a ``static`` member taking the full argument list of its family
-        (unused arguments are ignored).
+        """Print one ``Function`` as ``struct <name>_k`` and its ``static constexpr`` instance; the
+        call operator takes the full argument list of its family (unused arguments are ignored).
         """
         self.symbol_maps = []
         for key, group in f.args.items():
@@ -78,13 +93,15 @@ class FoamKernelPrinter(FoamNumericsPrinter):
         else:
             expr = self._expand_vector_conditionals(expr)
             shape, expr = get_nested_shape(expr)
-        body = self.convert_expression_body(expr, shape)
+        body = textwrap.indent(self.convert_expression_body(expr, shape), " " * 8)
         keys = _FAMILY[family(f)]
         if family(f) == "normal" and "n" in f.args.keys():
             keys = ("Q", "Qaux", "p", "n")
         sig = ", ".join(f"{_ARG[k][1]} {_ARG[k][0]}" for k in keys)
-        return (f"    static {self._foam_type(shape)} {f.name}({sig})\n"
-                f"    {{\n{body}\n    }}\n")
+        return (f"    struct {f.name}_k\n    {{\n"
+                f"        {self._array_type(shape)} operator()({sig}) const\n"
+                f"        {{\n{body}\n        }}\n    }};\n"
+                f"    static constexpr {f.name}_k {f.name}{{}};\n")
 
 
 def referenced(source, system):
@@ -103,8 +120,7 @@ def write_kernels(systems, source, path, topo=None):
         ``path``.
     """
     pr = FoamKernelPrinter()
-    out = ["#pragma once", "#include <array>", '#include "List.H"',
-           '#include "vector.H"', '#include "scalar.H"',
+    out = ["#pragma once", "#include <array>", '#include "rt.H"',
            '#include "UserFunctions.H"', "", "namespace zs", "{"]
     for name, nsm in systems:
         call, n_state = nsm.call, len(nsm.state)
