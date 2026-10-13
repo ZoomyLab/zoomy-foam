@@ -48,8 +48,11 @@ int main(int argc, char* argv[])
     fedisableexcept(FE_DIVBYZERO | FE_INVALID | FE_OVERFLOW);
 
     zs::configure();
-    zs::krylov().gamg =
-        runTime.controlDict().lookupOrDefault<word>("pressurePreconditioner", "none") == "gamg";
+    zs::krylov().solver = runTime.controlDict().lookupOrDefault<word>("linearSolver", "gmres");
+    if (zs::krylov().solver != "gmres" && zs::krylov().solver != "schur-gamg"
+        && zs::krylov().solver != "hypre")
+        FatalErrorInFunction << "linearSolver " << zs::krylov().solver.c_str()
+            << ": gmres, schur-gamg or hypre" << exit(FatalError);
     const int dim = runTime.controlDict().lookupOrDefault<label>("spaceDimension", 1);
     const zs::Mesh M(mesh, dim, std::vector<std::string>(zs::sys.bc_tags.begin(), zs::sys.bc_tags.end()));
 
@@ -110,9 +113,15 @@ int main(int argc, char* argv[])
         << " s" << endl;
     if (coupled) zs::coupling().participant->finalize();
     dump(out + "/final.dat", std::get<0>(res), std::get<1>(res), M.nown);
-    if (zs::krylov().solves)
-        Info<< "symFoam: linsolve " << zs::krylov().solves << " solves, "
-            << zs::krylov().iters << " GMRES iterations" << endl;
+    const zs::Krylov& kr = zs::krylov();
+    if (kr.solves)
+        Info<< "linsolve summary: " << (kr.solver == "hypre" ? "hypre FlexGMRES + BoomerAMG"
+                : kr.solver == "schur-gamg" ? "FGMRES + Schur-complement GAMG" : "FGMRES")
+            << ", " << kr.solves << " solves, "
+            << double(kr.iters)/kr.solves << " iterations/solve, ms/solve: assembly "
+            << 1e3*kr.t_asm/kr.solves << ", setup " << 1e3*kr.t_setup/kr.solves
+            << ", solve " << 1e3*kr.t_solve/kr.solves << endl;
+    zs::hypre_finalize();
     Info<< "symFoam: t = " << std::get<0>(res) << nl << "End" << endl;
     return 0;
 }
