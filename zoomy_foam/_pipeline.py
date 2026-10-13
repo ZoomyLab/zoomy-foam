@@ -1,31 +1,33 @@
 """In-process run entry for the OpenFOAM (zoomyFoam) backend — REQ-93.
 
-Foam is not drivable in-process: it is codegen -> apptainer ``wmake`` ->
-OpenFOAM ``polyMesh`` + ``0/`` fields -> ``zoomyFoam`` -> VTK, with the DOF count
-baked ``constexpr`` per model.  This module wraps that whole pipeline behind one
-call so the server's ``FoamAdapter`` (and anyone) can drive the *shared*
-folder-case format exactly like the numpy/jax/dmplex/amrex backends::
+Foam is not drivable in-process: it is codegen -> apptainer `wmake` ->
+OpenFOAM `polyMesh` + `0/` fields -> `zoomyFoam` -> VTK, with the DOF count
+baked `constexpr` per model.  This module wraps that whole pipeline behind one
+call so the server's `FoamAdapter` (and anyone) can drive the *shared*
+folder-case format exactly like the numpy/jax/dmplex/amrex backends:
 
+```
     from zoomy_foam import run_case
     h5 = run_case(model, settings, output_dir, on_progress=None)   # -> HDF5 path
+```
 
 It mirrors, generically, the by-hand flow in
-``tools/macdonald_friction_verification.py``:
+`tools/macdonald_friction_verification.py`:
 
-  (a) code-gen ``Model.H`` / ``NumericsKernels.H`` from the resolved model
-      (``FoamSystemModelPrinter`` / ``FoamNumericsPrinter``);
-  (b) ``wmake`` ``zoomyFoam`` in the OpenFOAM-13 apptainer — cached by a hash of
+  (a) code-gen `Model.H` / `NumericsKernels.H` from the resolved model
+      (`FoamSystemModelPrinter` / `FoamNumericsPrinter`);
+  (b) `wmake` `zoomyFoam` in the OpenFOAM-13 apptainer — cached by a hash of
       the emitted headers (the DOF + physics are baked in, so identical headers
       reuse the binary);
-  (c) build the OpenFOAM case: structured ``blockMeshDict`` from the mesh, ``0/Qi``
-      from ``model.initial_conditions`` at the cell centres, ``controlDict`` from
-      ``settings`` (endTime / maxCo / reconstructionOrder / timeScheme / params);
-  (d) run ``zoomyFoam``; parse ``Time = `` lines for ``on_progress``;
-  (e) ``foamToVTK`` -> ``zoomy_prepost.vtk_to_hdf5`` so the server serves the
+  (c) build the OpenFOAM case: structured `blockMeshDict` from the mesh, `0/Qi`
+      from `model.initial_conditions` at the cell centres, `controlDict` from
+      `settings` (endTime / maxCo / reconstructionOrder / timeScheme / params);
+  (d) run `zoomyFoam`; parse `Time = ` lines for `on_progress`;
+  (e) `foamToVTK` -> `zoomy_prepost.vtk_to_hdf5` so the server serves the
       shared HDF5 format.
 
-Env: ``ZOOMY_OF_SIF`` overrides the apptainer image (default
-``~/of_build/zoomy_openfoam.sif``).
+Env: `ZOOMY_OF_SIF` overrides the apptainer image (default
+`~/of_build/zoomy_openfoam.sif`).
 """
 from __future__ import annotations
 
@@ -52,8 +54,8 @@ _OF_BIN = "$HOME/OpenFOAM/$(whoami)-13/platforms/linux64GccDPInt32Opt/bin/zoomyF
 def _bind_args(binds):
     """--bind each real path so it is visible inside the container.
 
-    ``Path.resolve()`` canonicalises through the host's symlinks (e.g.
-    ``/mnt/userdrive/...``); the container only auto-mounts ``$HOME``/CWD, so any
+    `Path.resolve()` canonicalises through the host's symlinks (e.g.
+    `/mnt/userdrive/...`); the container only auto-mounts `$HOME`/CWD, so any
     other real path (the wmake tree, a scratch output dir) must be bound."""
     out = []
     for b in sorted({str(FOAM_ROOT), *(str(x) for x in binds)}):
@@ -78,7 +80,7 @@ def _apptainer(script, binds=(), **kw):
 def _codegen(model):
     """Emit Model.H / NumericsKernels.H into the wmake tree; return the SystemModel.
 
-    Uses ``SystemModel.from_model`` (NOT ``model.system_model``) so a resolved
+    Uses `SystemModel.from_model` (NOT `model.system_model`) so a resolved
     case model carries its model-level baked BCs into the kernel — the same
     coercion the numpy adapter path uses."""
     from zoomy_core.systemmodel import SystemModel
@@ -135,30 +137,30 @@ def _headers_hash():
 
 
 def _wmake_script(build_dir, of_bin, cached):
-    """Shell for one cached wmake: build in ``build_dir``, and copy ``of_bin``
-    to ``cached`` ONLY if the compile actually succeeded.
+    """Shell for one cached wmake: build in `build_dir`, and copy `of_bin`
+    to `cached` ONLY if the compile actually succeeded.
 
     Two guards, both load-bearing — this used to read
 
         wmake 2>&1 | tail -4 && cp <of_bin> <cached>
 
-    where ``&&`` binds to the PIPELINE's status, i.e. ``tail``'s, which is
+    where `&&` binds to the PIPELINE's status, i.e. `tail`'s, which is
     always 0.  A FAILED wmake therefore still copied whatever stale binary
     happened to sit in the install dir into .bincache under the NEW header
-    hash; ``cached.exists()`` then went true and the RuntimeError never fired.
+    hash; `cached.exists()` then went true and the RuntimeError never fired.
     Observed consequence: a "clean 16.84 s build" that ran a stale 4-state
     binary against a freshly generated 3-state Model.H — silent, and it would
     corrupt every reference produced from that cache entry.
 
-      1. ``rm -f`` the install target first, so a stale binary cannot be
+      1. `rm -f` the install target first, so a stale binary cannot be
          mistaken for a fresh one even if the status check is subverted.
       2. capture wmake's OWN status via a log file rather than a pipe.  Done
-         with a plain redirect + ``$?`` instead of ``set -o pipefail`` /
-         ``$PIPESTATUS`` because the container shell is not guaranteed to be
+         with a plain redirect + `$?` instead of `set -o pipefail` /
+         `$PIPESTATUS` because the container shell is not guaranteed to be
          bash; this form is POSIX and works in dash too.
 
-    The trailing ``[ $rc -eq 0 ]`` makes a failed compile exit non-zero, so
-    the caller's ``returncode`` check raises instead of caching junk."""
+    The trailing `[ $rc -eq 0 ]` makes a failed compile exit non-zero, so
+    the caller's `returncode` check raises instead of caching junk."""
     log = "wmake.$$.log"
     return (
         f"cd {build_dir}; wclean >/dev/null 2>&1; rm -f {of_bin}; "
@@ -192,7 +194,7 @@ def _default_face_names(dim):
     """Side-patch names in axis order (x-lo, x-hi[, y-lo, y-hi[, z-lo, z-hi]]).
     1-D keeps the historical left/right; 2-D uses the compass tags the shared
     cases already tag their BCs with (mesh.FACE_NAMES = West/East/South/North);
-    3-D the tags of ``BaseMesh.create_3d``."""
+    3-D the tags of `BaseMesh.create_3d`."""
     return {1: ("left", "right"), 2: ("West", "East", "South", "North"),
             3: ("left", "right", "front", "back", "bottom", "top")}[dim]
 
@@ -200,12 +202,12 @@ def _default_face_names(dim):
 def _mesh_geometry(mesh):
     """Structured-grid geometry for a uniform 1-, 2- or 3-D LSQMesh.
 
-    Returns ``(lo, hi, n, order, dim)``: ``lo/hi/n`` are per-active-axis lists
-    (x, then y), ``order`` maps the LSQMesh cell order to OpenFOAM's blockMesh
-    order (x fastest, z slowest — ``hex (nx ny nz)``), ``dim`` in {1, 2, 3}.
+    Returns `(lo, hi, n, order, dim)`: `lo/hi/n` are per-active-axis lists
+    (x, then y), `order` maps the LSQMesh cell order to OpenFOAM's blockMesh
+    order (x fastest, z slowest — `hex (nx ny nz)`), `dim` in {1, 2, 3}.
     The foam SOLVER is dimension-agnostic (it reads the full face normal); an
-    unstructured case must arrive as a gmsh ``.msh`` and go through
-    ``gmshToFoam``."""
+    unstructured case must arrive as a gmsh `.msh` and go through
+    `gmshToFoam`."""
     nc = int(mesh.n_inner_cells)
     cc = np.asarray(mesh.cell_centers)[:, :nc]
     active = [ax for ax in range(min(cc.shape[0], 3))
@@ -233,12 +235,12 @@ def _write_grid_system(case, lo, hi, n, dim=1, face_names=None, cyclic=None):
     """Structured blockMeshDict (1-D interval, 2-D quad or 3-D hexahedral grid)
     + minimal fvSchemes/fvSolution, shared by the explicit and Chorin builders.
 
-    The mesh box is ``[lo, hi]`` on each active axis; the y (1-D only) and z
-    (1-D, 2-D) directions are a single ``empty`` cell so OpenFOAM's operators
-    run in the intended dimension.  ``face_names`` names the ``2*dim`` side patches in axis
+    The mesh box is `[lo, hi]` on each active axis; the y (1-D only) and z
+    (1-D, 2-D) directions are a single `empty` cell so OpenFOAM's operators
+    run in the intended dimension.  `face_names` names the `2*dim` side patches in axis
     order — they MUST match the model's BC tags, else the solver's name-based BC
     dispatch (init.H) leaves them at the field default (zeroGradient).
-    ``cyclic``: {patch: partner} of the periodic sides (OpenFOAM cyclic pairs)."""
+    `cyclic`: {patch: partner} of the periodic sides (OpenFOAM cyclic pairs)."""
     fn = tuple(face_names) if face_names else _default_face_names(dim)
     x0, x1 = lo[0], hi[0]
     if dim >= 2:
@@ -296,12 +298,12 @@ def _field_file(case, name, vals, patches):
 
 
 def _model_parameters(model, sm):
-    """{name: value} for the controlDict ``modelParameters`` override.
+    """{name: value} for the controlDict `modelParameters` override.
 
-    Source of truth is ``sm.parameter_values`` (the resolved Zstruct the model
+    Source of truth is `sm.parameter_values` (the resolved Zstruct the model
     baked at derivation — e.g. VAM g=9.81, rho=1); the model-level
-    ``parameter_values`` (user override) wins where present.  NEVER fabricate a
-    0.0 for an unresolved name: the emitted ``Model::default_parameters()``
+    `parameter_values` (user override) wins where present.  NEVER fabricate a
+    0.0 for an unresolved name: the emitted `Model::default_parameters()`
     already carries the baked defaults, and a zero override for g/rho SIGFPEs
     the run (division by rho in every pressure term)."""
     out = {}
@@ -382,19 +384,19 @@ def _assert_binary_matches_model(binary, reported_dof, expected_dof, case):
     just generated.
 
     This is the second half of the stale-binary defence.  The first half stops a
-    failed ``wmake`` from POISONING the cache (see :func:`_wmake_script`); this
+    failed `wmake` from POISONING the cache (see `_wmake_script`); this
     one catches a mismatch however it arose — a hand-copied binary, a cache entry
     predating a hash-input change, a partially-bound container.
 
     The check is cheap because the binary reports its own compiled-in DOF count
-    at startup (``zoomy: n_dof_q = N`` in zoomyFoam.C).  That is the ONLY
+    at startup (`zoomy: n_dof_q = N` in zoomyFoam.C).  That is the ONLY
     trustworthy source: the DOF count is baked in at compile time, so it cannot
     be faked by regenerating headers.  Comparing against Model.H on disk would
     prove nothing — Model.H is exactly the file the stale binary disagrees with.
 
     Why this must RAISE rather than warn: a stale binary is silent by
     construction.  It reads Q0..Qn-1 fine, writes back its OWN number of fields,
-    and ``_strip_nonstate`` then deletes the surplus — so a 4-state binary run
+    and `_strip_nonstate` then deletes the surplus — so a 4-state binary run
     against a 3-state model exports a perfectly well-formed 3-state result that
     is physically wrong.  Nothing downstream can detect it."""
     if reported_dof is None:
@@ -414,17 +416,17 @@ def _assert_binary_matches_model(binary, reported_dof, expected_dof, case):
 
 def _run_stream(case, binary, on_progress, nprocs=1, n_dof_q=None):
     """blockMesh → (optionally decomposePar → mpirun -parallel → reconstructPar)
-    → stream the solver's per-step ``Time`` lines to ``on_progress``.
+    → stream the solver's per-step `Time` lines to `on_progress`.
 
-    With ``nprocs > 1`` the case is decomposed (scotch, so it works for any mesh
-    dimension), run under ``mpirun -np N <binary> -parallel``, and reconstructed
+    With `nprocs > 1` the case is decomposed (scotch, so it works for any mesh
+    dimension), run under `mpirun -np N <binary> -parallel`, and reconstructed
     back to the serial time dirs the VTK/HDF5 export consumes.  The solver is
     dimension- and rank-agnostic (global dt via returnReduce, processor-patch
     fluxes via patchNeighbourField), so a decomposed run reproduces serial.
 
-    ``n_dof_q`` is the state size of the model we just generated headers for.
-    When given, the binary's SELF-REPORTED ``zoomy: n_dof_q = N`` banner is
-    checked against it — see :func:`_assert_binary_matches_model`."""
+    `n_dof_q` is the state size of the model we just generated headers for.
+    When given, the binary's SELF-REPORTED `zoomy: n_dof_q = N` banner is
+    checked against it — see `_assert_binary_matches_model`."""
     nprocs = int(nprocs or 1)
     _apptainer(f"cd {case}; blockMesh > log.blockMesh 2>&1", binds=[case], check=True)
     if nprocs > 1:
@@ -494,15 +496,15 @@ def _time_dirs(case):
 
 
 def _strip_nonstate(case, n_state, n_aux=0):
-    """Keep only the state fields ``Q0..Q{n-1}`` in each written time dir, so the
-    exported HDF5 ``Q`` is exactly the model state — not zoomyFoam's internal
-    reconstruction diagnostics (``Dm*``/``Dp*``).
+    """Keep only the state fields `Q0..Q{n-1}` in each written time dir, so the
+    exported HDF5 `Q` is exactly the model state — not zoomyFoam's internal
+    reconstruction diagnostics (`Dm*`/`Dp*`).
 
-    ``n_aux > 0`` additionally keeps ``Qaux0..Qaux{n_aux-1}``, which the export
-    then splits into a separate ``Qaux`` dataset.  Aux is dropped by DEFAULT
+    `n_aux > 0` additionally keeps `Qaux0..Qaux{n_aux-1}`, which the export
+    then splits into a separate `Qaux` dataset.  Aux is dropped by DEFAULT
     because the server's shared-HDF5 contract is state-only; the test suite opts
     in, because a reference that pins Q alone cannot see a broken
-    ``update_aux_variables`` (the auxes carry the reconstruction gradients and
+    `update_aux_variables` (the auxes carry the reconstruction gradients and
     the bed slope, so an aux defect shows up in Q only after it has already
     corrupted the physics)."""
     keep = ({f"Q{i}" for i in range(n_state)}
@@ -520,7 +522,7 @@ def _write_pvd(path, time_files):
 
 
 def _vtk_field_names(vtk_path):
-    """Field names of a VTK frame in the SAME order ``zoomy_prepost`` packs Q."""
+    """Field names of a VTK frame in the SAME order `zoomy_prepost` packs Q."""
     import meshio
     m = meshio.read(vtk_path)
     names = []
@@ -535,22 +537,22 @@ def _vtk_field_names(vtk_path):
 
 
 def _keep_state_rows(h5_path, n_state, vtks, n_aux=0):
-    """Drop foamToVTK's synthetic ``cellID`` (and any non-state field): keep the
-    ``Q0..Q{n-1}`` rows, in state order, in every frame's ``Q``.
+    """Drop foamToVTK's synthetic `cellID` (and any non-state field): keep the
+    `Q0..Q{n-1}` rows, in state order, in every frame's `Q`.
 
-    With ``n_aux > 0`` the ``Qaux0..Qaux{n_aux-1}`` rows are split off into a
-    sibling ``Qaux`` dataset in the same frame group.
+    With `n_aux > 0` the `Qaux0..Qaux{n_aux-1}` rows are split off into a
+    sibling `Qaux` dataset in the same frame group.
 
     Selection is BY NAME, never by position, and is resolved PER FRAME.
 
     Both of those matter and neither is theoretical:
 
     * foamToVTK does not emit cell_data in declaration order (observed:
-      ``cellID, Qaux3, Q2, Qaux1, Qaux4, Qaux0, Q1, Qaux2, Q0``), so a
+      `cellID, Qaux3, Q2, Qaux1, Qaux4, Qaux0, Q1, Qaux2, Q0`), so a
       positional slice would interleave aux rows into the state.
-    * FRAMES ARE NOT HOMOGENEOUS.  Under ``nprocs > 1`` the reconstructed ``0/``
-      time dir carries only ``Q0..Qn-1`` — ``reconstructPar`` does not backfill
-      the aux into the pre-existing serial ``0/`` that ``decomposePar`` was
+    * FRAMES ARE NOT HOMOGENEOUS.  Under `nprocs > 1` the reconstructed `0/`
+      time dir carries only `Q0..Qn-1` — `reconstructPar` does not backfill
+      the aux into the pre-existing serial `0/` that `decomposePar` was
       seeded from, while every later time dir has the full set.  Resolving the
       index list once from frame 0 and applying it to every frame would
       therefore mis-index every later frame.
@@ -584,16 +586,16 @@ def _drop_auxless_times(case, n_aux):
     """Drop time dirs that do not carry the full aux set, so every exported frame
     has the SAME field list.
 
-    Why this is necessary rather than tidy: ``zoomy_prepost.vtk_to_hdf5`` fixes
+    Why this is necessary rather than tidy: `zoomy_prepost.vtk_to_hdf5` fixes
     the packed field schema from the FIRST frame, so one short frame silently
-    truncates ``Q`` for the whole series (measured: every frame came back with 4
+    truncates `Q` for the whole series (measured: every frame came back with 4
     rows instead of 9).
 
-    Only the t=0 dir is ever short, and only under ``nprocs > 1``: it is the IC
-    that ``_build_case`` wrote (state only), the solver's own startup aux write
-    went to ``processor*/0/``, and ``reconstructPar`` does not overwrite an
-    existing serial time dir.  Deleting ``0/`` and re-reconstructing is not an
-    option — ``reconstructPar`` then fails outright (exit 1).
+    Only the t=0 dir is ever short, and only under `nprocs > 1`: it is the IC
+    that `_build_case` wrote (state only), the solver's own startup aux write
+    went to `processor*/0/`, and `reconstructPar` does not overwrite an
+    existing serial time dir.  Deleting `0/` and re-reconstructing is not an
+    option — `reconstructPar` then fails outright (exit 1).
     """
     need = {f"Qaux{i}" for i in range(n_aux)}
     dirs = _time_dirs(case)
@@ -608,8 +610,8 @@ def _drop_auxless_times(case, n_aux):
 
 def _to_vtk(case, n_state, n_aux=0):
     """Strip to the state fields, `foamToVTK`, and write a `.pvd` collection with
-    physical OF times. Returns ``(source, vtks)`` — ``source`` is the ``.pvd``
-    path (or an ordered frame list on a count mismatch), ``vtks`` the sorted
+    physical OF times. Returns `(source, vtks)` — `source` is the `.pvd`
+    path (or an ordered frame list on a count mismatch), `vtks` the sorted
     frame files."""
     _strip_nonstate(case, n_state, n_aux)
     if n_aux:
@@ -643,17 +645,17 @@ def run_case(model, settings, output_dir, on_progress=None, with_aux=False):
     Parameters
     ----------
     model : zoomy_core Model
-        Resolved case model (IC/BC baked); coerced with ``SystemModel.from_model``.
+        Resolved case model (IC/BC baked); coerced with `SystemModel.from_model`.
     settings : dict
-        The case ``settings.json`` (``mesh``, ``time_end``, ``cfl``,
-        ``output_snapshots``, ``reconstruction_order``, optional ``time_scheme``,
-        ``min_dt``).  ``mesh`` is resolved relative to ``settings["_case_dir"]`` /
+        The case `settings.json` (`mesh`, `time_end`, `cfl`,
+        `output_snapshots`, `reconstruction_order`, optional `time_scheme`,
+        `min_dt`).  `mesh` is resolved relative to `settings["_case_dir"]` /
         the current directory when not absolute.
     output_dir : str | Path
-        Where the OpenFOAM case + ``simulation.h5`` are written.
+        Where the OpenFOAM case + `simulation.h5` are written.
     on_progress : callable(iteration, time, dt) | None
     with_aux : bool
-        Also export the model's aux state as a per-frame ``Qaux`` dataset.  Off
+        Also export the model's aux state as a per-frame `Qaux` dataset.  Off
         by default so the server's state-only HDF5 contract is unchanged.
     """
     case, sm = _run_pipeline(model, settings, output_dir, on_progress)
@@ -662,7 +664,7 @@ def run_case(model, settings, output_dir, on_progress=None, with_aux=False):
 
 
 def _run_pipeline(model, settings, output_dir, on_progress):
-    """Shared codegen → wmake → case → run prefix. Returns ``(case_dir, sm)``."""
+    """Shared codegen → wmake → case → run prefix. Returns `(case_dir, sm)`."""
     from zoomy_core.mesh.lsq_mesh import LSQMesh
     output_dir = Path(output_dir); output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -681,9 +683,9 @@ def _run_pipeline(model, settings, output_dir, on_progress):
 
 
 def run_to_vtk(model, settings, output_dir, on_progress=None):
-    """Same pipeline as :func:`run_case` but stops at the VTK series (no HDF5) —
+    """Same pipeline as `run_case` but stops at the VTK series (no HDF5) —
     the shape the gui solver wrappers use (gui converts VTK→h5 with
-    ``zoomy_prepost``). Returns the ``.pvd`` collection path."""
+    `zoomy_prepost`). Returns the `.pvd` collection path."""
     case, sm = _run_pipeline(model, settings, output_dir, on_progress)
     return _to_vtk(case, len(sm.state))[0]
 
@@ -693,16 +695,16 @@ _OF_CHORIN_BIN = "$HOME/OpenFOAM/$(whoami)-13/platforms/linux64GccDPInt32Opt/bin
 
 
 def _codegen_chorin(model):
-    """Emit the Chorin split headers from a model with ``chorin_split``:
-    predictor ``Model.H`` + ``NumericsKernels.H`` + ``Pressure.H`` (ChorinPressure)
-    + ``Corrector.H`` (ChorinCorrector) + ``ChorinState.H`` (full n_state).
-    Mirrors ``create_model.py`` but from the model OBJECT (baked BCs).  Returns
-    ``(full_sm, n_state, n_pred_aux)``.
+    """Emit the Chorin split headers from a model with `chorin_split`:
+    predictor `Model.H` + `NumericsKernels.H` + `Pressure.H` (ChorinPressure)
+    + `Corrector.H` (ChorinCorrector) + `ChorinState.H` (full n_state).
+    Mirrors `create_model.py` but from the model OBJECT (baked BCs).  Returns
+    `(full_sm, n_state, n_pred_aux)`.
 
-    ``n_pred_aux`` is the PREDICTOR's aux count (``Model::n_dof_qaux``), which is
-    what chorinFoam writes as ``Qaux*``.  It is NOT ``len(full.aux_state)``: the
+    `n_pred_aux` is the PREDICTOR's aux count (`Model::n_dof_qaux`), which is
+    what chorinFoam writes as `Qaux*`.  It is NOT `len(full.aux_state)`: the
     predictor is a different sub-system with its own aux, and the printer appends
-    the automatic ``hinv`` to whichever SystemModel it renders."""
+    the automatic `hinv` to whichever SystemModel it renders."""
     import sympy as sp
     from zoomy_core.systemmodel import SystemModel
     from zoomy_core.transformation.to_openfoam import (
@@ -739,7 +741,7 @@ def _codegen_chorin(model):
 
 
 def _wmake_chorin_cached():
-    """wmake the ``chorin_app`` (chorinFoam) for the current headers; cache by a
+    """wmake the `chorin_app` (chorinFoam) for the current headers; cache by a
     hash of the split headers + driver.  Returns the cached binary path."""
     _BINCACHE.mkdir(exist_ok=True)
     h = hashlib.sha256()
@@ -807,9 +809,9 @@ def _build_chorin_case(case, mesh, model, sm, settings):
 
 
 def run_chorin_to_vtk(model, settings, output_dir, on_progress=None):
-    """Chorin (pressure-projection) analog of :func:`run_to_vtk` — split codegen →
+    """Chorin (pressure-projection) analog of `run_to_vtk` — split codegen →
     wmake chorin_app → case (8-state VAM) → chorinFoam → VTK series.  Returns the
-    ``.pvd`` path.  ``model`` must expose ``chorin_split`` (e.g. VAM)."""
+    `.pvd` path.  `model` must expose `chorin_split` (e.g. VAM)."""
     from zoomy_core.mesh.lsq_mesh import LSQMesh
     output_dir = Path(output_dir); output_dir.mkdir(parents=True, exist_ok=True)
     mp = settings.get("mesh", "mesh.h5")
@@ -827,10 +829,10 @@ def run_chorin_to_vtk(model, settings, output_dir, on_progress=None):
 
 
 def run_chorin_case(model, settings, output_dir, on_progress=None, with_aux=False):
-    """Chorin analog of :func:`run_case`: same pipeline, exported to HDF5.
+    """Chorin analog of `run_case`: same pipeline, exported to HDF5.
 
-    ``run_chorin_to_vtk`` stops at the VTK series because that is the shape the
-    gui wants.  The test suite needs the same ``(Q, Qaux)`` readback it gets for
+    `run_chorin_to_vtk` stops at the VTK series because that is the shape the
+    gui wants.  The test suite needs the same `(Q, Qaux)` readback it gets for
     the hyperbolic path — otherwise the VAM/chorin pair would be the one pair
     compared on a weaker footing than every other test.
     """

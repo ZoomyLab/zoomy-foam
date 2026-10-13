@@ -1,7 +1,7 @@
-"""C++ kernels of the symbolic solvers on foam: one ``struct <system>_t`` per system with one
-``static constexpr`` functor per kernel the printed solver references.  The kernels are the
-NumericalSystemModel's ``call`` table (the Functions the JAX runtime lambdifies) printed in Foam
-syntax: state arguments are ``zs::Col`` views (rt.H), results fixed-size ``std::array``s, row-major.
+"""C++ kernels of the symbolic solvers on foam: one `struct <system>_t` per system with one
+`static constexpr` functor per kernel the printed solver references.  The kernels are the
+NumericalSystemModel's `call` table (the Functions the JAX runtime lambdifies) printed in Foam
+syntax: state arguments are `zs::Col` views (rt.H), results fixed-size ``std::array``s, row-major.
 """
 import re
 import textwrap
@@ -39,7 +39,7 @@ _FAMILY = {
 
 
 def family(f):
-    """Kernel family (``face``, ``bc``, ``recon``, ``normal``, ``cell``) of a ``Function``, which
+    """Kernel family (`face`, `bc`, `recon`, `normal`, `cell`) of a `Function`, which
     fixes its full C++ argument list.
     """
     keys = set(f.args.keys())
@@ -55,7 +55,7 @@ def family(f):
 
 
 class FoamKernelPrinter(FoamNumericsPrinter):
-    """Foam syntax of :class:`FoamNumericsPrinter` with stack results (``std::array``, row-major);
+    """Foam syntax of `FoamNumericsPrinter` with stack results (`std::array`, row-major);
     the symbol maps come from each kernel's own argument groups.
     """
 
@@ -64,19 +64,19 @@ class FoamKernelPrinter(FoamNumericsPrinter):
         GenericCppBase.__init__(self)
 
     def _array_type(self, shape):
-        """``std::array`` of the flattened ``shape``."""
+        """`std::array` of the flattened `shape`."""
         return f"std::array<{self.real_type}, {int(np.prod(shape))}>"
 
     def get_array_declaration(self, target, shape, init_zero=False):
-        """Zero-initialised stack array ``target`` of the flattened ``shape``."""
+        """Zero-initialised stack array `target` of the flattened `shape`."""
         return f"{self._array_type(shape)} {target}{{}};"
 
     def format_assignment(self, target, indices, value, shape):
-        """Row-major flat entry of ``indices``."""
+        """Row-major flat entry of `indices`."""
         return f"{target}[{flatten_index(indices, shape)}] = {value};"
 
     def kernel(self, f, n_state):
-        """Print one ``Function`` as ``struct <name>_k`` and its ``static constexpr`` instance; the
+        """Print one `Function` as `struct <name>_k` and its `static constexpr` instance; the
         call operator takes the full argument list of its family (unused arguments are ignored).
         """
         self.symbol_maps = []
@@ -105,19 +105,19 @@ class FoamKernelPrinter(FoamNumericsPrinter):
 
 
 def referenced(source, system):
-    """Kernel names ``<system>.<name>`` used by the printed solver source."""
+    """Kernel names `<system>.<name>` used by the printed solver source."""
     return sorted(set(re.findall(rf"\b{system}\.(\w+)", source)))
 
 
 def write_kernels(systems, source, path, topo=None):
-    """Write ``Kernels.H``: ``struct <name>_t`` and ``constexpr <name>_t <name>`` for each ``(name,
-    nsm)`` in ``systems``, with the kernels ``source`` uses.
+    """Write `Kernels.H`: `struct <name>_t` and `constexpr <name>_t <name>` for each ``(name,
+    nsm)`` in `systems`, with the kernels `source` uses.
 
     Args:
         topo: mesh topology; derivative aux entries carry the boundary-closure class of their state
             row (-1 without it)
     Returns:
-        ``path``.
+        `path`.
     """
     pr = FoamKernelPrinter()
     out = ["#pragma once", "#include <array>", '#include "rt.H"',
@@ -158,6 +158,6 @@ def write_kernels(systems, source, path, topo=None):
 
 
 def _axes(multi_index):
-    """``(row, state, d/dx, d/dy, d/dz)`` from a registry multi-index."""
+    """`(row, state, d/dx, d/dy, d/dz)` from a registry multi-index."""
     m = list(multi_index) + [0, 0, 0]
     return m[0], m[1], m[2]

@@ -1,25 +1,25 @@
-"""``zoomy_foam.solvers`` — param.Parameterized solver wrappers (gui REQ-133).
+"""`zoomy_foam.solvers` — param.Parameterized solver wrappers (gui REQ-133).
 
 The GUI/CLI-facing entry point for the OpenFOAM (zoomyFoam) backend.  Same shape
-as ``zoomy_amrex.solvers`` / ``zoomy_dmplex.solvers``: bounded ``param``
+as `zoomy_amrex.solvers` / `zoomy_dmplex.solvers`: bounded `param`
 attributes (the GUI auto-generates widgets), a uniform
-``solve(model, mesh, settings)`` that writes a VTK series into
-``settings.output.directory`` and returns the ``.pvd`` path (the gui converts
-VTK→h5 with ``zoomy_prepost``).
+`solve(model, mesh, settings)` that writes a VTK series into
+`settings.output.directory` and returns the `.pvd` path (the gui converts
+VTK→h5 with `zoomy_prepost`).
 
     from zoomy_foam.solvers import HyperbolicSolver
     solver = HyperbolicSolver(CFL=0.9, order=2)
     solver.solve(model, mesh, settings)      # -> .pvd in settings.output.directory
 
 Design (gui REQ-133, user-approved 2026-07-13):
-  * ``settings`` is STRUCTURED — ``settings.output.{directory, filename, snapshots}``
-    is always honored; ``settings.time_end`` / ``settings.mesh.n_cells`` carry the
+  * `settings` is STRUCTURED — `settings.output.{directory, filename, snapshots}`
+    is always honored; `settings.time_end` / `settings.mesh.n_cells` carry the
     run/grid properties.  Model-/scheme-specific things (reconstruction,
     eigenvalues, sources, IC, BC) come from the MODEL symbolically.
-  * ``mesh`` is a descriptor ``{"domain": [x0,x1(,y0,y1)], "n_cells": [nx(,ny)]}``
-    — a structured 1-D interval OR 2-D quad grid (dimension = ``len(n_cells)``).
+  * `mesh` is a descriptor `{"domain": [x0,x1(,y0,y1)], "n_cells": [nx(,ny)]}`
+    — a structured 1-D interval OR 2-D quad grid (dimension = `len(n_cells)`).
     RESOLUTION always comes from the mesh/settings, never a solver param.  A 3-D
-    or unstructured ``.msh`` case goes through ``gmshToFoam`` — a follow-up.
+    or unstructured `.msh` case goes through `gmshToFoam` — a follow-up.
   * NO case knowledge lives here — the wrapper owns codegen → controlDict →
     wmake → run → VTK; case physics (walls, inflow) are BCs on the MODEL.
 """
@@ -34,8 +34,8 @@ from ._pipeline import run_to_vtk, run_chorin_to_vtk
 
 # ── structured-settings access (dict- or attribute-shaped) ──────────────────
 def _get(obj, dotted, default=None):
-    """Look up ``a.b.c`` through a structured ``settings`` mixing dicts and
-    attribute objects (param.Parameterized groups); ``default`` if any hop is
+    """Look up `a.b.c` through a structured `settings` mixing dicts and
+    attribute objects (param.Parameterized groups); `default` if any hop is
     missing/None."""
     cur = obj
     for key in dotted.split("."):
@@ -46,11 +46,11 @@ def _get(obj, dotted, default=None):
 
 
 def _domain_ncells(mesh, settings):
-    """Resolve ``mesh`` → (domain, n_cells, dim) for a structured 1-D or 2-D grid.
+    """Resolve `mesh` → (domain, n_cells, dim) for a structured 1-D or 2-D grid.
 
-    ``mesh`` is a ``{'domain': [x0,x1(,y0,y1)], 'n_cells': [nx(,ny)]}`` descriptor
-    (dimension = ``len(n_cells)``).  A 3-D or unstructured case must come as a
-    gmsh ``.msh`` (gmshToFoam) — a documented follow-up."""
+    `mesh` is a `{'domain': [x0,x1(,y0,y1)], 'n_cells': [nx(,ny)]}` descriptor
+    (dimension = `len(n_cells)`).  A 3-D or unstructured case must come as a
+    gmsh `.msh` (gmshToFoam) — a documented follow-up."""
     if not isinstance(mesh, dict):
         raise NotImplementedError(
             "zoomy_foam solvers build a structured grid from a "
@@ -73,7 +73,7 @@ def _domain_ncells(mesh, settings):
 
 
 class _BaseSolver(param.Parameterized):
-    """Shared ``settings`` → foam-pipeline translation (writes the structured
+    """Shared `settings` → foam-pipeline translation (writes the structured
     mesh.h5 the pipeline consumes, and maps the structured output group)."""
 
     def _output_dir(self, settings):
@@ -133,8 +133,8 @@ class HyperbolicSolver(_BaseSolver):
 class SplitSolver(_BaseSolver):
     """N sequential system models + pressure projection (Chorin
     pressure-corrector).  The split structure — predictor / pressure / corrector
-    sub-models — comes from the MODEL (``model.chorin_split``, e.g. VAM); this
-    wrapper drives the ``chorinFoam`` app (split codegen → wmake chorin_app →
+    sub-models — comes from the MODEL (`model.chorin_split`, e.g. VAM); this
+    wrapper drives the `chorinFoam` app (split codegen → wmake chorin_app →
     case → run → VTK) and exposes only the march / pressure-solve knobs."""
 
     # Chorin/VAM keeps its own MEASURED bound (see tests/conftest CFL_VAM),

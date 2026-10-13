@@ -1,6 +1,6 @@
 """Foam driver of the symbolic solvers: prints the C++ solver, builds it with wmake in the OpenFOAM
 apptainer, runs the case.  Sits at the end of Model -> SystemModel -> NumericalSystemModel -> C++
-template -> foam runtime (``symsolver/rt.H``).
+template -> foam runtime (`symsolver/rt.H`).
 """
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ class Decomposition(Option):
 
 
 class FoamDriver(param.Parameterized):
-    """Foam runtime of a C++ solver backend (:mod:`zoomy_core.symsolver.backend_cxx`): build tree,
+    """Foam runtime of a C++ solver backend (`zoomy_core.symsolver.backend_cxx`): build tree,
     case, launch, read-back.
 
     References:
@@ -95,7 +95,7 @@ class FoamDriver(param.Parameterized):
             topo: mesh topology whose boundary-closure classes the kernels carry; None (precompile):
                 none
         Returns:
-            Path of the ``symFoam`` binary.
+            Path of the `symFoam` binary.
         """
         self.source = self._print(nsm, dimension)
         files = {"Solver.H": self.source,
@@ -131,16 +131,16 @@ class FoamDriver(param.Parameterized):
         return binary
 
     def run(self, mesh, model, Q0, workdir):
-        """Write the case (mesh, fields, stencils), launch ``symFoam`` (``mpirun -parallel`` for
-        ``nprocs > 1``) and read the result back.
+        """Write the case (mesh, fields, stencils), launch `symFoam` (`mpirun -parallel` for
+        `nprocs > 1`) and read the result back.
 
         Args:
             mesh: zoomy_core mesh
-            Q0: initial state ``(n_state, n_cells)`` in the mesh order
+            Q0: initial state `(n_state, n_cells)` in the mesh order
             workdir: case directory (recreated)
         Returns:
-            ``(time, Q)`` with Q in the mesh order; the written snapshots are kept in
-                ``self.snapshots``.
+            `(time, Q)` with Q in the mesh order; the written snapshots are kept in
+                `self.snapshots`.
         """
         nsm = self._prepare(mesh, model)
         if self.couple and (self.restart_from is not None or self.dt_checkpoint is not None):
@@ -249,7 +249,7 @@ class FoamDriver(param.Parameterized):
                                + (case / "log.symFoam").read_text()[-3000:])
 
         def read(name):
-            """Read ``out/<name>`` of every part into the mesh cell order."""
+            """Read `out/<name>` of every part into the mesh cell order."""
             time, Q = None, np.empty((Q0.shape[0], len(order)))
             for d, c in zip(parts, cells):
                 time, q = _read_dat(d / "out" / name)
@@ -261,13 +261,13 @@ class FoamDriver(param.Parameterized):
 
 
 class SymbolicHyperbolicSolverFoam(FoamDriver, CxxBackend):
-    """The explicit hyperbolic template on foam: ``time, Q = solver.run(mesh, nsm, Q0, workdir)``."""
+    """The explicit hyperbolic template on foam: `time, Q = solver.run(mesh, nsm, Q0, workdir)`."""
 
 
 class SymbolicChorinSolverFoam(FoamDriver, CxxChorinBackend):
-    """The Chorin projection template on foam, run with ``(pred, press, corr)`` in place of ``nsm``.
+    """The Chorin projection template on foam, run with `(pred, press, corr)` in place of `nsm`.
 
-    ``pred`` is the predictor NSM on the full state, ``press`` / ``corr`` the pressure and corrector
+    `pred` is the predictor NSM on the full state, `press` / `corr` the pressure and corrector
     systems of the model's split.
 
     References:
@@ -286,12 +286,12 @@ class SymbolicChorinSolverFoam(FoamDriver, CxxChorinBackend):
         return f"linearSolver {self.linear_solver};\n"
 
     def _hypre(self):
-        """True for ``linear_solver="hypre"``."""
+        """True for `linear_solver="hypre"`."""
         return self.linear_solver == "hypre"
 
 
 def _options(hypre, build):
-    """``Make/options`` of the build tree ``build``: preCICE; with the hypre prefix ``hypre`` its
+    """`Make/options` of the build tree `build`: preCICE; with the hypre prefix `hypre` its
     static library and OpenFOAM's MPI flags."""
     inc, lib = "", "-lprecice"
     if (PRECICE / "lib" / "libprecice.so").exists():
@@ -309,7 +309,7 @@ def _options(hypre, build):
 
 
 def _precice_dict(c):
-    """The ``precice`` controlDict entry of a coupled run (empty without coupling)."""
+    """The `precice` controlDict entry of a coupled run (empty without coupling)."""
     if not c:
         return ""
     return (f"precice {{ participant {c['participant']}; config \"{c['config']}\"; "
@@ -318,7 +318,7 @@ def _precice_dict(c):
 
 
 def _cyclic(nsm):
-    """``{tag: partner}`` of the model's Periodic BCs as OpenFOAM cyclic pairs; each side must name
+    """`{tag: partner}` of the model's Periodic BCs as OpenFOAM cyclic pairs; each side must name
     the other.
     """
     from zoomy_core.model.boundary_conditions import Periodic
@@ -334,7 +334,7 @@ def _cyclic(nsm):
 
 
 def _write_stencils(mesh, topo, order, inv, parts, cells):
-    """Write ``constant/zoomyStencil`` of every part: zoomy_core's LSQ tables (derivative aux fit,
+    """Write `constant/zoomyStencil` of every part: zoomy_core's LSQ tables (derivative aux fit,
     boundary closure) per cell, in the global cell numbering of the decomposition.
     """
     nc = int(mesh.n_inner_cells)
@@ -384,7 +384,7 @@ def _write_stencils(mesh, topo, order, inv, parts, cells):
 
 
 def _write_colours(topo, nc, order, parts, cells):
-    """Write ``constant/zoomyColours`` of every part (count and number of colours, then one colour
+    """Write `constant/zoomyColours` of every part (count and number of colours, then one colour
     per OF cell): a greedy distance-2 colouring of the global LSQ pattern in the mesh's cell order,
     so the cells of a stencil (a matrix row) differ and rt.H's hypre_solve recovers the operator by
     one probe per colour and row (9 colours on quads with the vertex stencil).
@@ -414,8 +414,8 @@ def _write_colours(topo, nc, order, parts, cells):
 
 
 def hypre_prefix():
-    """The CPU hypre install symFoam links (``~/.cache/zoomy/hypre-cpu-3.2.0``, or
-    ``ZOOMY_HYPRE_DIR``), built first by ``containers/zoomy_amrex/build_hypre_cuda.sh cpu`` when
+    """The CPU hypre install symFoam links (`~/.cache/zoomy/hypre-cpu-3.2.0`, or
+    `ZOOMY_HYPRE_DIR`), built first by `containers/zoomy_amrex/build_hypre_cuda.sh cpu` when
     missing.
 
     References:
@@ -442,7 +442,7 @@ def hypre_prefix():
 
 
 def _seam(mesh, tag):
-    """Boundary-face centres of ``tag``, in the mesh's boundary order."""
+    """Boundary-face centres of `tag`, in the mesh's boundary order."""
     names = list(mesh.boundary_conditions_sorted_names)
     nb = int(mesh.n_boundary_faces)
     nums = np.asarray(mesh.boundary_face_function_numbers, dtype=int)[:nb]
@@ -453,7 +453,7 @@ def _seam(mesh, tag):
 
 
 def _separation(mesh, tag, partner):
-    """OpenFOAM's cyclic ``separation`` vector of ``tag`` (from the partner's faces to its own)."""
+    """OpenFOAM's cyclic `separation` vector of `tag` (from the partner's faces to its own)."""
     s = np.zeros(3)
     s[:int(mesh.dimension)] = _seam(mesh, tag).mean(axis=0) - _seam(mesh, partner).mean(axis=0)
     return f"({float(s[0])!r} {float(s[1])!r} {float(s[2])!r})"
@@ -474,7 +474,7 @@ def _structured(mesh):
 
 def _write_extruded_msh(mesh, path, cyclic=None):
     """Write a 2-D mesh as one layer of prisms or hexahedra (gmsh 2.2) with the boundary tags on the
-    side faces and ``frontAndBack`` at z = 0, 1; cyclic faces are sorted along the seam.
+    side faces and `frontAndBack` at z = 0, 1; cyclic faces are sorted along the seam.
     """
     import meshio
     X = np.asarray(mesh.vertex_coordinates)[:2].T
@@ -536,7 +536,7 @@ def _side_names(mesh, dim):
 
 
 def _write_field(case, name, vals, patches):
-    """Write the scalar field ``0/<name>`` with the given patch types."""
+    """Write the scalar field `0/<name>` with the given patch types."""
     body = "\n".join(repr(float(v)) for v in vals)
     bf = "\n".join(f"  {p} {{ type {t}; }}" for p, t in patches.items())
     (case / "0" / name).write_text(
@@ -607,7 +607,7 @@ def _copy_state(restart, case, parts, cells=None):
 
 
 def _read_dat(path):
-    """Read an ``out/*.dat`` file: time on the first line, then one row per state variable."""
+    """Read an `out/*.dat` file: time on the first line, then one row per state variable."""
     lines = Path(path).read_text().split("\n")
     time = float(lines[0])
     return time, np.array([[float(x) for x in ln.split()] for ln in lines[1:] if ln.strip()])
