@@ -18,7 +18,9 @@ import param
 from scipy.spatial import cKDTree
 
 from zoomy_core.mesh.geometry_xp import build_topology, compute_geometry
+from zoomy_core.misc.options import Option, OptionParam
 from zoomy_core.symsolver.backend_cxx import RUNTIME_HEADER, CxxBackend, CxxChorinBackend
+from zoomy_core.symsolver.settings import LinearSolver
 from zoomy_foam._pipeline import (FOAM_ROOT, _BINCACHE, _apptainer,
                                   _mesh_geometry,
                                   _write_grid_system)
@@ -54,6 +56,14 @@ HYPRE_CACHE = Path(os.environ.get("ZOOMY_HYPRE_CACHE", Path.home() / ".cache" / 
 HYPRE_SCRIPT = FOAM_ROOT.parent.parent / "containers" / "zoomy_amrex" / "build_hypre_cuda.sh"
 
 
+class Decomposition(Option):
+    """decomposePar's method for an MPI run."""
+    #: graph partition
+    scotch = "scotch"
+    #: nprocs slabs along x
+    simple = "simple"
+
+
 class FoamDriver(param.Parameterized):
     """Foam runtime of a C++ solver backend (:mod:`zoomy_core.symsolver.backend_cxx`): build tree,
     case, launch, read-back.
@@ -63,8 +73,8 @@ class FoamDriver(param.Parameterized):
     """
     nprocs = param.Integer(default=1, bounds=(1, None),
                            doc="MPI ranks: decomposePar, mpirun -parallel.")
-    decomposition = param.Selector(
-        default="scotch", objects=["scotch", "simple"],
+    decomposition = OptionParam(
+        Decomposition, default=Decomposition.scotch,
         doc="decomposePar method: 'scotch' (graph partition), 'simple' (nprocs "
             "slabs along x).")
 
@@ -238,8 +248,9 @@ class SymbolicChorinSolverFoam(FoamDriver, CxxChorinBackend):
     References:
         Chorin 1968, https://doi.org/10.1090/S0025-5718-1968-0242392-2
     """
-    linear_solver = param.Selector(
-        default="hypre", objects=["hypre", "schur-gamg", "gmres"], doc=(
+    linear_solver = OptionParam(
+        LinearSolver, default=LinearSolver.hypre,
+        members=[LinearSolver.hypre, LinearSolver.schur_gamg, LinearSolver.gmres], doc=(
             "Linear solves (linsolve): 'hypre' = hypre FlexGMRES + one BoomerAMG V-cycle on the "
             "operator assembled by colouring, left-scaled by its inverse cell blocks; "
             "'schur-gamg' = flexible GMRES right-preconditioned by OpenFOAM's GAMG on the "
