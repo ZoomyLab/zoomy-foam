@@ -101,6 +101,7 @@ class FoamDriver(param.Parameterized):
         files = {"Solver.H": self.source,
                  "symFoam.C": (APP / "symFoam.C").read_text(),
                  "rt.H": (APP / "rt.H").read_text(),
+                 "UserFunctions.H": (FOAM_ROOT / "UserFunctions.H").read_text(),
                  RUNTIME_HEADER.name: RUNTIME_HEADER.read_text()}
         hypre = hypre_prefix() if self._hypre() else None
         h = hashlib.sha256(_options(hypre, "BUILD").encode())   # the build flags, then the sources
