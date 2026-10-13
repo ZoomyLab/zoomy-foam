@@ -27,7 +27,9 @@ It mirrors, generically, the by-hand flow in
       shared HDF5 format.
 
 Env: `ZOOMY_OF_SIF` overrides the apptainer image (default
-`~/of_build/zoomy_openfoam.sif`).
+`~/of_build/zoomy_openfoam.sif`); inside the OpenFOAM image (`in_image`) wmake and the solvers
+run directly.  `ZOOMY_FOAM_BINCACHE` names the binary cache (default `<package>/../.bincache`
+when writable, else `~/.cache/zoomy/foam_bincache`, else the temp directory).
 """
 from __future__ import annotations
 
@@ -45,7 +47,38 @@ import numpy as np
 # The wmake tree (Model.H, zoomyFoam.C, Make/) is the package's PARENT dir.
 FOAM_ROOT = Path(__file__).resolve().parent.parent
 SIF = Path(os.environ.get("ZOOMY_OF_SIF", str(Path.home() / "of_build" / "zoomy_openfoam.sif")))
-_BINCACHE = FOAM_ROOT / ".bincache"
+
+
+def _writable_dir(*candidates):
+    """The first candidate directory that exists writable or can be created."""
+    for c in candidates:
+        c = Path(c)
+        try:
+            c.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        if os.access(c, os.W_OK | os.X_OK):
+            return c
+    raise RuntimeError(f"no writable foam build cache among {candidates}: "
+                       "set ZOOMY_FOAM_BINCACHE")
+
+
+def _bincache():
+    """`ZOOMY_FOAM_BINCACHE`, else the first writable of `FOAM_ROOT/.bincache` (a source
+    checkout), `~/.cache/zoomy/foam_bincache`, `<tmp>/zoomy_foam_bincache` (a read-only
+    install)."""
+    if os.environ.get("ZOOMY_FOAM_BINCACHE"):
+        return Path(os.environ["ZOOMY_FOAM_BINCACHE"])
+    import tempfile
+    return _writable_dir(FOAM_ROOT / ".bincache",
+                         Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+                         / "zoomy" / "foam_bincache",
+                         Path(tempfile.gettempdir()) / "zoomy_foam_bincache")
+
+
+_BINCACHE = _bincache()
+#: OpenFOAM 13's environment script in the image
+OF_BASHRC = Path("/opt/openfoam13/etc/bashrc")
 # where `wmake` installs the freshly built binary inside the apptainer
 _OF_BIN = "$HOME/OpenFOAM/$(whoami)-13/platforms/linux64GccDPInt32Opt/bin/zoomyFoam"
 
@@ -63,13 +96,30 @@ def _bind_args(binds):
     return out
 
 
+def in_image():
+    """True when this process already runs where OpenFOAM is: `ZOOMY_FOAM_IN_IMAGE` (1 / 0) when
+    set, else OpenFOAM 13 here (`/opt/openfoam13/etc/bashrc` or `foamRun` on PATH) and either an
+    apptainer container around this process (`APPTAINER_CONTAINER`) or no `apptainer` to call.
+    Then wmake, the meshers and the solvers run directly (no nested apptainer)."""
+    flag = os.environ.get("ZOOMY_FOAM_IN_IMAGE")
+    if flag is not None:
+        return flag.strip().lower() not in ("", "0", "false", "no")
+    if not (OF_BASHRC.exists() or shutil.which("foamRun")):
+        return False
+    return bool(os.environ.get("APPTAINER_CONTAINER")) or shutil.which("apptainer") is None
+
+
 def _apptainer_cmd(script, binds=()):
-    return ["apptainer", "exec", *_bind_args(binds), str(SIF), "bash", "-lc",
-            "source /opt/openfoam13/etc/bashrc 2>/dev/null; " + script]
+    """The command running the shell `script` with OpenFOAM's environment: in the apptainer
+    image `SIF`, or directly inside the image (`in_image`)."""
+    script = f"source {OF_BASHRC} 2>/dev/null; " + script
+    if in_image():
+        return ["bash", "-lc", script]
+    return ["apptainer", "exec", *_bind_args(binds), str(SIF), "bash", "-lc", script]
 
 
 def _apptainer(script, binds=(), **kw):
-    if not SIF.exists():
+    if not in_image() and not SIF.exists():
         raise RuntimeError(
             f"OpenFOAM apptainer image not found at {SIF} (set ZOOMY_OF_SIF). "
             "zoomy_foam.run_case needs the OF-13 container to wmake + run zoomyFoam.")

@@ -1,5 +1,5 @@
 """Foam driver of the symbolic solvers: prints the C++ solver, builds it with wmake in the OpenFOAM
-apptainer, runs the case.  Sits at the end of Model -> SystemModel -> NumericalSystemModel -> C++
+apptainer (inside the image: directly, `zoomy_foam._pipeline.in_image`), runs the case.  Sits at the end of Model -> SystemModel -> NumericalSystemModel -> C++
 template -> foam runtime (`symsolver/rt.H`).
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ from zoomy_core.mesh.geometry_xp import build_topology, compute_geometry
 from zoomy_core.misc.options import Option, OptionParam
 from zoomy_core.symsolver.backend_cxx import RUNTIME_HEADER, CxxBackend, CxxChorinBackend
 from zoomy_core.symsolver.settings import LinearSolver
-from zoomy_foam._pipeline import (SIF, FOAM_ROOT, _BINCACHE, _apptainer,
+from zoomy_foam._pipeline import (SIF, FOAM_ROOT, OF_BASHRC, _BINCACHE, _apptainer, in_image,
                                   _mesh_geometry,
                                   _write_grid_system)
 from zoomy_foam.symkernels import write_kernels
@@ -57,7 +57,13 @@ HYPRE_SCRIPT = FOAM_ROOT.parent.parent / "containers" / "zoomy_amrex" / "build_h
 
 
 def _image_id(sif):
-    """Identity of the apptainer image that compiles a binary (a replaced image rebuilds)."""
+    """Identity of the image that compiles a binary (a replaced image rebuilds): the `.sif` file,
+    inside the image the OpenFOAM install and the container labels."""
+    if in_image():
+        of = OF_BASHRC.parent.parent
+        labels = Path("/.singularity.d/labels.json")
+        tag = hashlib.sha256(labels.read_bytes()).hexdigest()[:12] if labels.exists() else ""
+        return f"native:{of}:{of.stat().st_mtime_ns if of.exists() else 0}:{tag}"
     st = Path(sif).stat()
     return f"{Path(sif).name}:{st.st_size}:{st.st_mtime_ns}"
 
