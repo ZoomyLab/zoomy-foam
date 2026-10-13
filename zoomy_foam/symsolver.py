@@ -21,7 +21,7 @@ from zoomy_core.mesh.geometry_xp import build_topology, compute_geometry
 from zoomy_core.misc.options import Option, OptionParam
 from zoomy_core.symsolver.backend_cxx import RUNTIME_HEADER, CxxBackend, CxxChorinBackend
 from zoomy_core.symsolver.settings import LinearSolver
-from zoomy_foam._pipeline import (FOAM_ROOT, _BINCACHE, _apptainer,
+from zoomy_foam._pipeline import (SIF, FOAM_ROOT, _BINCACHE, _apptainer,
                                   _mesh_geometry,
                                   _write_grid_system)
 from zoomy_foam.symkernels import write_kernels
@@ -54,6 +54,12 @@ PRECICE = Path(os.environ.get("ZOOMY_PRECICE_PREFIX",
 HYPRE_VERSION = "3.2.0"
 HYPRE_CACHE = Path(os.environ.get("ZOOMY_HYPRE_CACHE", Path.home() / ".cache" / "zoomy"))
 HYPRE_SCRIPT = FOAM_ROOT.parent.parent / "containers" / "zoomy_amrex" / "build_hypre_cuda.sh"
+
+
+def _image_id(sif):
+    """Identity of the apptainer image that compiles a binary (a replaced image rebuilds)."""
+    st = Path(sif).stat()
+    return f"{Path(sif).name}:{st.st_size}:{st.st_mtime_ns}"
 
 
 class Decomposition(Option):
@@ -105,6 +111,7 @@ class FoamDriver(param.Parameterized):
                  RUNTIME_HEADER.name: RUNTIME_HEADER.read_text()}
         hypre = hypre_prefix() if self._hypre() else None
         h = hashlib.sha256(_options(hypre, "BUILD").encode())   # the build flags, then the sources
+        h.update(_image_id(SIF).encode())                       # and the image that compiles them
         for k in sorted(files):
             h.update(k.encode() + files[k].encode())
         _BINCACHE.mkdir(exist_ok=True)
