@@ -142,6 +142,10 @@ class FoamDriver(param.Parameterized):
                 ``self.snapshots``.
         """
         nsm = self._prepare(mesh, model)
+        if self.couple and (self.restart_from is not None or self.dt_checkpoint is not None):
+            raise NotImplementedError("restart / checkpoints with preCICE coupling")
+        restart = (None if self.restart_from is None
+                   else restart_state(self.restart_from, self.nprocs))
         from zoomy_core.mesh import ensure_lsq_mesh
         mesh = ensure_lsq_mesh(mesh, nsm)        # its LSQ stencil: the derivatives'
         structured = _structured(mesh)
@@ -155,15 +159,24 @@ class FoamDriver(param.Parameterized):
                               systems=[sm for _, sm in self._systems(nsm)[1:]])
         binary = self.build(nsm, dim, topo)
         case = Path(workdir)
+        staged = None
+        if restart is not None and case.resolve() in (restart[0], *restart[0].parents):
+            staged = Path(tempfile.mkdtemp(dir=case.parent))   # out of the case recreated here
+            restart = _copy_state(restart, staged, [None] * self.nprocs)
         if case.exists():
             shutil.rmtree(case)
         for d in ("0", "system", "constant"):
             (case / d).mkdir(parents=True)
+        ckpt = None if self.checkpoint is None else Path(self.checkpoint).resolve()
+        start = (f"startTime {float(self.time_start)!r}; zoomyStart \"0\";\n" if restart is None
+                 else f"startTime {restart[2]!r}; zoomyStart \"{restart[1]}\"; "
+                      "zoomyRestart true;\n")
         (case / "system" / "controlDict").write_text(
             "FoamFile { version 2.0; format ascii; class dictionary; object controlDict; }\n"
-            f"application symFoam; startFrom startTime; startTime 0; stopAt endTime;\n"
+            f"application symFoam; startFrom startTime; stopAt endTime;\n{start}"
             f"endTime {1e30 if self.time_end is None else self.time_end!r}; deltaT 1; writeControl timeStep; "
             f"writeInterval 1; writeFormat ascii; writePrecision 17; spaceDimension {dim};\n"
+            + ("" if ckpt is None else f"zoomyCheckpoint \"{ckpt}\";\n")
             + self._control() + _precice_dict(self.couple))
         if structured:
             _write_grid_system(case, lo, hi, n, dim, names, cyclic)
@@ -214,10 +227,21 @@ class FoamDriver(param.Parameterized):
             _read_labels(d / "constant" / "polyMesh" / "cellProcAddressing") for d in parts]
         inv = np.empty_like(order)
         inv[order] = np.arange(len(order))
+        if restart is not None:
+            _copy_state(restart, case, parts, cells)
+        if staged is not None:
+            shutil.rmtree(staged)
+        if ckpt is not None:            # the decomposition, checked by a restart from there
+            for k, a in enumerate(cells):
+                if a is not None:
+                    (ckpt / f"processor{k}").mkdir(parents=True, exist_ok=True)
+                    shutil.copy(parts[k] / "constant" / "polyMesh" / "cellProcAddressing",
+                                ckpt / f"processor{k}" / "cellProcAddressing")
         _write_stencils(mesh, topo, order, inv, parts, cells)
         if self._hypre():
             _write_colours(topo, int(mesh.n_inner_cells), order, parts, cells)
-        r = _apptainer(f"cd {case}; {run}", binds=[case.parent, binary.parent],
+        r = _apptainer(f"cd {case}; {run}",
+                       binds=[case.parent, binary.parent] + ([] if ckpt is None else [ckpt]),
                        capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(f"symFoam failed, see {case}/log.symFoam:\n"
@@ -518,6 +542,67 @@ def _write_field(case, name, vals, patches):
         f"FoamFile {{ version 2.0; format ascii; class volScalarField; object {name}; }}\n"
         f"dimensions [0 0 0 0 0 0 0];\ninternalField nonuniform List<scalar>\n"
         f"{len(vals)}\n(\n{body}\n);\nboundaryField {{\n{bf}\n}}\n")
+
+
+def _state_time(d):
+    """The time of the restart state in the time directory `d`; None: none."""
+    try:
+        m = re.search(r"\btime\s+([^;\s]+)\s*;", (d / "uniform" / "zoomyState").read_text())
+    except OSError:
+        return None
+    return None if m is None else float(m.group(1))
+
+
+def restart_state(path, nprocs=1):
+    """The restart state `(base, name, time)` at `path`: a time directory of `io.save_state`
+    (`<base>/[processor<k>/]<name>`), or a case / checkpoint directory (its latest).
+    """
+    from zoomy_core.symsolver.restart import missing
+    p = Path(path).resolve()
+    part0 = (lambda b: b) if nprocs == 1 else (lambda b: b / "processor0")
+    if not p.exists():
+        raise missing(p)
+    if _state_time(part0(p.parent) / p.name) is not None:
+        base, name = p.parent, p.name
+    else:
+        times = ([(_state_time(d), d.name) for d in part0(p).iterdir()]
+                 if part0(p).is_dir() else [])
+        times = [(t, n) for t, n in times if t is not None]
+        if not times:
+            other = "serial" if nprocs > 1 else "parallel (processor*)"
+            raise FileNotFoundError(
+                f"restart_from {str(path)!r}: no foam restart state for {nprocs} rank(s) (a time "
+                f"directory with uniform/zoomyState, or a case / checkpoint directory holding one; "
+                f"a {other} state needs nprocs {'1' if nprocs > 1 else '> 1'})")
+        base, name = p, max(times)[1]
+    if nprocs > 1 and ((base / f"processor{nprocs}").exists()
+                       or not (base / f"processor{nprocs - 1}" / name).is_dir()):
+        n = len(list(base.glob("processor*")))
+        raise ValueError(f"restart_from {str(path)!r}: written by {n} ranks, this run has nprocs "
+                         f"{nprocs} (foam restarts on the same decomposition)")
+    return base, name, _state_time(part0(base) / name)
+
+
+def _copy_state(restart, case, parts, cells=None):
+    """Copy the restart time directories into the `parts` of `case`; `cells`: their
+    cellProcAddressing, None: stage them with theirs in `case` and return the new state.
+    """
+    base, name, time = restart
+    src = [base] if len(parts) == 1 else [base / f"processor{k}" for k in range(len(parts))]
+    for d, part, a in zip(src, parts, cells or [None] * len(parts)):
+        addr = [f for f in (d / "constant" / "polyMesh" / "cellProcAddressing",
+                            d / "cellProcAddressing") if f.exists()]
+        if cells is None:                     # staged, with the decomposition
+            to = case / d.relative_to(base)
+            shutil.copytree(d / name, to / name)
+            if addr:
+                shutil.copy(addr[0], to / "cellProcAddressing")
+        elif a is not None and addr and not np.array_equal(_read_labels(addr[0]), a):
+            raise ValueError(f"restart_from {str(base)!r}: another decomposition than this run's "
+                             f"({d.name}); restart with the same mesh, nprocs and decomposition")
+        else:
+            shutil.copytree(d / name, part / name)
+    return case, name, time
 
 
 def _read_dat(path):
