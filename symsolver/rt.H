@@ -158,38 +158,21 @@ Field select(const Field& m, const A& a, const B& b)
 /// Elementwise minimum of two fields.
 inline Field minimum(const Field& a, const Field& b) { return zip(a, b, Min{}); }
 
-/// Column ``c`` of a field as a list: the state argument of a kernel.
-inline Vec col(const Field& F, int c)
+/// Read-only strided view of a field column, a list or a stack array: a kernel's state argument (no copy).
+struct Col
 {
-    Vec r(F.nq);
-    for (int i = 0; i < F.nq; ++i) r[i] = F(i, c);
-    return r;
-}
-/// Flatten a kernel's (nested) result row-major into a vector of doubles.
-inline void flat_into(std::vector<double>& v, Foam::scalar x) { v.push_back(x); }
-template<class T> void flat_into(std::vector<double>& v, const Foam::List<T>& r)
-{
-    for (const auto& e : r) flat_into(v, e);
-}
-template<class T> std::vector<double> flat(const Foam::List<T>& r)
-{
-    std::vector<double> v;
-    flat_into(v, r);
-    return v;
-}
-/// Split a field into ``N`` equal blocks of rows.
-template<int N> std::array<Field, N> split(const Field& F)
-{
-    std::array<Field, N> out;
-    const int r = F.nq/N;
-    for (int g = 0; g < N; ++g)
-    {
-        out[g] = Field(r, F.n);
-        for (int i = 0; i < r; ++i)
-            for (int c = 0; c < F.n; ++c) out[g](i, c) = F(g*r + i, c);
-    }
-    return out;
-}
+    const double* d;
+    int s;
+    Col(const Field& F, int c) : d(F.d.empty() ? nullptr : F.d.data() + c), s(F.n) {}
+    Col(const Vec& v) : d(v.cdata()), s(1) {}
+    template<size_t N> Col(const std::array<double, N>& a) : d(a.data()), s(1) {}
+    double operator[](int i) const { return d[size_t(i)*s]; }
+};
+/// Column ``c`` of a field: the state argument of a kernel.
+inline Col col(const Field& F, int c) { return Col(F, c); }
+/// Number of entries of the (``std::array``) result of kernel ``K`` called with ``A...``.
+template<class K, class... A>
+constexpr int n_out = int(std::tuple_size_v<std::invoke_result_t<K, A...>>);
 
 // ── mesh ────────────────────────────────────────────────────────────────────
 struct Mesh;
@@ -349,12 +332,12 @@ template<class K>
 Field cells(K k, const Field& Q, const Field& Qaux, const Vec& p, double time,
             double dt, const Mesh& M)
 {
-    Field out;
+    constexpr int nq = n_out<K, Col, Col, const Vec&, double, double, const Foam::vector&>;
+    Field out(nq, M.nc);
     for (int c = 0; c < M.nc; ++c)
     {
-        const auto v = flat(k(col(Q, c), col(Qaux, c), p, time, dt, M.cc[c]));
-        if (c == 0) out = Field(int(v.size()), M.nc);
-        for (int i = 0; i < out.nq; ++i) out(i, c) = v[i];
+        const auto v = k(col(Q, c), col(Qaux, c), p, time, dt, M.cc[c]);
+        for (int i = 0; i < nq; ++i) out(i, c) = v[i];
     }
     return out;
 }
@@ -364,16 +347,17 @@ template<int N = 1, class K>
 auto faces(K k, const Field& QL, const Field& QR, const Field& AL,
            const Field& AR, const Vec& p, const Mesh& M)
 {
-    Field out;
+    constexpr int r = n_out<K, Col, Col, Col, Col, const Vec&, const Foam::vector&>/N;
+    std::array<Field, N> out;
+    for (Field& F : out) F = Field(r, M.nf);
     for (int f = 0; f < M.nf; ++f)
     {
-        const auto v = flat(k(col(QL, f), col(QR, f), col(AL, f), col(AR, f), p,
-                              M.normal[f]));
-        if (f == 0) out = Field(int(v.size()), M.nf);
-        for (int i = 0; i < out.nq; ++i) out(i, f) = v[i];
+        const auto v = k(col(QL, f), col(QR, f), col(AL, f), col(AR, f), p, M.normal[f]);
+        for (int g = 0; g < N; ++g)
+            for (int i = 0; i < r; ++i) out[g](i, f) = v[g*r + i];
     }
-    if constexpr (N == 1) return out;
-    else return split<N>(out);
+    if constexpr (N == 1) return std::move(out[0]);
+    else return out;
 }
 
 /// Aux of the owner and of the neighbour of every face (the owner twice on a boundary face).
@@ -398,7 +382,7 @@ Field face_wavespeed(K k, const Field& Q, const Field& Qaux, const Vec& p,
     auto peak = [&](int c, const Foam::vector& n)
     {
         double s = 0.0;
-        for (double x : flat(k(col(Q, c), col(Qaux, c), p, n))) s = maximum(s, std::abs(x));
+        for (double x : k(col(Q, c), col(Qaux, c), p, n)) s = maximum(s, std::abs(x));
         return s;
     };
     for (int f = 0; f < M.nf; ++f)
@@ -428,8 +412,8 @@ Field bc_states(K bc, const Field& states, const Field& Qaux, const Vec& p,
         const Foam::vector r = M.fc[f] - M.cc[c];
         const double dn = r & M.normal[f];
         const Foam::vector at = ghost ? Foam::vector(M.cc[c] + dn*M.normal[f]) : M.fc[f];
-        const auto v = flat(bc(M.bf_branch[i], time, at, ghost ? dn : Foam::mag(r),
-                               col(states, i), col(Qaux, c), p, M.normal[f]));
+        const auto v = bc(M.bf_branch[i], time, at, ghost ? dn : Foam::mag(r),
+                          col(states, i), col(Qaux, c), p, M.normal[f]);
         for (int q = 0; q < out.nq; ++q) out(q, i) = v[q];
     }
     return out;
@@ -483,17 +467,19 @@ Field boundary_traces(K bc, const Field& Q, const Field& QL, const Field& QR,
 template<class K>
 Field pointwise(K k, const Field& X, const Field& Xaux, const Vec& p)
 {
-    Field out(X.nq, X.n);
+    auto call = [&](int c)
+    {
+        if constexpr (std::is_invocable_v<K, Col, Col, const Vec&>)
+            return k(col(X, c), col(Xaux, c), p);
+        else
+            return k(col(X, c), col(Xaux, c), p, 0.0, 0.0, Foam::vector::zero);
+    };
+    constexpr int nq = int(std::tuple_size_v<decltype(call(0))>);
+    Field out(nq, X.n);
     for (int c = 0; c < X.n; ++c)
     {
-        const Vec x = col(X, c), a = col(Xaux, c);
-        std::vector<double> v;
-        if constexpr (std::is_invocable_v<K, const Vec&, const Vec&, const Vec&>)
-            v = flat(k(x, a, p));
-        else
-            v = flat(k(x, a, p, 0.0, 0.0, Foam::vector::zero));
-        if (c == 0) out = Field(int(v.size()), X.n);
-        for (int i = 0; i < out.nq; ++i) out(i, c) = v[i];
+        const auto v = call(c);
+        for (int i = 0; i < nq; ++i) out(i, c) = v[i];
     }
     return out;
 }
@@ -636,7 +622,7 @@ Field edge_source(K k, const Field& Q, const Field& QL, const Field& QR,
     Field out(Q.nq, M.nc);
     auto add = [&](int c, const Field& trace, int f, const Foam::vector& n)
     {
-        const auto v = flat(k(col(Q, c), col(trace, f), col(Qaux, c), col(Qaux, c), p, n));
+        const auto v = k(col(Q, c), col(trace, f), col(Qaux, c), col(Qaux, c), p, n);
         for (int q = 0; q < Q.nq; ++q) out(q, c) += v[q]*M.area[f]/M.vol[c];
     };
     for (int f = 0; f < M.nf; ++f)
@@ -821,7 +807,7 @@ Field inadmissible(K k, const Field& Q, const Field& Qaux, const Vec& p)
     for (int c = 0; c < Q.n; ++c)
     {
         bool bad = false;
-        for (double x : flat(k(col(Q, c), col(Qaux, c), p, 0.0, 0.0, Foam::vector::zero)))
+        for (double x : k(col(Q, c), col(Qaux, c), p, 0.0, 0.0, Foam::vector::zero))
             bad = bad || x < 0.0;
         for (int q = 0; q < Q.nq; ++q) bad = bad || !std::isfinite(Q(q, c));
         out(0, c) = bad;
@@ -1721,27 +1707,21 @@ Field interface_flux(K k, KA kaux, int side, const Field& Q, const Field& Qaux,
     const auto& F = interface().faces;
     Field out(Q.nq, M.nf);
     const Vec zero(Qaux.nq, 0.0);
-    auto aux = [&](const Vec& q, const Foam::vector& X)
+    auto aux = [&](Col q, const Foam::vector& X)
     {
         if constexpr (std::is_same_v<KA, bool>) return zero;
-        else
-        {
-            const auto v = flat(kaux(q, zero, p, 0.0, 0.0, X));
-            Vec r(int(v.size()));
-            for (size_t i = 0; i < v.size(); ++i) r[i] = v[i];
-            return r;
-        }
+        else return kaux(q, Col(zero), p, 0.0, 0.0, X);
     };
+    Vec other(peer.nq);
     for (size_t j = 0; j < F.size(); ++j)
     {
         const int f = F[j];
-        const Vec own = col(Q, M.own[f]);
-        Vec other(peer.nq);
+        const Col own = col(Q, M.own[f]);
         for (int q = 0; q < peer.nq; ++q) other[q] = peer.v[size_t(q)*peer.n + j];
-        const Vec& lo = side == 0 ? own : other;
-        const Vec& hi = side == 0 ? other : own;
+        const Col lo = side == 0 ? own : Col(other);
+        const Col hi = side == 0 ? Col(other) : own;
         const Foam::vector n = side == 0 ? M.normal[f] : Foam::vector(-M.normal[f]);
-        const auto W = flat(k(lo, hi, aux(lo, M.fc[f]), aux(hi, M.fc[f]), p, n));
+        const auto W = k(lo, hi, aux(lo, M.fc[f]), aux(hi, M.fc[f]), p, n);
         for (int q = 0; q < Q.nq; ++q) out(q, f) = W[side*Q.nq + q];
     }
     return out;
