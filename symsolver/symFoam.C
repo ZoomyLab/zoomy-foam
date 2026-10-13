@@ -1,18 +1,22 @@
 /*---------------------------------------------------------------------------*\
     symFoam -- runs a printed symbolic solver (Solver.H) on an OpenFOAM mesh: reads
-    0/Q<i>, marches with the printed ``run`` and writes the snapshots and the final
-    state as text (``out/<k>.dat``: time, then one line per state row).
+    0/Q<i> (or a restart time directory), marches with the printed ``run`` and writes
+    the snapshots and the final state as text (``out/<k>.dat``: time, then one line per
+    state row) and the restart states as time directories (Q<i>, Qaux<i>,
+    uniform/zoomyState).
 \*---------------------------------------------------------------------------*/
 #include <cfenv>
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 #include "argList.H"
 #include "Time.H"
 #include "fvMesh.H"
 #include "volFields.H"
 #include "OSspecific.H"
+#include "IFstream.H"
 #include "rt.H"
 #include "Kernels.H"
 
@@ -56,18 +60,44 @@ int main(int argc, char* argv[])
     const int dim = runTime.controlDict().lookupOrDefault<label>("spaceDimension", 1);
     const zs::Mesh M(mesh, dim, std::vector<std::string>(zs::sys.bc_tags.begin(), zs::sys.bc_tags.end()));
 
-    zs::Field Q(zs::System::n_state, M.nc), Qaux(zs::System::n_aux, M.nc);
-    for (int i = 0; i < zs::System::n_state; ++i)
+    // the start state: zoomyStart (default the start time's directory) holds Q<i>; a
+    // restart (zoomyRestart) also Qaux<i> and the exact time in uniform/zoomyState
+    const fileName start = runTime.controlDict().lookupOrDefault<fileName>("zoomyStart",
+                                                                           runTime.name());
+    const bool restart = runTime.controlDict().lookupOrDefault<Switch>("zoomyRestart", false);
+    wordList types;                       // the patch types of the written fields
+    auto read = [&](const std::string& base, int nq)
     {
-        const volScalarField qi
-        (
-            IOobject("Q" + std::to_string(i), runTime.name(), mesh,
-                     IOobject::MUST_READ, IOobject::NO_WRITE),
-            mesh
-        );
-        for (int c = 0; c < M.nown; ++c) Q(i, c) = qi[c];
+        zs::Field F(nq, M.nc);
+        for (int i = 0; i < nq; ++i)
+        {
+            const volScalarField fi
+            (
+                IOobject(base + std::to_string(i), start, mesh,
+                         IOobject::MUST_READ, IOobject::NO_WRITE),
+                mesh
+            );
+            if (types.empty()) types = fi.boundaryField().types();
+            for (int c = 0; c < M.nown; ++c) F(i, c) = fi[c];
+        }
+        return zs::halo(F, M);
+    };
+    zs::Field Q = read("Q", zs::System::n_state), Qaux(zs::System::n_aux, M.nc);
+    double time0 = runTime.startTime().value();
+    if (restart)
+    {
+        const fileName state = runTime.path()/start/"uniform"/"zoomyState";
+        if (!isFile(state))
+            FatalErrorInFunction << "restart: no " << state << exit(FatalError);
+        time0 = dictionary(IFstream(state)()).lookup<scalar>("time");
+        const zs::Field A = read("Qaux", zs::System::n_aux);
+        zs::loader() = [Q, A, time0](double& t, zs::Field& q, zs::Field& a)
+        {
+            t = time0;
+            q = Q;
+            a = A;
+        };
     }
-    Q = zs::halo(Q, M);
     const zs::Vec p = zs::System::parameters();
     const double time_end = runTime.endTime().value();
 
@@ -77,6 +107,33 @@ int main(int argc, char* argv[])
     zs::writer() = [&](double t, const zs::Field& q, const zs::Field&)
     {
         dump(out + "/" + std::to_string(k++) + ".dat", t, q, M.nown);
+    };
+    // io.save_state: the time directory <checkpoint>/[processor<k>/]<t> (default: the case's)
+    const fileName ckpt = runTime.controlDict().lookupOrDefault<fileName>("zoomyCheckpoint",
+                                                                          fileName());
+    zs::saver() = [&](double t, const zs::Field& q, const zs::Field& qa)
+    {
+        const fileName dir = ckpt.empty() ? runTime.path()/runTime.timeName(t)
+            : (Pstream::parRun() ? ckpt/("processor" + Foam::name(Pstream::myProcNo())) : ckpt)
+              /runTime.timeName(t);
+        mkDir(dir/"uniform");
+        for (const auto& [F, base] : {std::pair<const zs::Field*, std::string>{&q, "Q"},
+                                     {&qa, "Qaux"}})
+            for (int i = 0; i < F->nq; ++i)
+            {
+                volScalarField f
+                (
+                    IOobject(base + std::to_string(i), dir, mesh, IOobject::NO_READ,
+                             IOobject::NO_WRITE, false),
+                    mesh, dimensionedScalar(dimless, 0), types
+                );
+                for (int c = 0; c < M.nown; ++c) f[c] = (*F)(i, c);
+                f.write();
+            }
+        FILE* s = std::fopen((dir/"uniform"/"zoomyState").c_str(), "w");
+        std::fprintf(s, "FoamFile { version 2.0; format ascii; class dictionary; "
+                        "object zoomyState; }\ntime %.17g;\n", t);
+        std::fclose(s);
     };
 
     // preCICE: controlDict precice { participant; config; mesh; write (..);
@@ -107,7 +164,7 @@ int main(int argc, char* argv[])
 
     Qaux = std::get<0>(zs::initial_aux(Q, Qaux, p, std::cref(M), 0L));
     const auto t0 = std::chrono::steady_clock::now();
-    const auto res = zs::march(Q, Qaux, p, time_end, std::cref(M));
+    const auto res = zs::march(Q, Qaux, p, time0, time_end, std::cref(M));
     Info<< "symFoam: march wall time "
         << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
         << " s" << endl;
