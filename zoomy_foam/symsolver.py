@@ -34,9 +34,6 @@ divSchemes { default none; }
 gradSchemes
 {
     default leastSquares;
-    limited(minmod) cellLimited leastSquares 1;
-    limited(barth_jespersen) cellLimited leastSquares 1;
-    limited(venkatakrishnan) cellLimited<Venkatakrishnan> leastSquares 1;
 }
 laplacianSchemes { default Gauss linear corrected; }
 interpolationSchemes { default linear; }
@@ -246,7 +243,9 @@ class FoamDriver(param.Parameterized):
                     (ckpt / f"processor{k}").mkdir(parents=True, exist_ok=True)
                     shutil.copy(parts[k] / "constant" / "polyMesh" / "cellProcAddressing",
                                 ckpt / f"processor{k}" / "cellProcAddressing")
-        _write_stencils(mesh, topo, order, inv, parts, cells)
+        owner = getattr(nsm, "_symbolic_name", None) or "nsm"
+        _write_stencils(mesh, topo, order, inv, parts, cells,
+                        topo.lsq_closure_class.get((owner, "reconstruction"), ()))
         if self._hypre():
             _write_colours(topo, int(mesh.n_inner_cells), order, parts, cells)
         r = _apptainer(f"cd {case}; {run}",
@@ -339,10 +338,13 @@ def _cyclic(nsm):
     return pairs
 
 
-def _write_stencils(mesh, topo, order, inv, parts, cells):
-    """Write `constant/zoomyStencil` of every part: zoomy_core's LSQ tables (derivative aux fit,
-    boundary closure) per cell, in the global cell numbering of the decomposition.
+def _write_stencils(mesh, topo, order, inv, parts, cells, recon=()):
+    """Write `constant/zoomyStencil` of every part: zoomy_core's LSQ tables (the fit of the
+    derivative aux and of the reconstruction gradient, boundary closure) per cell, in the global
+    cell numbering of the decomposition, and the closure entry of each reconstruction row
+    (`recon`, the topology's `lsq_closure_class` of the reconstruction space).
     """
+    from zoomy_foam.symkernels import _closure_ints
     nc = int(mesh.n_inner_cells)
     dim = int(mesh.dimension)
     geom = compute_geometry(topo, np.asarray(mesh.vertex_coordinates)[:dim])
@@ -375,7 +377,9 @@ def _write_stencils(mesh, topo, order, inv, parts, cells):
     for d, a in zip(parts, cells):
         lines = [f"{nc if a is None else len(a)} {nbr.shape[1]} {bdy.shape[1]} {M}",
                  " ".join(str(int(p)) for mi in topo.lsq_monomial_multi_index
-                          for p in (tuple(mi) + (0, 0, 0))[:3])]
+                          for p in (tuple(mi) + (0, 0, 0))[:3]),
+                 " ".join([str(len(recon))] + [str(v) for r, e in enumerate(recon)
+                                               for v in _closure_ints(r, e)])]
         for k in (range(nc) if a is None else a):     # OF cells of this part
             c = order[k]
             b = bdy[c][bdy[c] >= 0]
