@@ -720,17 +720,27 @@ struct Fit
         map.reset(new Foam::distributionMap(Foam::globalIndex(M.nown), stencil, compact));
     }
 
+    /// Table of cell ``c`` for closure class ``cls`` (``nullptr`` if ``cls < 0`` or the class does not constrain it).
+    const std::vector<double>* find(int c, int cls) const
+    {
+        if (cls >= 0)
+            for (const auto& [k, T] : Acl[c]) if (k == cls) return &T;
+        return nullptr;
+    }
+
     /// Table of cell ``c`` for closure class ``cls`` (the base table if ``cls < 0`` or the class does not constrain it).
     const std::vector<double>& table(int c, int cls) const
     {
-        if (cls >= 0)
-            for (const auto& [k, T] : Acl[c]) if (k == cls) return T;
-        return A[c];
+        const std::vector<double>* T = find(c, cls);
+        return T ? *T : A[c];
     }
 
-    /// Derivative along ``ax`` of row ``row`` of ``Xf`` with closure class ``cls`` (boundary faces: ghosts ``G``).
+    /// Derivative along ``ax`` of row ``row`` of ``Xf`` with closure class ``cls`` (boundary faces: ghosts ``G``);
+    /// ``partners`` the further terms ``(src, class)`` of a vector row (the joint fit of its group: the other
+    /// components' samples, where that class constrains the cell, zero elsewhere).
     Field derivative(const Mesh& M, const Field& Xf, int row, int cls, const Field* G,
-                     const std::vector<int>& ax) const
+                     const std::vector<int>& ax,
+                     const std::vector<std::array<int, 2>>& partners = {}) const
     {
         const std::array<int, 2> key = ax.size() == 1 ? std::array<int, 2>{ax[0], -1}
             : std::array<int, 2>{std::min(ax[0], ax[1]), std::max(ax[0], ax[1])};
@@ -738,18 +748,34 @@ struct Fit
         if (k == int(mon.size()))
             FatalErrorInFunction << "derivative_aux: axis beyond the mesh dimension"
                 << Foam::exit(Foam::FatalError);
-        Foam::List<Foam::scalar> v(map->constructSize(), 0.0);
-        for (int c = 0; c < M.nown; ++c) v[c] = Xf(row, c);
-        map->distribute(v);
-        Field out(1, M.nc);
-        for (int c = 0; c < M.nown; ++c)
+        auto values = [&](int r)
         {
-            const double x = Xf(row, c);
-            const std::vector<double>& T = table(c, cls);
+            Foam::List<Foam::scalar> v(map->constructSize(), 0.0);
+            for (int c = 0; c < M.nown; ++c) v[c] = Xf(r, c);
+            map->distribute(v);
+            return v;
+        };
+        // sum of table . (samples - cell value) of row ``r`` in cell ``c``
+        auto apply = [&](const std::vector<double>& T, const Foam::List<Foam::scalar>& v,
+                         int r, int c)
+        {
+            const double x = Xf(r, c);
             double d = 0;
             for (int m = 0; m < nnbr; ++m) d += T[size_t(m)*nM + k]*(v[stencil[c][m]] - x);
             for (size_t j = 0; j < bfs[c].size(); ++j)
-                d += T[(nnbr + j)*nM + k]*((G ? (*G)(row, bfs[c][j]) : x) - x);
+                d += T[(nnbr + j)*nM + k]*((G ? (*G)(r, bfs[c][j]) : x) - x);
+            return d;
+        };
+        const Foam::List<Foam::scalar> v = values(row);
+        std::vector<Foam::List<Foam::scalar>> vp;
+        for (const auto& pt : partners) vp.push_back(values(pt[0]));
+        Field out(1, M.nc);
+        for (int c = 0; c < M.nown; ++c)
+        {
+            double d = apply(table(c, cls), v, row, c);
+            for (size_t i = 0; i < partners.size(); ++i)
+                if (const std::vector<double>* T = find(c, partners[i][1]))
+                    d += apply(*T, vp[i], partners[i][0], c);
             out(0, c) = d;
         }
         M.exchange(out);
@@ -777,7 +803,10 @@ Field derivatives(const S& spec, const Field& Q, Field out, const Mesh& M,
         if (int(ax.size()) > std::min(2, settings().lsq_degree))
             FatalErrorInFunction << "derivative_aux: order " << ax.size() << " > 2 or above the LSQ degree "
                 << settings().lsq_degree << Foam::exit(Foam::FatalError);
-        const Field D = fit(M).derivative(M, Q, e[1], e[5], Qg, ax);
+        std::vector<std::array<int, 2>> partners;     // a vector row's other components
+        for (size_t i = 6; i + 1 < e.size(); i += 2)
+            if (e[i] >= 0) partners.push_back({e[i], e[i + 1]});
+        const Field D = fit(M).derivative(M, Q, e[1], e[5], Qg, ax, partners);
         for (int c = 0; c < M.nc; ++c) out(e[0], c) = D(0, c);
     }
     return out;
