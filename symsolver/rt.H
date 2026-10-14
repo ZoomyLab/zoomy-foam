@@ -27,6 +27,7 @@
 #include "globalIndex.H"
 #include <fstream>
 #include "fvc.H"
+#include "leastSquaresVectors.H"
 #include "fvm.H"
 #include "fvMatrices.H"
 
@@ -540,13 +541,13 @@ inline double slope_dot(const Field& G, int q, int c, const Foam::vector& r, int
 }
 
 /// Limiter factors ``phi`` of ``rows`` (1 elsewhere) such that OpenFOAM's ``limited(<name>)`` gradient is ``phi G``.
-template<class... I>
-Field limiter_factors(const char* scheme, const std::tuple<I...>& rows,
+template<class R>
+Field limiter_factors(const char* scheme, const R& rows,
                       const Field& W, const Field& Wg, const Field& G, const Mesh& M)
 {
     Field phi(W.nq, M.nc, 1.0);
-    const Field L = fv_gradient(ints(rows), W, Wg, M, scheme);
-    for (const int q : ints(rows))
+    const Field L = fv_gradient(rows, W, Wg, M, scheme);
+    for (const int q : rows)
         for (int c = 0; c < M.nc; ++c)
         {
             double gg = 0.0, gl = 0.0;
@@ -559,22 +560,211 @@ Field limiter_factors(const char* scheme, const std::tuple<I...>& rows,
         }
     return phi;
 }
+
+// ── the free surface at the shore (reconstruction.shore_extension) ──────────
+// In the free-surface row eta a DRY neighbour k (depth row W(h, k) <= eps) enters cell i's
+// stencil as min(eta_k, eta_i): in the LSQ gradient (the difference min(eta_k - eta_i, 0)) and
+// in the limiter bounds.  The hydrostatic reconstruction's own face state continues the water
+// level of the wet cell towards a higher bed; the same continuation in the stencil keeps the
+// free surface of a lake at rest against a bank above it flat for any limiter.  Below:
+// OpenFOAM's leastSquares gradient and cellLimited limiter (fv::leastSquaresGrad,
+// fv::cellLimitedGrad: their vectors, loop order and limiter functions) with that one change;
+// a coupled neighbour's depth crosses its processor / cyclic patch with its value.
+// Ref: Audusse et al. 2004, https://doi.org/10.1137/S1064827503431090
+
+/// OpenFOAM's gradient limiter functions of r (fv::gradientLimiters).
+enum class GradLimiter { minmod, venkatakrishnan };
+inline double limiter_function(GradLimiter L, double r)
+{
+    return L == GradLimiter::minmod ? std::min(r, 1.0) : (r*r + 2*r)/(r*r + r + 2);
+}
+
+/// Rows ``er`` (eta) and ``dr`` (depth) of ``W`` as rows 0 and 1, halo columns from their owners.
+inline Field shore_rows(const Field& W, int er, int dr, const Mesh& M)
+{
+    Field E(2, M.nc);
+    for (int c = 0; c < M.nown; ++c)
+    {
+        E(0, c) = W(er, c);
+        E(1, c) = W(dr, c);
+    }
+    M.exchange(E);
+    return E;
+}
+
+/// Every boundary face in OpenFOAM's patch order (the order of its gradient loops): ``phys(i, p, k, c)`` on a physical patch (``i``: the runtime's boundary-face index), ``cpl(h, p, k, c)`` on a coupled one (``h``: the halo column); ``p`` the patch, ``k`` the face in it, ``c`` its cell.
+template<class P, class C>
+void boundary_faces(const Mesh& M, P phys, C cpl)
+{
+    int i = 0, h = M.nown;
+    forAll(M.m.boundaryMesh(), p)
+    {
+        const Foam::polyPatch& pp = M.m.boundaryMesh()[p];
+        const bool coupled = Foam::isA<Foam::processorPolyPatch>(pp)
+                          || Foam::isA<Foam::cyclicPolyPatch>(pp);
+        if (!coupled && Foam::isA<Foam::emptyPolyPatch>(pp)) continue;
+        forAll(pp, k)
+        {
+            if (coupled) cpl(h++, int(p), int(k), int(pp.faceCells()[k]));
+            else phys(i++, int(p), int(k), int(pp.faceCells()[k]));
+        }
+    }
+}
+
+/// ``d = u_k - u_i`` seen from cell i: min(d, 0) for a dry neighbour k (``E(1, k) <= eps``).
+inline double shore_delta(const Field& E, int k, double d, double eps)
+{
+    return E(1, k) <= eps ? std::min(d, 0.0) : d;
+}
+
+/// OpenFOAM's leastSquares gradient of ``E``'s row 0 with the shore differences, ``F``'s row ``er`` on the physical boundary faces; rows 0..2 = d/dx_a, own and halo columns.
+/// Ref: Mavriplis 2003, https://doi.org/10.2514/6.2003-3986
+inline Field shore_lsq(const Field& E, const Field& F, int er, double eps, const Mesh& M)
+{
+    const Foam::leastSquaresVectors& lsv = Foam::leastSquaresVectors::New(M.m);
+    const Foam::surfaceVectorField& ownLs = lsv.pVectors();
+    const Foam::surfaceVectorField& neiLs = lsv.nVectors();
+    std::vector<Foam::vector> g(M.nown, Foam::vector::zero);
+    for (int f = 0; f < M.nfi; ++f)
+    {
+        const int o = M.own[f], n = M.nei[f];
+        const double d = E(0, n) - E(0, o);
+        g[o] += ownLs[f]*shore_delta(E, n, d, eps);
+        g[n] -= neiLs[f]*(-shore_delta(E, o, -d, eps));
+    }
+    boundary_faces(M,
+        [&](int i, int p, int k, int c)
+        { g[c] += ownLs.boundaryField()[p][k]*(F(er, i) - E(0, c)); },
+        [&](int h, int p, int k, int c)
+        { g[c] += ownLs.boundaryField()[p][k]*shore_delta(E, h, E(0, h) - E(0, c), eps); });
+    Field G(3, M.nc);
+    for (int c = 0; c < M.nown; ++c)
+        for (int a = 0; a < 3; ++a) G(a, c) = g[c][a];
+    M.exchange(G);
+    return G;
+}
+
+/// OpenFOAM's cellLimited limiter factor (k = 1) of ``E``'s row 0, extrapolated with ``G``'s row ``er``, a dry neighbour bounding as min(u_k, u_i), ``F``'s row ``er`` on the physical boundary faces; own and halo columns.
+/// Ref: Barth, Jespersen 1989, https://doi.org/10.2514/6.1989-366
+inline Field shore_limiter(GradLimiter L, const Field& E, const Field& F, int er, const Field& G,
+                           double eps, const Mesh& M)
+{
+    std::vector<double> mx(M.nown), mn(M.nown);
+    for (int c = 0; c < M.nown; ++c) mx[c] = mn[c] = E(0, c);
+    auto bound = [&](int c, double v)
+    {
+        mx[c] = std::max(mx[c], v);
+        mn[c] = std::min(mn[c], v);
+    };
+    auto value = [&](int c, int k) { return E(1, k) <= eps ? std::min(E(0, k), E(0, c)) : E(0, k); };
+    for (int f = 0; f < M.nfi; ++f)
+    {
+        bound(M.own[f], value(M.own[f], M.nei[f]));
+        bound(M.nei[f], value(M.nei[f], M.own[f]));
+    }
+    boundary_faces(M, [&](int i, int, int, int c) { bound(c, F(er, i)); },
+                   [&](int h, int, int, int c) { bound(c, value(c, h)); });
+    for (int c = 0; c < M.nown; ++c)
+    {
+        mx[c] -= E(0, c);
+        mn[c] -= E(0, c);
+    }
+    Field phi(1, M.nc, 1.0);
+    auto face = [&](int c, int f)
+    {
+        const Foam::vector g(G(3*er, c), G(3*er + 1, c), G(3*er + 2, c));
+        const double e = (M.fc[f] - M.cc[c]) & g;
+        double r;
+        if (e > Foam::small) r = mx[c]/e;
+        else if (e < -Foam::small) r = mn[c]/e;
+        else return;
+        phi(0, c) = std::min(phi(0, c), limiter_function(L, r));
+    };
+    for (int f = 0; f < M.nfi; ++f)
+    {
+        face(M.own[f], f);
+        face(M.nei[f], f);
+    }
+    for (int f = M.nfi; f < M.nf; ++f) face(M.own[f], f);
+    M.exchange(phi);
+    return phi;
+}
+
+/// The LSQ gradient with the shore extension: ``shore`` = (eta, h) rows, a neighbour with ``W(h) <= eps`` enters row eta as min(W_k, W_i) (``vocabulary.gradient``).
+template<class... I>
+Field gradient(const Field& W, const Field& Wg, const std::tuple<I...>& shore, double eps,
+               const Mesh& M)
+{
+    const auto [er, dr] = ints(shore);
+    std::vector<int> rows;
+    for (int q = 0; q < W.nq; ++q)
+        if (q != er) rows.push_back(q);
+    Field G = fv_gradient(rows, W, Wg, M, "grad");
+    const Field S = shore_lsq(shore_rows(W, er, dr, M), face_values(W, Wg, M), er, eps, M);
+    for (int a = 0; a < 3; ++a)
+        for (int c = 0; c < M.nc; ++c) G(3*er + a, c) = S(a, c);
+    return G;
+}
+
+/// Limiter factors of ``rows``, the bounds of row eta in the shore form of ``gradient``.
+template<class... I, class... J>
+Field limiter_factors(const char* scheme, GradLimiter L, const std::tuple<I...>& rows,
+                      const Field& W, const Field& Wg, const Field& G,
+                      const std::tuple<J...>& shore, double eps, const Mesh& M)
+{
+    const auto [er, dr] = ints(shore);
+    std::vector<int> rest;
+    bool eta = false;
+    for (const int q : ints(rows))
+    {
+        if (q == er) eta = true;
+        else rest.push_back(q);
+    }
+    Field phi = limiter_factors(scheme, rest, W, Wg, G, M);
+    if (eta)
+    {
+        const Field s = shore_limiter(L, shore_rows(W, er, dr, M), face_values(W, Wg, M), er, G,
+                                      eps, M);
+        for (int c = 0; c < M.nc; ++c) phi(er, c) = s(0, c);
+    }
+    return phi;
+}
+
 /// Minmod limiter factors of ``rows``.
 template<class... I>
 Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
              const Field& G, const Mesh& M)
-{ return limiter_factors("limited(minmod)", rows, W, Wg, G, M); }
+{ return limiter_factors("limited(minmod)", ints(rows), W, Wg, G, M); }
 /// Venkatakrishnan limiter factors of ``rows``.
 template<class... I>
 Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W,
                       const Field& Wg, const Field& G, const Mesh& M)
-{ return limiter_factors("limited(venkatakrishnan)", rows, W, Wg, G, M); }
+{ return limiter_factors("limited(venkatakrishnan)", ints(rows), W, Wg, G, M); }
 /// Barth-Jespersen limiter factors of ``rows``.
 /// Ref: Barth, Jespersen 1989, https://doi.org/10.2514/6.1989-366
 template<class... I>
 Field barth_jespersen(const std::tuple<I...>& rows, const Field& W,
                       const Field& Wg, const Field& G, const Mesh& M)
-{ return limiter_factors("limited(barth_jespersen)", rows, W, Wg, G, M); }
+{ return limiter_factors("limited(barth_jespersen)", ints(rows), W, Wg, G, M); }
+/// The limiters with the shore extension of the bounds of row eta (``gradient``'s shore form).
+template<class... I, class... J>
+Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wg, const Field& G,
+             const std::tuple<J...>& shore, double eps, const Mesh& M)
+{ return limiter_factors("limited(minmod)", GradLimiter::minmod, rows, W, Wg, G, shore, eps, M); }
+template<class... I, class... J>
+Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
+                      const Field& G, const std::tuple<J...>& shore, double eps, const Mesh& M)
+{
+    return limiter_factors("limited(venkatakrishnan)", GradLimiter::venkatakrishnan, rows, W,
+                           Wg, G, shore, eps, M);
+}
+template<class... I, class... J>
+Field barth_jespersen(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
+                      const Field& G, const std::tuple<J...>& shore, double eps, const Mesh& M)
+{
+    return limiter_factors("limited(barth_jespersen)", GradLimiter::minmod, rows, W, Wg, G,
+                           shore, eps, M);
+}
 
 /// Face traces ``W + phi G.(x_f - x_c)`` from owner and neighbour (a boundary face's outer slot: the inner trace).
 /// Ref: van Leer 1979, https://doi.org/10.1016/0021-9991(79)90145-1
