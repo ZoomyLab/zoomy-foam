@@ -598,6 +598,32 @@ std::tuple<Field, Field> extrapolate(const Field& W, const Field& G, const P& ph
     return {L, R};
 }
 
+/// Cell mask: 1 where the depth ``Q[depth] + phi[depth] G[w].(x_f - x_c)`` falls below ``-(1/tol - 1) Q[depth]`` at a face, ``(depth, w) = rows``: the a-priori front detector (``ReconstructionSpec.front_tol``).  Own cells over all their faces; a halo column takes its owner's flag (it sees only the faces it shares with this rank).
+/// Ref: Gallardo, Pares, Castro 2007, https://doi.org/10.1016/j.jcp.2007.08.007
+template<class P, class... I>
+Field front_cells(const Field& Q, const Field& G, const P& phi, const std::tuple<I...>& rows,
+                  double tol, const Mesh& M)
+{
+    const auto r = ints(rows);
+    const int dr = r[0], wr = r[1];
+    std::vector<double> low(M.nown, std::numeric_limits<double>::infinity());
+    auto reach = [&](int c, int f)
+    {
+        if (c >= M.nown) return;
+        const double hf = Q(dr, c) + at(phi, dr, c)*slope_dot(G, wr, c, M.fc[f] - M.cc[c], M.dim);
+        low[c] = Min{}(low[c], hf);              // a NaN face depth stays NaN (no demotion)
+    };
+    for (int f = 0; f < M.nf; ++f)
+    {
+        reach(M.own[f], f);
+        if (M.nei[f] >= 0) reach(M.nei[f], f);
+    }
+    Field out(1, M.nc);
+    for (int c = 0; c < M.nown; ++c) out(0, c) = low[c] < Q(dr, c)*(1.0 - 1.0/tol) ? 1.0 : 0.0;
+    M.exchange(out);
+    return out;
+}
+
 /// Per-cell sum of the face values ``Wm`` (owner) and ``Wp`` (neighbour) times |f|/|V|.
 inline Field divergence(const Field& Wm, const Field& Wp, const Mesh& M)
 {
