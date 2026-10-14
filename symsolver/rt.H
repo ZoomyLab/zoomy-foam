@@ -862,12 +862,14 @@ Field take(const Field& Q, const std::tuple<I...>& rows)
 }
 
 // ── implicit solves (rt_common.H's implicit() from the driver) ──────────────
-/// Linear-solve state: the solver (controlDict ``linearSolver``: ``gmres``, ``schur-gamg``, ``hypre``), solve / iteration counters, seconds in matrix assembly, preconditioner setup and Krylov solve.
+/// Linear-solve state: the solver (controlDict ``linearSolver``: ``gmres``, ``schur-gamg``, ``hypre``), solve / iteration counters, seconds in matrix assembly, preconditioner setup and Krylov solve; implicit diffusion: calls, residual evaluations, seconds in all, in the explicit right-hand side and in the residual evaluations.
 struct Krylov
 {
     std::string solver = "gmres";
     long solves = 0, iters = 0;
     double t_asm = 0, t_setup = 0, t_solve = 0;
+    long diffusions = 0, residuals = 0;
+    double t_diffusion = 0, t_rhs = 0, t_residual = 0;
 };
 /// The process-wide ``Krylov``.
 inline Krylov& krylov() { static Krylov k; return k; }
@@ -1422,11 +1424,30 @@ Field linsolve(A op, const Field& b)
     const double t1 = seconds();
     kr.t_setup += t1 - t0;
     const int m = o.ls_restart;
+    // met: the last cycle's own (Arnoldi) residual estimate reached ls_tol.  If the true residual
+    // then stays above ls_tol and no longer halves over such a cycle, it is the operator's
+    // round-off floor (a finite-difference Jacobian action: ~sqrt(eps) relative), which further
+    // cycles do not pass: stop there, as hypre_solve does
+    bool met = false;
+    double last = 0.0;
+    static bool warned = false;
     for (int outer = 0; outer < o.ls_maxiter; ++outer)
     {
         Field r = b - opx(x);
         double beta = norm(r);
         if (beta <= o.ls_tol*nb) break;
+        if (met && beta > 0.5*last)
+        {
+            if (!warned)
+            {
+                warned = true;
+                warn(text("linsolve: true residual ", beta/nb, " > ls_tol ", o.ls_tol,
+                          " stalls (the round-off floor of the operator; warned once)"));
+            }
+            break;
+        }
+        last = beta;
+        met = false;
         std::vector<Field> V{r/beta}, Z;
         std::vector<std::vector<double>> H(m + 1, std::vector<double>(m, 0.0));
         std::vector<double> cs(m), sn(m), g(m + 1, 0.0);
@@ -1453,7 +1474,7 @@ Field linsolve(A op, const Field& b)
             cs[j] = H[j][j]/d; sn[j] = H[j + 1][j]/d;
             H[j][j] = d; H[j + 1][j] = 0.0;
             g[j + 1] = -sn[j]*g[j]; g[j] = cs[j]*g[j];
-            if (std::abs(g[j + 1]) <= o.ls_tol*nb || hn == 0.0) { ++j; break; }
+            if (std::abs(g[j + 1]) <= o.ls_tol*nb || hn == 0.0) { met = true; ++j; break; }
             V.push_back(w/hn);
         }
         std::vector<double> y(j);
@@ -1650,14 +1671,24 @@ template<class K, class G>
 Field implicit_diffusion(K k, G ghost, const Field& Q, const Field& Qaux, const Vec& p,
                          double time, double dt, const Mesh& M)
 {
+    auto& kr = krylov();
+    const double t0 = seconds();
     const auto [D, C] = diffusion_parts(k, ghost, Q, Qaux, p, time, M, true);
     const Field b = Q + 0.5*dt*(D + 2.0*C);
+    kr.t_rhs += seconds() - t0;
     auto R = [&](const Field& X)
     {
+        const double s = seconds();
         const Field Y = halo(X, M);
-        return Y - b - 0.5*dt*diffusion_parts(k, ghost, Y, Qaux, p, time + dt, M, false).first;
+        Field r = Y - b - 0.5*dt*diffusion_parts(k, ghost, Y, Qaux, p, time + dt, M, false).first;
+        kr.t_residual += seconds() - s;
+        ++kr.residuals;
+        return r;
     };
-    return halo(newton_krylov(R, Q), M);
+    Field out = halo(newton_krylov(R, Q), M);
+    kr.t_diffusion += seconds() - t0;
+    ++kr.diffusions;
+    return out;
 }
 
 // ── control ─────────────────────────────────────────────────────────────────
