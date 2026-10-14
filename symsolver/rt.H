@@ -55,6 +55,13 @@ inline void warn(const std::string& message)
     Foam::Warning << message.c_str() << Foam::endl;
 }
 
+/// Stop the run with ``message`` (OpenFOAM's FatalError: every rank).
+[[noreturn]] inline void fail(const std::string& message)
+{
+    FatalErrorInFunction << message.c_str() << Foam::exit(Foam::FatalError);
+    std::abort();
+}
+
 // ── arrays ──────────────────────────────────────────────────────────────────
 /// Dense array of ``nq`` rows by ``n`` columns (cells or faces), row-major: the runtime's value type.
 struct Field
