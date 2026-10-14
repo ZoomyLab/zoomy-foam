@@ -1,4 +1,4 @@
-"""The printed march raises instead of ending silently (zoomy_core ANALYSIS 49, item 1): a step
+"""The printed march raises instead of ending silently (zoomy_core ANALYSIS 52, item 1): a step
 that does not advance the time stops the loop and `check.march` fails the run, as does a
 non-finite final state; the driver raises `FloatingPointError` with the runtime's message.
 Builds the printed program (container): large.
