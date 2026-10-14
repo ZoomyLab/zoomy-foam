@@ -27,6 +27,7 @@
 #include "globalIndex.H"
 #include <fstream>
 #include "fvc.H"
+#include "leastSquaresVectors.H"
 #include "fvm.H"
 #include "fvMatrices.H"
 
@@ -52,6 +53,13 @@ using Vec = Foam::List<Foam::scalar>;
 inline void warn(const std::string& message)
 {
     Foam::Warning << message.c_str() << Foam::endl;
+}
+
+/// Stop the run with ``message`` (OpenFOAM's FatalError: every rank).
+[[noreturn]] inline void fail(const std::string& message)
+{
+    FatalErrorInFunction << message.c_str() << Foam::exit(Foam::FatalError);
+    std::abort();
 }
 
 // ── arrays ──────────────────────────────────────────────────────────────────
@@ -540,13 +548,13 @@ inline double slope_dot(const Field& G, int q, int c, const Foam::vector& r, int
 }
 
 /// Limiter factors ``phi`` of ``rows`` (1 elsewhere) such that OpenFOAM's ``limited(<name>)`` gradient is ``phi G``.
-template<class... I>
-Field limiter_factors(const char* scheme, const std::tuple<I...>& rows,
+template<class R>
+Field limiter_factors(const char* scheme, const R& rows,
                       const Field& W, const Field& Wg, const Field& G, const Mesh& M)
 {
     Field phi(W.nq, M.nc, 1.0);
-    const Field L = fv_gradient(ints(rows), W, Wg, M, scheme);
-    for (const int q : ints(rows))
+    const Field L = fv_gradient(rows, W, Wg, M, scheme);
+    for (const int q : rows)
         for (int c = 0; c < M.nc; ++c)
         {
             double gg = 0.0, gl = 0.0;
@@ -559,22 +567,211 @@ Field limiter_factors(const char* scheme, const std::tuple<I...>& rows,
         }
     return phi;
 }
+
+// ── the free surface at the shore (reconstruction.shore_extension) ──────────
+// In the free-surface row eta a DRY neighbour k (depth row W(h, k) <= eps) enters cell i's
+// stencil as min(eta_k, eta_i): in the LSQ gradient (the difference min(eta_k - eta_i, 0)) and
+// in the limiter bounds.  The hydrostatic reconstruction's own face state continues the water
+// level of the wet cell towards a higher bed; the same continuation in the stencil keeps the
+// free surface of a lake at rest against a bank above it flat for any limiter.  Below:
+// OpenFOAM's leastSquares gradient and cellLimited limiter (fv::leastSquaresGrad,
+// fv::cellLimitedGrad: their vectors, loop order and limiter functions) with that one change;
+// a coupled neighbour's depth crosses its processor / cyclic patch with its value.
+// Ref: Audusse et al. 2004, https://doi.org/10.1137/S1064827503431090
+
+/// OpenFOAM's gradient limiter functions of r (fv::gradientLimiters).
+enum class GradLimiter { minmod, venkatakrishnan };
+inline double limiter_function(GradLimiter L, double r)
+{
+    return L == GradLimiter::minmod ? std::min(r, 1.0) : (r*r + 2*r)/(r*r + r + 2);
+}
+
+/// Rows ``er`` (eta) and ``dr`` (depth) of ``W`` as rows 0 and 1, halo columns from their owners.
+inline Field shore_rows(const Field& W, int er, int dr, const Mesh& M)
+{
+    Field E(2, M.nc);
+    for (int c = 0; c < M.nown; ++c)
+    {
+        E(0, c) = W(er, c);
+        E(1, c) = W(dr, c);
+    }
+    M.exchange(E);
+    return E;
+}
+
+/// Every boundary face in OpenFOAM's patch order (the order of its gradient loops): ``phys(i, p, k, c)`` on a physical patch (``i``: the runtime's boundary-face index), ``cpl(h, p, k, c)`` on a coupled one (``h``: the halo column); ``p`` the patch, ``k`` the face in it, ``c`` its cell.
+template<class P, class C>
+void boundary_faces(const Mesh& M, P phys, C cpl)
+{
+    int i = 0, h = M.nown;
+    forAll(M.m.boundaryMesh(), p)
+    {
+        const Foam::polyPatch& pp = M.m.boundaryMesh()[p];
+        const bool coupled = Foam::isA<Foam::processorPolyPatch>(pp)
+                          || Foam::isA<Foam::cyclicPolyPatch>(pp);
+        if (!coupled && Foam::isA<Foam::emptyPolyPatch>(pp)) continue;
+        forAll(pp, k)
+        {
+            if (coupled) cpl(h++, int(p), int(k), int(pp.faceCells()[k]));
+            else phys(i++, int(p), int(k), int(pp.faceCells()[k]));
+        }
+    }
+}
+
+/// ``d = u_k - u_i`` seen from cell i: min(d, 0) for a dry neighbour k (``E(1, k) <= eps``).
+inline double shore_delta(const Field& E, int k, double d, double eps)
+{
+    return E(1, k) <= eps ? std::min(d, 0.0) : d;
+}
+
+/// OpenFOAM's leastSquares gradient of ``E``'s row 0 with the shore differences, ``F``'s row ``er`` on the physical boundary faces; rows 0..2 = d/dx_a, own and halo columns.
+/// Ref: Mavriplis 2003, https://doi.org/10.2514/6.2003-3986
+inline Field shore_lsq(const Field& E, const Field& F, int er, double eps, const Mesh& M)
+{
+    const Foam::leastSquaresVectors& lsv = Foam::leastSquaresVectors::New(M.m);
+    const Foam::surfaceVectorField& ownLs = lsv.pVectors();
+    const Foam::surfaceVectorField& neiLs = lsv.nVectors();
+    std::vector<Foam::vector> g(M.nown, Foam::vector::zero);
+    for (int f = 0; f < M.nfi; ++f)
+    {
+        const int o = M.own[f], n = M.nei[f];
+        const double d = E(0, n) - E(0, o);
+        g[o] += ownLs[f]*shore_delta(E, n, d, eps);
+        g[n] -= neiLs[f]*(-shore_delta(E, o, -d, eps));
+    }
+    boundary_faces(M,
+        [&](int i, int p, int k, int c)
+        { g[c] += ownLs.boundaryField()[p][k]*(F(er, i) - E(0, c)); },
+        [&](int h, int p, int k, int c)
+        { g[c] += ownLs.boundaryField()[p][k]*shore_delta(E, h, E(0, h) - E(0, c), eps); });
+    Field G(3, M.nc);
+    for (int c = 0; c < M.nown; ++c)
+        for (int a = 0; a < 3; ++a) G(a, c) = g[c][a];
+    M.exchange(G);
+    return G;
+}
+
+/// OpenFOAM's cellLimited limiter factor (k = 1) of ``E``'s row 0, extrapolated with ``G``'s row ``er``, a dry neighbour bounding as min(u_k, u_i), ``F``'s row ``er`` on the physical boundary faces; own and halo columns.
+/// Ref: Barth, Jespersen 1989, https://doi.org/10.2514/6.1989-366
+inline Field shore_limiter(GradLimiter L, const Field& E, const Field& F, int er, const Field& G,
+                           double eps, const Mesh& M)
+{
+    std::vector<double> mx(M.nown), mn(M.nown);
+    for (int c = 0; c < M.nown; ++c) mx[c] = mn[c] = E(0, c);
+    auto bound = [&](int c, double v)
+    {
+        mx[c] = std::max(mx[c], v);
+        mn[c] = std::min(mn[c], v);
+    };
+    auto value = [&](int c, int k) { return E(1, k) <= eps ? std::min(E(0, k), E(0, c)) : E(0, k); };
+    for (int f = 0; f < M.nfi; ++f)
+    {
+        bound(M.own[f], value(M.own[f], M.nei[f]));
+        bound(M.nei[f], value(M.nei[f], M.own[f]));
+    }
+    boundary_faces(M, [&](int i, int, int, int c) { bound(c, F(er, i)); },
+                   [&](int h, int, int, int c) { bound(c, value(c, h)); });
+    for (int c = 0; c < M.nown; ++c)
+    {
+        mx[c] -= E(0, c);
+        mn[c] -= E(0, c);
+    }
+    Field phi(1, M.nc, 1.0);
+    auto face = [&](int c, int f)
+    {
+        const Foam::vector g(G(3*er, c), G(3*er + 1, c), G(3*er + 2, c));
+        const double e = (M.fc[f] - M.cc[c]) & g;
+        double r;
+        if (e > Foam::small) r = mx[c]/e;
+        else if (e < -Foam::small) r = mn[c]/e;
+        else return;
+        phi(0, c) = std::min(phi(0, c), limiter_function(L, r));
+    };
+    for (int f = 0; f < M.nfi; ++f)
+    {
+        face(M.own[f], f);
+        face(M.nei[f], f);
+    }
+    for (int f = M.nfi; f < M.nf; ++f) face(M.own[f], f);
+    M.exchange(phi);
+    return phi;
+}
+
+/// The LSQ gradient with the shore extension: ``shore`` = (eta, h) rows, a neighbour with ``W(h) <= eps`` enters row eta as min(W_k, W_i) (``vocabulary.gradient``).
+template<class... I>
+Field gradient(const Field& W, const Field& Wg, const std::tuple<I...>& shore, double eps,
+               const Mesh& M)
+{
+    const auto [er, dr] = ints(shore);
+    std::vector<int> rows;
+    for (int q = 0; q < W.nq; ++q)
+        if (q != er) rows.push_back(q);
+    Field G = fv_gradient(rows, W, Wg, M, "grad");
+    const Field S = shore_lsq(shore_rows(W, er, dr, M), face_values(W, Wg, M), er, eps, M);
+    for (int a = 0; a < 3; ++a)
+        for (int c = 0; c < M.nc; ++c) G(3*er + a, c) = S(a, c);
+    return G;
+}
+
+/// Limiter factors of ``rows``, the bounds of row eta in the shore form of ``gradient``.
+template<class... I, class... J>
+Field limiter_factors(const char* scheme, GradLimiter L, const std::tuple<I...>& rows,
+                      const Field& W, const Field& Wg, const Field& G,
+                      const std::tuple<J...>& shore, double eps, const Mesh& M)
+{
+    const auto [er, dr] = ints(shore);
+    std::vector<int> rest;
+    bool eta = false;
+    for (const int q : ints(rows))
+    {
+        if (q == er) eta = true;
+        else rest.push_back(q);
+    }
+    Field phi = limiter_factors(scheme, rest, W, Wg, G, M);
+    if (eta)
+    {
+        const Field s = shore_limiter(L, shore_rows(W, er, dr, M), face_values(W, Wg, M), er, G,
+                                      eps, M);
+        for (int c = 0; c < M.nc; ++c) phi(er, c) = s(0, c);
+    }
+    return phi;
+}
+
 /// Minmod limiter factors of ``rows``.
 template<class... I>
 Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
              const Field& G, const Mesh& M)
-{ return limiter_factors("limited(minmod)", rows, W, Wg, G, M); }
+{ return limiter_factors("limited(minmod)", ints(rows), W, Wg, G, M); }
 /// Venkatakrishnan limiter factors of ``rows``.
 template<class... I>
 Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W,
                       const Field& Wg, const Field& G, const Mesh& M)
-{ return limiter_factors("limited(venkatakrishnan)", rows, W, Wg, G, M); }
+{ return limiter_factors("limited(venkatakrishnan)", ints(rows), W, Wg, G, M); }
 /// Barth-Jespersen limiter factors of ``rows``.
 /// Ref: Barth, Jespersen 1989, https://doi.org/10.2514/6.1989-366
 template<class... I>
 Field barth_jespersen(const std::tuple<I...>& rows, const Field& W,
                       const Field& Wg, const Field& G, const Mesh& M)
-{ return limiter_factors("limited(barth_jespersen)", rows, W, Wg, G, M); }
+{ return limiter_factors("limited(barth_jespersen)", ints(rows), W, Wg, G, M); }
+/// The limiters with the shore extension of the bounds of row eta (``gradient``'s shore form).
+template<class... I, class... J>
+Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wg, const Field& G,
+             const std::tuple<J...>& shore, double eps, const Mesh& M)
+{ return limiter_factors("limited(minmod)", GradLimiter::minmod, rows, W, Wg, G, shore, eps, M); }
+template<class... I, class... J>
+Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
+                      const Field& G, const std::tuple<J...>& shore, double eps, const Mesh& M)
+{
+    return limiter_factors("limited(venkatakrishnan)", GradLimiter::venkatakrishnan, rows, W,
+                           Wg, G, shore, eps, M);
+}
+template<class... I, class... J>
+Field barth_jespersen(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
+                      const Field& G, const std::tuple<J...>& shore, double eps, const Mesh& M)
+{
+    return limiter_factors("limited(barth_jespersen)", GradLimiter::minmod, rows, W, Wg, G,
+                           shore, eps, M);
+}
 
 /// Face traces ``W + phi G.(x_f - x_c)`` from owner and neighbour (a boundary face's outer slot: the inner trace).
 /// Ref: van Leer 1979, https://doi.org/10.1016/0021-9991(79)90145-1
@@ -596,6 +793,32 @@ std::tuple<Field, Field> extrapolate(const Field& W, const Field& G, const P& ph
         }
     }
     return {L, R};
+}
+
+/// Cell mask: 1 where the depth ``Q[depth] + phi[depth] G[w].(x_f - x_c)`` falls below ``-(1/tol - 1) Q[depth]`` at a face, ``(depth, w) = rows``: the a-priori front detector (``ReconstructionSpec.front_tol``).  Own cells over all their faces; a halo column takes its owner's flag (it sees only the faces it shares with this rank).
+/// Ref: Gallardo, Pares, Castro 2007, https://doi.org/10.1016/j.jcp.2007.08.007
+template<class P, class... I>
+Field front_cells(const Field& Q, const Field& G, const P& phi, const std::tuple<I...>& rows,
+                  double tol, const Mesh& M)
+{
+    const auto r = ints(rows);
+    const int dr = r[0], wr = r[1];
+    std::vector<double> low(M.nown, std::numeric_limits<double>::infinity());
+    auto reach = [&](int c, int f)
+    {
+        if (c >= M.nown) return;
+        const double hf = Q(dr, c) + at(phi, dr, c)*slope_dot(G, wr, c, M.fc[f] - M.cc[c], M.dim);
+        low[c] = Min{}(low[c], hf);              // a NaN face depth stays NaN (no demotion)
+    };
+    for (int f = 0; f < M.nf; ++f)
+    {
+        reach(M.own[f], f);
+        if (M.nei[f] >= 0) reach(M.nei[f], f);
+    }
+    Field out(1, M.nc);
+    for (int c = 0; c < M.nown; ++c) out(0, c) = low[c] < Q(dr, c)*(1.0 - 1.0/tol) ? 1.0 : 0.0;
+    M.exchange(out);
+    return out;
 }
 
 /// Per-cell sum of the face values ``Wm`` (owner) and ``Wp`` (neighbour) times |f|/|V|.
@@ -862,12 +1085,14 @@ Field take(const Field& Q, const std::tuple<I...>& rows)
 }
 
 // ── implicit solves (rt_common.H's implicit() from the driver) ──────────────
-/// Linear-solve state: the solver (controlDict ``linearSolver``: ``gmres``, ``schur-gamg``, ``hypre``), solve / iteration counters, seconds in matrix assembly, preconditioner setup and Krylov solve.
+/// Linear-solve state: the solver (controlDict ``linearSolver``: ``gmres``, ``schur-gamg``, ``hypre``), solve / iteration counters, seconds in matrix assembly, preconditioner setup and Krylov solve; implicit diffusion: calls, residual evaluations, seconds in all, in the explicit right-hand side and in the residual evaluations.
 struct Krylov
 {
     std::string solver = "gmres";
     long solves = 0, iters = 0;
     double t_asm = 0, t_setup = 0, t_solve = 0;
+    long diffusions = 0, residuals = 0;
+    double t_diffusion = 0, t_rhs = 0, t_residual = 0;
 };
 /// The process-wide ``Krylov``.
 inline Krylov& krylov() { static Krylov k; return k; }
@@ -1422,11 +1647,30 @@ Field linsolve(A op, const Field& b)
     const double t1 = seconds();
     kr.t_setup += t1 - t0;
     const int m = o.ls_restart;
+    // met: the last cycle's own (Arnoldi) residual estimate reached ls_tol.  If the true residual
+    // then stays above ls_tol and no longer halves over such a cycle, it is the operator's
+    // round-off floor (a finite-difference Jacobian action: ~sqrt(eps) relative), which further
+    // cycles do not pass: stop there, as hypre_solve does
+    bool met = false;
+    double last = 0.0;
+    static bool warned = false;
     for (int outer = 0; outer < o.ls_maxiter; ++outer)
     {
         Field r = b - opx(x);
         double beta = norm(r);
         if (beta <= o.ls_tol*nb) break;
+        if (met && beta > 0.5*last)
+        {
+            if (!warned)
+            {
+                warned = true;
+                warn(text("linsolve: true residual ", beta/nb, " > ls_tol ", o.ls_tol,
+                          " stalls (the round-off floor of the operator; warned once)"));
+            }
+            break;
+        }
+        last = beta;
+        met = false;
         std::vector<Field> V{r/beta}, Z;
         std::vector<std::vector<double>> H(m + 1, std::vector<double>(m, 0.0));
         std::vector<double> cs(m), sn(m), g(m + 1, 0.0);
@@ -1453,7 +1697,7 @@ Field linsolve(A op, const Field& b)
             cs[j] = H[j][j]/d; sn[j] = H[j + 1][j]/d;
             H[j][j] = d; H[j + 1][j] = 0.0;
             g[j + 1] = -sn[j]*g[j]; g[j] = cs[j]*g[j];
-            if (std::abs(g[j + 1]) <= o.ls_tol*nb || hn == 0.0) { ++j; break; }
+            if (std::abs(g[j + 1]) <= o.ls_tol*nb || hn == 0.0) { met = true; ++j; break; }
             V.push_back(w/hn);
         }
         std::vector<double> y(j);
@@ -1644,20 +1888,50 @@ Field diffusion(K k, G ghost, const Field& X, const Field& Qaux, const Vec& p,
     return D + C;
 }
 
+/// The two-point part of ``diffusion`` (the ``diffusion_tpfa`` block).
+template<class K, class G>
+Field diffusion_tpfa(K k, G ghost, const Field& X, const Field& Qaux, const Vec& p,
+                     double time, const Mesh& M)
+{
+    return diffusion_parts(k, ghost, X, Qaux, p, time, M, false).first;
+}
+
+/// ``diffusion`` beyond its two-point part (the ``diffusion_correction`` block; zero in 1-D).
+template<class K, class G>
+Field diffusion_correction(K k, G ghost, const Field& X, const Field& Qaux, const Vec& p,
+                           double time, const Mesh& M)
+{
+    return diffusion_parts(k, ghost, X, Qaux, p, time, M, true).second;
+}
+
+/// Newton on a residual coupling face neighbours (the ``implicit_solve`` block): Jacobian-free Newton-Krylov.
+/// Ref: Knoll, Keyes 2004, https://doi.org/10.1016/j.jcp.2003.08.010
+template<class F> Field implicit_solve(F f, Field x) { return newton_krylov(f, std::move(x)); }
+
 /// One Crank-Nicolson step of the two-point part of ``diffusion`` over ``dt`` (A at the new state) solved by Newton-Krylov, the correction explicit at ``Q`` (deferred).
 /// Ref: Knoll, Keyes 2004, https://doi.org/10.1016/j.jcp.2003.08.010
 template<class K, class G>
 Field implicit_diffusion(K k, G ghost, const Field& Q, const Field& Qaux, const Vec& p,
                          double time, double dt, const Mesh& M)
 {
+    auto& kr = krylov();
+    const double t0 = seconds();
     const auto [D, C] = diffusion_parts(k, ghost, Q, Qaux, p, time, M, true);
     const Field b = Q + 0.5*dt*(D + 2.0*C);
+    kr.t_rhs += seconds() - t0;
     auto R = [&](const Field& X)
     {
+        const double s = seconds();
         const Field Y = halo(X, M);
-        return Y - b - 0.5*dt*diffusion_parts(k, ghost, Y, Qaux, p, time + dt, M, false).first;
+        Field r = Y - b - 0.5*dt*diffusion_parts(k, ghost, Y, Qaux, p, time + dt, M, false).first;
+        kr.t_residual += seconds() - s;
+        ++kr.residuals;
+        return r;
     };
-    return halo(newton_krylov(R, Q), M);
+    Field out = halo(newton_krylov(R, Q), M);
+    kr.t_diffusion += seconds() - t0;
+    ++kr.diffusions;
+    return out;
 }
 
 // ── control ─────────────────────────────────────────────────────────────────

@@ -178,6 +178,12 @@ int main(int argc, char* argv[])
             << double(kr.iters)/kr.solves << " iterations/solve, ms/solve: assembly "
             << 1e3*kr.t_asm/kr.solves << ", setup " << 1e3*kr.t_setup/kr.solves
             << ", solve " << 1e3*kr.t_solve/kr.solves << endl;
+    if (kr.diffusions)
+        Info<< "implicit diffusion summary: " << kr.diffusions << " calls, "
+            << double(kr.residuals)/kr.diffusions << " residual evaluations/call, ms/call: all "
+            << 1e3*kr.t_diffusion/kr.diffusions << ", right-hand side "
+            << 1e3*kr.t_rhs/kr.diffusions << ", residual evaluations "
+            << 1e3*kr.t_residual/kr.diffusions << endl;
     zs::hypre_finalize();
     Info<< "symFoam: t = " << std::get<0>(res) << nl << "End" << endl;
     return 0;
