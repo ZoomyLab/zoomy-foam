@@ -11,6 +11,7 @@ import sympy as sp
 
 from zoomy_core.transformation.generic_c import GenericCppBase, flatten_index, get_nested_shape
 from zoomy_core.transformation.to_openfoam import FoamNumericsPrinter
+from zoomy_core.symsolver.discretization.residual import check_derivative_aux
 
 _C, _L, _S, _V = ("const Col", "const Foam::List<Foam::scalar>&", "const Foam::scalar",
                   "const Foam::vector&")
@@ -119,6 +120,8 @@ def write_kernels(systems, source, path, topo=None):
     Returns:
         `path`.
     """
+    # the derivative aux of a state row only: anything else would read 0
+    check_derivative_aux([nsm for _, nsm in systems], ("state",), "foam")
     pr = FoamKernelPrinter()
     out = ["#pragma once", "#include <array>", '#include "rt.H"',
            '#include "UserFunctions.H"', "", "namespace zs", "{"]
