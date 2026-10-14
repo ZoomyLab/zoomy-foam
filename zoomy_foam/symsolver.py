@@ -42,11 +42,6 @@ laplacianSchemes { default Gauss linear corrected; }
 interpolationSchemes { default linear; }
 snGradSchemes { default corrected; }
 """
-# preCICE the binary links: a prefix whose version matches the Python peers
-# (conda-forge stops at 3.4.0, the container ships 3.4.1; preCICE refuses to
-# couple different versions).  Unset or missing: the container's own.
-PRECICE = Path(os.environ.get("ZOOMY_PRECICE_PREFIX",
-                              Path.home() / "of_build" / "precice-3.4.0"))
 # hypre for linear_solver=LinearSolver.hypre: the static CPU libHYPRE.a of
 # containers/zoomy_amrex/build_hypre_cuda.sh (variant cpu, built in the AMReX
 # image).  The OF13 image has the same Ubuntu 24.04, gcc 13.3 and OpenMPI 4.1.6,
@@ -304,12 +299,10 @@ class SymbolicChorinSolverFoam(FoamDriver, CxxChorinBackend):
 
 
 def _options(hypre, build):
-    """`Make/options` of the build tree `build`: preCICE; with the hypre prefix `hypre` its
-    static library and OpenFOAM's MPI flags."""
+    """`Make/options` of the build tree `build`: the image's preCICE (3.4.0, the version of
+    the other participants: preCICE refuses to couple different ones); with the hypre prefix
+    `hypre` its static library and OpenFOAM's MPI flags."""
     inc, lib = "", "-lprecice"
-    if (PRECICE / "lib" / "libprecice.so").exists():
-        inc = f"-I{PRECICE}/include "
-        lib = f"-L{PRECICE}/lib -Wl,-rpath,{PRECICE}/lib -lprecice"
     head = ""
     if hypre is not None:   # static: nothing to bind at run time
         head = "-include $(GENERAL_RULES)/mplib$(WM_MPLIB)\n"

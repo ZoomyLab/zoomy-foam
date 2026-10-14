@@ -15,7 +15,7 @@ STATUS, measured this session:
     not built by the default ``wmake`` and no test exercised it.  Fixed, and
     ``test_swe_precice_coupling_builds`` below is what keeps it fixed.
 
-  * preCICE itself is present in the image (3.4.1), so the build is genuinely
+  * preCICE itself is present in the image (3.4.0), so the build is genuinely
     exercised rather than skipped for a missing dependency.
 
   * The full COUPLED PAIR (a two-participant SME<->VOF run) is NOT executed
