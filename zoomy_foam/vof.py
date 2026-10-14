@@ -21,6 +21,7 @@ cell-centre heights of `nz` = the tank's cells over its height (`ny`), the model
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import subprocess
 import tempfile
@@ -305,22 +306,26 @@ def coupling_library(sm, *, cache=None):
     for n in sorted(emitted):
         h.update(n.encode() + emitted[n].encode())
     build = cache / f"swecoupling_{h.hexdigest()[:16]}"
-    lib = build / "lib"
-    if (lib / "libswePreciceCoupling.so").exists():
-        return lib
-    shutil.rmtree(build, ignore_errors=True)
+    if (build / "lib" / "libswePreciceCoupling.so").exists():
+        return build / "lib"
+    # built aside and moved in whole: concurrent runs of the same model may build at once
+    tmp = Path(tempfile.mkdtemp(prefix=build.name + "_", dir=cache))
     for p in sources:
-        dst = build / p.relative_to(FOAM_ROOT)
+        dst = tmp / p.relative_to(FOAM_ROOT)
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(p, dst)
     for n, text in emitted.items():
-        (build / n).write_text(text)
-    r = _apptainer(f"export FOAM_USER_LIBBIN={lib}; cd {build}/swePreciceCoupling; "
+        (tmp / n).write_text(text)
+    r = _apptainer(f"export FOAM_USER_LIBBIN={tmp}/lib; cd {tmp}/swePreciceCoupling; "
                    "wmake libso > wmake.log 2>&1; rc=$?; tail -30 wmake.log; [ $rc -eq 0 ]",
-                   binds=[build], capture_output=True, text=True)
-    if r.returncode != 0 or not (lib / "libswePreciceCoupling.so").exists():
-        raise RuntimeError(f"swePreciceCoupling wmake failed ({build}):\n{r.stdout}\n{r.stderr}")
-    return lib
+                   binds=[tmp], capture_output=True, text=True)
+    if r.returncode != 0 or not (tmp / "lib" / "libswePreciceCoupling.so").exists():
+        raise RuntimeError(f"swePreciceCoupling wmake failed ({tmp}):\n{r.stdout}\n{r.stderr}")
+    try:
+        os.rename(tmp, build)
+    except OSError:                      # another run moved its build in first
+        shutil.rmtree(tmp, ignore_errors=True)
+    return build / "lib"
 
 
 def start(case, lib, *, log=None):
