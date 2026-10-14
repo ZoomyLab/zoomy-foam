@@ -142,12 +142,14 @@ def write_kernels(systems, source, path, topo=None):
                 classes = (topo.lsq_closure_class.get((name, "state"), ())
                            if topo is not None else ())
                 rows = [(e["row"], e["state_index"], *_axes(e["multi_index"]),
-                         int(classes[e["state_index"]]) if len(classes) else -1)
+                         *_closure_ints(e["state_index"],
+                                        classes[e["state_index"]] if len(classes) else -1))
                         for e in nsm.aux_derivatives
                         if e["kind"] == "derivative" and e["target_kind"] == "state"]
                 items = ", ".join("{" + ", ".join(map(str, r)) + "}" for r in rows)
-                out.append(f"    static constexpr std::array<std::array<int, 6>, "
-                           f"{len(rows)}> aux_derivatives = {{{{{items}}}}};")
+                out.append(f"    static constexpr std::array<std::array<int, "
+                           f"{6 + 2 * _PARTNERS}>, {len(rows)}> aux_derivatives = "
+                           f"{{{{{items}}}}};")
             elif call[k] is None:
                 raise ValueError(f"{name}.{k} is used but empty")
             else:
@@ -158,6 +160,24 @@ def write_kernels(systems, source, path, topo=None):
             "} // namespace zs", ""]
     path.write_text("\n".join(out))
     return path
+
+
+#: Partner rows a derivative-aux entry can read (a vector row of the boundary closure: the other
+#: components of its group, at most two).
+_PARTNERS = 2
+
+
+def _closure_ints(row, entry):
+    """`(class, src, class, src, class)` of a derivative-aux entry: the class of the row's own
+    term (-1: none), then the partner terms of a vector row (-1 padded).
+    """
+    from zoomy_core.mesh.geometry_xp import closure_terms
+    terms = closure_terms(row, entry)
+    own = [k for u, k in terms if u == row]
+    other = [x for u, k in terms if u != row for x in (u, k)]
+    if len(other) > 2 * _PARTNERS:
+        raise NotImplementedError(f"closure of row {row}: {len(other) // 2} partner rows")
+    return (own[0] if own else -1, *other, *[-1] * (2 * _PARTNERS - len(other)))
 
 
 def _axes(multi_index):

@@ -27,12 +27,10 @@
 #include "globalIndex.H"
 #include <fstream>
 #include "fvc.H"
-#include "leastSquaresVectors.H"
 #include "fvm.H"
 #include "fvMatrices.H"
 
 #include <chrono>
-#include <cstdlib>
 #include <memory>
 
 #ifdef ZS_HYPRE
@@ -505,272 +503,12 @@ inline std::tuple<Field, Field> cell_traces(const Field& Q, const Mesh& M)
     return {L, R};
 }
 
-/// OpenFOAM's boundary face value, ``(W + Wg)/2`` with the ghost ``Wg`` at the mirror image of the cell centre.
-inline Field face_values(const Field& W, const Field& Wg, const Mesh& M)
-{
-    Field F(W.nq, M.nbf);
-    for (int q = 0; q < W.nq; ++q)
-        for (int i = 0; i < M.nbf; ++i) F(q, i) = 0.5*(W(q, M.bf_cell[i]) + Wg(q, i));
-    return F;
-}
-
-/// OpenFOAM gradient scheme ``scheme`` of ``rows``; row ``3 q + a`` holds d/dx_a of row ``q``.
-template<class R>
-Field fv_gradient(const R& rows, const Field& W, const Field& Wg, const Mesh& M,
-                  const char* scheme)
-{
-    Field G(3*W.nq, M.nc);
-    const Field F = face_values(W, Wg, M);
-    for (const int q : rows)
-    {
-        const Foam::volVectorField g(Foam::fvc::grad(M.load(W, q, &F), scheme));
-        for (int a = 0; a < 3; ++a)
-            M.copy(G, 3*q + a, g, [a](const Foam::vector& v) { return v[a]; });
-    }
-    return G;
-}
-
-/// Least-squares gradient of every row of ``W`` with the ghosts ``Wg`` on the boundary faces.
-/// Ref: Mavriplis 2003, https://doi.org/10.2514/6.2003-3986
-inline Field gradient(const Field& W, const Field& Wg, const Mesh& M)
-{
-    std::vector<int> rows(W.nq);
-    for (int q = 0; q < W.nq; ++q) rows[q] = q;
-    return fv_gradient(rows, W, Wg, M, "grad");
-}
-
 /// ``G_q . r`` over the mesh dimension: slope of row ``q`` of cell ``c`` along ``r``.
 inline double slope_dot(const Field& G, int q, int c, const Foam::vector& r, int dim)
 {
     double s = 0.0;
     for (int a = 0; a < dim; ++a) s += G(3*q + a, c)*r[a];
     return s;
-}
-
-/// Limiter factors ``phi`` of ``rows`` (1 elsewhere) such that OpenFOAM's ``limited(<name>)`` gradient is ``phi G``.
-template<class R>
-Field limiter_factors(const char* scheme, const R& rows,
-                      const Field& W, const Field& Wg, const Field& G, const Mesh& M)
-{
-    Field phi(W.nq, M.nc, 1.0);
-    const Field L = fv_gradient(rows, W, Wg, M, scheme);
-    for (const int q : rows)
-        for (int c = 0; c < M.nc; ++c)
-        {
-            double gg = 0.0, gl = 0.0;
-            for (int a = 0; a < 3; ++a)
-            {
-                gg += G(3*q + a, c)*G(3*q + a, c);
-                gl += G(3*q + a, c)*L(3*q + a, c);
-            }
-            if (gg > 0.0) phi(q, c) = gl/gg;
-        }
-    return phi;
-}
-
-// ── the free surface at the shore (reconstruction.shore_extension) ──────────
-// In the free-surface row eta a DRY neighbour k (depth row W(h, k) <= eps) enters cell i's
-// stencil as min(eta_k, eta_i): in the LSQ gradient (the difference min(eta_k - eta_i, 0)) and
-// in the limiter bounds.  The hydrostatic reconstruction's own face state continues the water
-// level of the wet cell towards a higher bed; the same continuation in the stencil keeps the
-// free surface of a lake at rest against a bank above it flat for any limiter.  Below:
-// OpenFOAM's leastSquares gradient and cellLimited limiter (fv::leastSquaresGrad,
-// fv::cellLimitedGrad: their vectors, loop order and limiter functions) with that one change;
-// a coupled neighbour's depth crosses its processor / cyclic patch with its value.
-// Ref: Audusse et al. 2004, https://doi.org/10.1137/S1064827503431090
-
-/// OpenFOAM's gradient limiter functions of r (fv::gradientLimiters).
-enum class GradLimiter { minmod, venkatakrishnan };
-inline double limiter_function(GradLimiter L, double r)
-{
-    return L == GradLimiter::minmod ? std::min(r, 1.0) : (r*r + 2*r)/(r*r + r + 2);
-}
-
-/// Rows ``er`` (eta) and ``dr`` (depth) of ``W`` as rows 0 and 1, halo columns from their owners.
-inline Field shore_rows(const Field& W, int er, int dr, const Mesh& M)
-{
-    Field E(2, M.nc);
-    for (int c = 0; c < M.nown; ++c)
-    {
-        E(0, c) = W(er, c);
-        E(1, c) = W(dr, c);
-    }
-    M.exchange(E);
-    return E;
-}
-
-/// Every boundary face in OpenFOAM's patch order (the order of its gradient loops): ``phys(i, p, k, c)`` on a physical patch (``i``: the runtime's boundary-face index), ``cpl(h, p, k, c)`` on a coupled one (``h``: the halo column); ``p`` the patch, ``k`` the face in it, ``c`` its cell.
-template<class P, class C>
-void boundary_faces(const Mesh& M, P phys, C cpl)
-{
-    int i = 0, h = M.nown;
-    forAll(M.m.boundaryMesh(), p)
-    {
-        const Foam::polyPatch& pp = M.m.boundaryMesh()[p];
-        const bool coupled = Foam::isA<Foam::processorPolyPatch>(pp)
-                          || Foam::isA<Foam::cyclicPolyPatch>(pp);
-        if (!coupled && Foam::isA<Foam::emptyPolyPatch>(pp)) continue;
-        forAll(pp, k)
-        {
-            if (coupled) cpl(h++, int(p), int(k), int(pp.faceCells()[k]));
-            else phys(i++, int(p), int(k), int(pp.faceCells()[k]));
-        }
-    }
-}
-
-/// ``d = u_k - u_i`` seen from cell i: min(d, 0) for a dry neighbour k (``E(1, k) <= eps``).
-inline double shore_delta(const Field& E, int k, double d, double eps)
-{
-    return E(1, k) <= eps ? std::min(d, 0.0) : d;
-}
-
-/// OpenFOAM's leastSquares gradient of ``E``'s row 0 with the shore differences, ``F``'s row ``er`` on the physical boundary faces; rows 0..2 = d/dx_a, own and halo columns.
-/// Ref: Mavriplis 2003, https://doi.org/10.2514/6.2003-3986
-inline Field shore_lsq(const Field& E, const Field& F, int er, double eps, const Mesh& M)
-{
-    const Foam::leastSquaresVectors& lsv = Foam::leastSquaresVectors::New(M.m);
-    const Foam::surfaceVectorField& ownLs = lsv.pVectors();
-    const Foam::surfaceVectorField& neiLs = lsv.nVectors();
-    std::vector<Foam::vector> g(M.nown, Foam::vector::zero);
-    for (int f = 0; f < M.nfi; ++f)
-    {
-        const int o = M.own[f], n = M.nei[f];
-        const double d = E(0, n) - E(0, o);
-        g[o] += ownLs[f]*shore_delta(E, n, d, eps);
-        g[n] -= neiLs[f]*(-shore_delta(E, o, -d, eps));
-    }
-    boundary_faces(M,
-        [&](int i, int p, int k, int c)
-        { g[c] += ownLs.boundaryField()[p][k]*(F(er, i) - E(0, c)); },
-        [&](int h, int p, int k, int c)
-        { g[c] += ownLs.boundaryField()[p][k]*shore_delta(E, h, E(0, h) - E(0, c), eps); });
-    Field G(3, M.nc);
-    for (int c = 0; c < M.nown; ++c)
-        for (int a = 0; a < 3; ++a) G(a, c) = g[c][a];
-    M.exchange(G);
-    return G;
-}
-
-/// OpenFOAM's cellLimited limiter factor (k = 1) of ``E``'s row 0, extrapolated with ``G``'s row ``er``, a dry neighbour bounding as min(u_k, u_i), ``F``'s row ``er`` on the physical boundary faces; own and halo columns.
-/// Ref: Barth, Jespersen 1989, https://doi.org/10.2514/6.1989-366
-inline Field shore_limiter(GradLimiter L, const Field& E, const Field& F, int er, const Field& G,
-                           double eps, const Mesh& M)
-{
-    std::vector<double> mx(M.nown), mn(M.nown);
-    for (int c = 0; c < M.nown; ++c) mx[c] = mn[c] = E(0, c);
-    auto bound = [&](int c, double v)
-    {
-        mx[c] = std::max(mx[c], v);
-        mn[c] = std::min(mn[c], v);
-    };
-    auto value = [&](int c, int k) { return E(1, k) <= eps ? std::min(E(0, k), E(0, c)) : E(0, k); };
-    for (int f = 0; f < M.nfi; ++f)
-    {
-        bound(M.own[f], value(M.own[f], M.nei[f]));
-        bound(M.nei[f], value(M.nei[f], M.own[f]));
-    }
-    boundary_faces(M, [&](int i, int, int, int c) { bound(c, F(er, i)); },
-                   [&](int h, int, int, int c) { bound(c, value(c, h)); });
-    for (int c = 0; c < M.nown; ++c)
-    {
-        mx[c] -= E(0, c);
-        mn[c] -= E(0, c);
-    }
-    Field phi(1, M.nc, 1.0);
-    auto face = [&](int c, int f)
-    {
-        const Foam::vector g(G(3*er, c), G(3*er + 1, c), G(3*er + 2, c));
-        const double e = (M.fc[f] - M.cc[c]) & g;
-        double r;
-        if (e > Foam::small) r = mx[c]/e;
-        else if (e < -Foam::small) r = mn[c]/e;
-        else return;
-        phi(0, c) = std::min(phi(0, c), limiter_function(L, r));
-    };
-    for (int f = 0; f < M.nfi; ++f)
-    {
-        face(M.own[f], f);
-        face(M.nei[f], f);
-    }
-    for (int f = M.nfi; f < M.nf; ++f) face(M.own[f], f);
-    M.exchange(phi);
-    return phi;
-}
-
-/// The LSQ gradient with the shore extension: ``shore`` = (eta, h) rows, a neighbour with ``W(h) <= eps`` enters row eta as min(W_k, W_i) (``vocabulary.gradient``).
-template<class... I>
-Field gradient(const Field& W, const Field& Wg, const std::tuple<I...>& shore, double eps,
-               const Mesh& M)
-{
-    const auto [er, dr] = ints(shore);
-    std::vector<int> rows;
-    for (int q = 0; q < W.nq; ++q)
-        if (q != er) rows.push_back(q);
-    Field G = fv_gradient(rows, W, Wg, M, "grad");
-    const Field S = shore_lsq(shore_rows(W, er, dr, M), face_values(W, Wg, M), er, eps, M);
-    for (int a = 0; a < 3; ++a)
-        for (int c = 0; c < M.nc; ++c) G(3*er + a, c) = S(a, c);
-    return G;
-}
-
-/// Limiter factors of ``rows``, the bounds of row eta in the shore form of ``gradient``.
-template<class... I, class... J>
-Field limiter_factors(const char* scheme, GradLimiter L, const std::tuple<I...>& rows,
-                      const Field& W, const Field& Wg, const Field& G,
-                      const std::tuple<J...>& shore, double eps, const Mesh& M)
-{
-    const auto [er, dr] = ints(shore);
-    std::vector<int> rest;
-    bool eta = false;
-    for (const int q : ints(rows))
-    {
-        if (q == er) eta = true;
-        else rest.push_back(q);
-    }
-    Field phi = limiter_factors(scheme, rest, W, Wg, G, M);
-    if (eta)
-    {
-        const Field s = shore_limiter(L, shore_rows(W, er, dr, M), face_values(W, Wg, M), er, G,
-                                      eps, M);
-        for (int c = 0; c < M.nc; ++c) phi(er, c) = s(0, c);
-    }
-    return phi;
-}
-
-/// Minmod limiter factors of ``rows``.
-template<class... I>
-Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
-             const Field& G, const Mesh& M)
-{ return limiter_factors("limited(minmod)", ints(rows), W, Wg, G, M); }
-/// Venkatakrishnan limiter factors of ``rows``.
-template<class... I>
-Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W,
-                      const Field& Wg, const Field& G, const Mesh& M)
-{ return limiter_factors("limited(venkatakrishnan)", ints(rows), W, Wg, G, M); }
-/// Barth-Jespersen limiter factors of ``rows``.
-/// Ref: Barth, Jespersen 1989, https://doi.org/10.2514/6.1989-366
-template<class... I>
-Field barth_jespersen(const std::tuple<I...>& rows, const Field& W,
-                      const Field& Wg, const Field& G, const Mesh& M)
-{ return limiter_factors("limited(barth_jespersen)", ints(rows), W, Wg, G, M); }
-/// The limiters with the shore extension of the bounds of row eta (``gradient``'s shore form).
-template<class... I, class... J>
-Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wg, const Field& G,
-             const std::tuple<J...>& shore, double eps, const Mesh& M)
-{ return limiter_factors("limited(minmod)", GradLimiter::minmod, rows, W, Wg, G, shore, eps, M); }
-template<class... I, class... J>
-Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
-                      const Field& G, const std::tuple<J...>& shore, double eps, const Mesh& M)
-{
-    return limiter_factors("limited(venkatakrishnan)", GradLimiter::venkatakrishnan, rows, W,
-                           Wg, G, shore, eps, M);
-}
-template<class... I, class... J>
-Field barth_jespersen(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
-                      const Field& G, const std::tuple<J...>& shore, double eps, const Mesh& M)
-{
-    return limiter_factors("limited(barth_jespersen)", GradLimiter::minmod, rows, W, Wg, G,
-                           shore, eps, M);
 }
 
 /// Face traces ``W + phi G.(x_f - x_c)`` from owner and neighbour (a boundary face's outer slot: the inner trace).
@@ -869,6 +607,7 @@ struct Fit
     std::vector<std::vector<int>> bfs;            // per own cell: own boundary face of each table slot
     std::vector<std::vector<double>> A;           // per own cell: the base table, (nnbr + slots) x nM
     std::vector<std::vector<std::pair<int, std::vector<double>>>> Acl;  // per own cell: class -> table
+    std::vector<std::vector<int>> recon;          // per reconstruction row: class, (src, class) partners
 
     /// Read ``constant/zoomyStencil``; match each table's boundary slot to the cell's own boundary face.
     explicit Fit(const Mesh& M)
@@ -890,6 +629,10 @@ struct Fit
                           : ax.size() == 2 ? std::array<int, 2>{ax[0], ax[1]}
                           : std::array<int, 2>{-2, -2});
         }
+        int nrec = 0;
+        in >> nrec;
+        recon.assign(nrec, std::vector<int>(5));
+        for (auto& e : recon) for (int& v : e) in >> v;
         std::vector<std::vector<int>> own_bf(M.nown);
         for (int i = 0; i < M.nbf; ++i) own_bf[M.bf_cell[i]].push_back(i);
         stencil.setSize(M.nown);
@@ -943,17 +686,27 @@ struct Fit
         map.reset(new Foam::distributionMap(Foam::globalIndex(M.nown), stencil, compact));
     }
 
+    /// Table of cell ``c`` for closure class ``cls`` (``nullptr`` if ``cls < 0`` or the class does not constrain it).
+    const std::vector<double>* find(int c, int cls) const
+    {
+        if (cls >= 0)
+            for (const auto& [k, T] : Acl[c]) if (k == cls) return &T;
+        return nullptr;
+    }
+
     /// Table of cell ``c`` for closure class ``cls`` (the base table if ``cls < 0`` or the class does not constrain it).
     const std::vector<double>& table(int c, int cls) const
     {
-        if (cls >= 0)
-            for (const auto& [k, T] : Acl[c]) if (k == cls) return T;
-        return A[c];
+        const std::vector<double>* T = find(c, cls);
+        return T ? *T : A[c];
     }
 
-    /// Derivative along ``ax`` of row ``row`` of ``Xf`` with closure class ``cls`` (boundary faces: ghosts ``G``).
+    /// Derivative along ``ax`` of row ``row`` of ``Xf`` with closure class ``cls`` (boundary faces: ghosts ``G``);
+    /// ``partners`` the further terms ``(src, class)`` of a vector row (the joint fit of its group: the other
+    /// components' samples, where that class constrains the cell, zero elsewhere).
     Field derivative(const Mesh& M, const Field& Xf, int row, int cls, const Field* G,
-                     const std::vector<int>& ax) const
+                     const std::vector<int>& ax,
+                     const std::vector<std::array<int, 2>>& partners = {}) const
     {
         const std::array<int, 2> key = ax.size() == 1 ? std::array<int, 2>{ax[0], -1}
             : std::array<int, 2>{std::min(ax[0], ax[1]), std::max(ax[0], ax[1])};
@@ -961,20 +714,82 @@ struct Fit
         if (k == int(mon.size()))
             FatalErrorInFunction << "derivative_aux: axis beyond the mesh dimension"
                 << Foam::exit(Foam::FatalError);
-        Foam::List<Foam::scalar> v(map->constructSize(), 0.0);
-        for (int c = 0; c < M.nown; ++c) v[c] = Xf(row, c);
-        map->distribute(v);
-        Field out(1, M.nc);
-        for (int c = 0; c < M.nown; ++c)
+        return columns(M, Xf, row, cls, G, {k}, partners);
+    }
+
+    /// The first derivatives of row ``row`` of ``Xf`` (rows ``a < M.dim`` of the result), the
+    /// reconstruction row's closure entry ``recon[row]`` (boundary faces: ghosts ``G``);
+    /// ``shore`` = (depth row, eps): a stencil cell with ``Xf(depth) <= eps`` enters as
+    /// ``min(X_k - X_i, 0)`` (``vocabulary.gradient``'s shore form; the base fit only, as
+    /// zoomy_core's ``lsq_derivatives``: a closure fit keeps its samples).
+    Field gradient(const Mesh& M, const Field& Xf, int row, const Field* G,
+                   const std::pair<int, double>* shore = nullptr) const
+    {
+        std::vector<int> ks;
+        for (int a = 0; a < M.dim; ++a)
+            ks.push_back(int(std::find(mon.begin(), mon.end(), std::array<int, 2>{a, -1})
+                             - mon.begin()));
+        int cls = -1;
+        std::vector<std::array<int, 2>> partners;
+        if (row < int(recon.size()))
         {
-            const double x = Xf(row, c);
-            const std::vector<double>& T = table(c, cls);
-            double d = 0;
-            for (int m = 0; m < nnbr; ++m) d += T[size_t(m)*nM + k]*(v[stencil[c][m]] - x);
-            for (size_t j = 0; j < bfs[c].size(); ++j)
-                d += T[(nnbr + j)*nM + k]*((G ? (*G)(row, bfs[c][j]) : x) - x);
-            out(0, c) = d;
+            cls = recon[row][0];
+            for (size_t i = 1; i + 1 < recon[row].size(); i += 2)
+                if (recon[row][i] >= 0) partners.push_back({recon[row][i], recon[row][i + 1]});
         }
+        return columns(M, Xf, row, cls, G, ks, partners, shore);
+    }
+
+    /// Monomial columns ``ks`` of the fit of row ``row`` (one result row each), the closure
+    /// class ``cls``, the ``partners`` of a vector row (``derivative``) and the ``shore``
+    /// extension of ``gradient``.
+    Field columns(const Mesh& M, const Field& Xf, int row, int cls, const Field* G,
+                  const std::vector<int>& ks,
+                  const std::vector<std::array<int, 2>>& partners = {},
+                  const std::pair<int, double>* shore = nullptr) const
+    {
+        auto values = [&](int r)
+        {
+            Foam::List<Foam::scalar> v(map->constructSize(), 0.0);
+            for (int c = 0; c < M.nown; ++c) v[c] = Xf(r, c);
+            map->distribute(v);
+            return v;
+        };
+        // the shore form: the depth of every stencil cell, a dry one's difference min(d, 0)
+        const Foam::List<Foam::scalar> depth = shore ? values(shore->first)
+                                                     : Foam::List<Foam::scalar>();
+        // sum of table . (samples - cell value) of row ``r`` in cell ``c``, column ``k``
+        auto apply = [&](const std::vector<double>& T, const Foam::List<Foam::scalar>& v,
+                         int r, int c, int k, bool dry_rule)
+        {
+            const double x = Xf(r, c);
+            double d = 0;
+            for (int m = 0; m < nnbr; ++m)
+            {
+                const int s = stencil[c][m];
+                const double dv = v[s] - x;
+                d += T[size_t(m)*nM + k]*(dry_rule && depth[s] <= shore->second
+                                          ? std::min(dv, 0.0) : dv);
+            }
+            for (size_t j = 0; j < bfs[c].size(); ++j)
+                d += T[(nnbr + j)*nM + k]*((G ? (*G)(r, bfs[c][j]) : x) - x);
+            return d;
+        };
+        const Foam::List<Foam::scalar> v = values(row);
+        std::vector<Foam::List<Foam::scalar>> vp;
+        for (const auto& pt : partners) vp.push_back(values(pt[0]));
+        Field out(int(ks.size()), M.nc);
+        for (int c = 0; c < M.nown; ++c)
+            for (size_t i = 0; i < ks.size(); ++i)
+            {
+                const std::vector<double>* Tc = find(c, cls);
+                double d = Tc ? apply(*Tc, v, row, c, ks[i], false)
+                              : apply(A[c], v, row, c, ks[i], shore != nullptr);
+                for (size_t j = 0; j < partners.size(); ++j)
+                    if (const std::vector<double>* T = find(c, partners[j][1]))
+                        d += apply(*T, vp[j], partners[j][0], c, ks[i], false);
+                out(int(i), c) = d;
+            }
         M.exchange(out);
         return out;
     }
@@ -985,6 +800,159 @@ inline const Fit& fit(const Mesh& M)
     static std::unique_ptr<Fit> q;
     if (!q) q.reset(new Fit(M));
     return *q;
+}
+
+/// Least-squares gradient of every row of ``W`` (the template's ``gradient``): zoomy_core's fit of
+/// ``constant/zoomyStencil`` as on JAX, the ghosts ``Wg`` at the mirror images on the boundary faces,
+/// reconstruction rows with a boundary-closure class closed by its constraints.
+/// Ref: Mavriplis 2003, https://doi.org/10.2514/6.2003-3986
+inline Field gradient(const Field& W, const Field& Wg, const Mesh& M)
+{
+    Field G(3*W.nq, M.nc);
+    for (int q = 0; q < W.nq; ++q)
+    {
+        const Field D = fit(M).gradient(M, W, q, &Wg);
+        for (int a = 0; a < M.dim; ++a)
+            for (int c = 0; c < M.nc; ++c) G(3*q + a, c) = D(a, c);
+    }
+    return G;
+}
+
+// ── the free surface at the shore (reconstruction.shore_extension) ──────────
+// In the free-surface row eta a DRY stencil cell k (depth row W(h, k) <= eps) enters cell i's
+// fit as min(eta_k, eta_i): the difference min(eta_k - eta_i, 0) in the LSQ gradient, the bound
+// min(eta_k, eta_i) in the limiter; boundary ghosts are not changed (zoomy_core lsq_derivatives /
+// the runtimes' ghost_bounds).  A remote stencil cell's depth comes with its value (the Fit's
+// distribution map), a coupled face neighbour's from the halo columns.
+// Ref: Audusse et al. 2004, https://doi.org/10.1137/S1064827503431090
+
+/// The LSQ gradient with the shore extension: ``shore`` = (eta, h) rows, a stencil cell with
+/// ``W(h) <= eps`` enters row eta as min(W_k, W_i) (``vocabulary.gradient``).
+template<class... I>
+Field gradient(const Field& W, const Field& Wg, const std::tuple<I...>& shore, double eps,
+               const Mesh& M)
+{
+    const auto [er, dr] = ints(shore);
+    const std::pair<int, double> dry{dr, eps};
+    Field G(3*W.nq, M.nc);
+    for (int q = 0; q < W.nq; ++q)
+    {
+        const Field D = fit(M).gradient(M, W, q, &Wg, q == er ? &dry : nullptr);
+        for (int a = 0; a < M.dim; ++a)
+            for (int c = 0; c < M.nc; ++c) G(3*q + a, c) = D(a, c);
+    }
+    return G;
+}
+
+/// The template's limiter factors of ``rows`` (1 elsewhere), as JAX / NumPy: bounds from the face
+/// neighbours and the ghosts (a ghost bounds its face's owner); per face of the cell the candidate
+/// ``cand(max - W, min - W, G . (x_f - x_c), c)``; ``phi`` their minimum, in [0, 1].
+template<class F, class... I>
+Field limit(F cand, const std::tuple<I...>& rows, const Field& W, const Field& Wg,
+            const Field& G, const Mesh& M, int er = -1, int dr = -1, double eps = 0.0)
+{
+    Field phi(W.nq, M.nc, 1.0);
+    std::vector<double> lo(M.nc), hi(M.nc);
+    for (const int q : ints(rows))
+    {
+        // a neighbour k of cell c; row eta of the shore form: a dry k bounds as min(u_k, u_c)
+        auto nb = [&](int c, int k)
+        { return q == er && W(dr, k) <= eps ? std::min(W(q, k), W(q, c)) : W(q, k); };
+        for (int c = 0; c < M.nc; ++c) lo[c] = hi[c] = W(q, c);
+        for (int f = 0; f < M.nf; ++f)
+        {
+            const int o = M.own[f], n = M.nei[f];
+            if (n < 0) continue;
+            lo[o] = std::min(lo[o], nb(o, n)); hi[o] = std::max(hi[o], nb(o, n));
+            if (f < M.nfi) { lo[n] = std::min(lo[n], nb(n, o)); hi[n] = std::max(hi[n], nb(n, o)); }
+        }
+        for (int i = 0; i < M.nbf; ++i)
+        {
+            const int c = M.bf_cell[i];
+            lo[c] = std::min(lo[c], Wg(q, i)); hi[c] = std::max(hi[c], Wg(q, i));
+        }
+        auto face = [&](int c, int f)
+        {
+            const double d = slope_dot(G, q, c, M.fc[f] - M.cc[c], M.dim);
+            phi(q, c) = std::min(phi(q, c), cand(hi[c] - W(q, c), lo[c] - W(q, c), d, c));
+        };
+        for (int f = 0; f < M.nf; ++f)
+        {
+            face(M.own[f], f);
+            if (M.nei[f] >= 0 && f < M.nfi) face(M.nei[f], f);
+        }
+        for (int c = 0; c < M.nown; ++c) phi(q, c) = std::min(1.0, std::max(0.0, phi(q, c)));
+    }
+    M.exchange(phi);
+    return phi;
+}
+
+/// Minmod / Barth-Jespersen candidate of one face: the ratio of the bound to the face increment.
+/// Ref: Barth, Jespersen 1989, https://doi.org/10.2514/6.1989-366
+inline double ratio_limit(double dp, double dm, double d, int)
+{
+    constexpr double eps = 1e-30;
+    if (d > eps) return std::min(1.0, std::max(0.0, dp/std::max(d, eps)));
+    if (d < -eps) return std::min(1.0, std::max(0.0, dm/std::min(d, -eps)));
+    return 1.0;
+}
+/// Minmod limiter factors of ``rows``.
+/// Ref: Sweby 1984, https://doi.org/10.1137/0721062
+template<class... I>
+Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
+             const Field& G, const Mesh& M)
+{ return limit(ratio_limit, rows, W, Wg, G, M); }
+/// Barth-Jespersen limiter factors of ``rows``.
+/// Ref: Barth, Jespersen 1989, https://doi.org/10.2514/6.1989-366
+template<class... I>
+Field barth_jespersen(const std::tuple<I...>& rows, const Field& W,
+                      const Field& Wg, const Field& G, const Mesh& M)
+{ return limit(ratio_limit, rows, W, Wg, G, M); }
+/// Venkatakrishnan candidate of one face (eps^2 = |V|^(2/dim) of the cell).
+/// Ref: Venkatakrishnan 1995, https://doi.org/10.1006/jcph.1995.1084
+inline auto vk_limit(const Mesh& M)
+{
+    return [&M](double dp, double dm, double d, int c)
+    {
+        constexpr double eps = 1e-30;
+        const double e2 = std::pow(std::pow(M.vol[c], 1.0/std::max(M.dim, 1)), 2);
+        auto vk = [&](double dx)
+        {
+            const double r = (dx*dx + e2 + 2*d*dx)/std::max(dx*dx + 2*d*d + d*dx + e2, eps);
+            return std::min(1.0, std::max(0.0, r));
+        };
+        if (d > eps) return vk(dp);
+        if (d < -eps) return vk(dm);
+        return 1.0;
+    };
+}
+/// Venkatakrishnan limiter factors of ``rows``.
+template<class... I>
+Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W,
+                      const Field& Wg, const Field& G, const Mesh& M)
+{ return limit(vk_limit(M), rows, W, Wg, G, M); }
+/// The limiters in ``gradient``'s shore form: the bounds of row eta with a dry neighbour as
+/// min(eta_k, eta_i).
+template<class... I, class... J>
+Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wg, const Field& G,
+             const std::tuple<J...>& shore, double eps, const Mesh& M)
+{
+    const auto [er, dr] = ints(shore);
+    return limit(ratio_limit, rows, W, Wg, G, M, er, dr, eps);
+}
+template<class... I, class... J>
+Field barth_jespersen(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
+                      const Field& G, const std::tuple<J...>& shore, double eps, const Mesh& M)
+{
+    const auto [er, dr] = ints(shore);
+    return limit(ratio_limit, rows, W, Wg, G, M, er, dr, eps);
+}
+template<class... I, class... J>
+Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
+                      const Field& G, const std::tuple<J...>& shore, double eps, const Mesh& M)
+{
+    const auto [er, dr] = ints(shore);
+    return limit(vk_limit(M), rows, W, Wg, G, M, er, dr, eps);
 }
 
 /// Fill the derivative aux rows of ``spec`` (orders 1, 2) by the fit; boundary faces carry ghosts ``Qg``.
@@ -1000,7 +968,10 @@ Field derivatives(const S& spec, const Field& Q, Field out, const Mesh& M,
         if (int(ax.size()) > std::min(2, settings().lsq_degree))
             FatalErrorInFunction << "derivative_aux: order " << ax.size() << " > 2 or above the LSQ degree "
                 << settings().lsq_degree << Foam::exit(Foam::FatalError);
-        const Field D = fit(M).derivative(M, Q, e[1], e[5], Qg, ax);
+        std::vector<std::array<int, 2>> partners;     // a vector row's other components
+        for (size_t i = 6; i + 1 < e.size(); i += 2)
+            if (e[i] >= 0) partners.push_back({e[i], e[i + 1]});
+        const Field D = fit(M).derivative(M, Q, e[1], e[5], Qg, ax, partners);
         for (int c = 0; c < M.nc; ++c) out(e[0], c) = D(0, c);
     }
     return out;
