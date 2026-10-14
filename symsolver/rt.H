@@ -53,6 +53,13 @@ inline void warn(const std::string& message)
     Foam::Warning << message.c_str() << Foam::endl;
 }
 
+/// Stop the run with ``message`` (OpenFOAM's FatalError: every rank).
+[[noreturn]] inline void fail(const std::string& message)
+{
+    FatalErrorInFunction << message.c_str() << Foam::exit(Foam::FatalError);
+    std::abort();
+}
+
 // ── arrays ──────────────────────────────────────────────────────────────────
 /// Dense array of ``nq`` rows by ``n`` columns (cells or faces), row-major: the runtime's value type.
 struct Field
@@ -526,6 +533,32 @@ std::tuple<Field, Field> extrapolate(const Field& W, const Field& G, const P& ph
     return {L, R};
 }
 
+/// Cell mask: 1 where the depth ``Q[depth] + phi[depth] G[w].(x_f - x_c)`` falls below ``-(1/tol - 1) Q[depth]`` at a face, ``(depth, w) = rows``: the a-priori front detector (``ReconstructionSpec.front_tol``).  Own cells over all their faces; a halo column takes its owner's flag (it sees only the faces it shares with this rank).
+/// Ref: Gallardo, Pares, Castro 2007, https://doi.org/10.1016/j.jcp.2007.08.007
+template<class P, class... I>
+Field front_cells(const Field& Q, const Field& G, const P& phi, const std::tuple<I...>& rows,
+                  double tol, const Mesh& M)
+{
+    const auto r = ints(rows);
+    const int dr = r[0], wr = r[1];
+    std::vector<double> low(M.nown, std::numeric_limits<double>::infinity());
+    auto reach = [&](int c, int f)
+    {
+        if (c >= M.nown) return;
+        const double hf = Q(dr, c) + at(phi, dr, c)*slope_dot(G, wr, c, M.fc[f] - M.cc[c], M.dim);
+        low[c] = Min{}(low[c], hf);              // a NaN face depth stays NaN (no demotion)
+    };
+    for (int f = 0; f < M.nf; ++f)
+    {
+        reach(M.own[f], f);
+        if (M.nei[f] >= 0) reach(M.nei[f], f);
+    }
+    Field out(1, M.nc);
+    for (int c = 0; c < M.nown; ++c) out(0, c) = low[c] < Q(dr, c)*(1.0 - 1.0/tol) ? 1.0 : 0.0;
+    M.exchange(out);
+    return out;
+}
+
 /// Per-cell sum of the face values ``Wm`` (owner) and ``Wp`` (neighbour) times |f|/|V|.
 inline Field divergence(const Field& Wm, const Field& Wp, const Mesh& M)
 {
@@ -685,8 +718,12 @@ struct Fit
     }
 
     /// The first derivatives of row ``row`` of ``Xf`` (rows ``a < M.dim`` of the result), the
-    /// reconstruction row's closure entry ``recon[row]`` (boundary faces: ghosts ``G``).
-    Field gradient(const Mesh& M, const Field& Xf, int row, const Field* G) const
+    /// reconstruction row's closure entry ``recon[row]`` (boundary faces: ghosts ``G``);
+    /// ``shore`` = (depth row, eps): a stencil cell with ``Xf(depth) <= eps`` enters as
+    /// ``min(X_k - X_i, 0)`` (``vocabulary.gradient``'s shore form; the base fit only, as
+    /// zoomy_core's ``lsq_derivatives``: a closure fit keeps its samples).
+    Field gradient(const Mesh& M, const Field& Xf, int row, const Field* G,
+                   const std::pair<int, double>* shore = nullptr) const
     {
         std::vector<int> ks;
         for (int a = 0; a < M.dim; ++a)
@@ -700,14 +737,16 @@ struct Fit
             for (size_t i = 1; i + 1 < recon[row].size(); i += 2)
                 if (recon[row][i] >= 0) partners.push_back({recon[row][i], recon[row][i + 1]});
         }
-        return columns(M, Xf, row, cls, G, ks, partners);
+        return columns(M, Xf, row, cls, G, ks, partners, shore);
     }
 
     /// Monomial columns ``ks`` of the fit of row ``row`` (one result row each), the closure
-    /// class ``cls`` and the ``partners`` of a vector row (``derivative``).
+    /// class ``cls``, the ``partners`` of a vector row (``derivative``) and the ``shore``
+    /// extension of ``gradient``.
     Field columns(const Mesh& M, const Field& Xf, int row, int cls, const Field* G,
                   const std::vector<int>& ks,
-                  const std::vector<std::array<int, 2>>& partners = {}) const
+                  const std::vector<std::array<int, 2>>& partners = {},
+                  const std::pair<int, double>* shore = nullptr) const
     {
         auto values = [&](int r)
         {
@@ -716,13 +755,22 @@ struct Fit
             map->distribute(v);
             return v;
         };
+        // the shore form: the depth of every stencil cell, a dry one's difference min(d, 0)
+        const Foam::List<Foam::scalar> depth = shore ? values(shore->first)
+                                                     : Foam::List<Foam::scalar>();
         // sum of table . (samples - cell value) of row ``r`` in cell ``c``, column ``k``
         auto apply = [&](const std::vector<double>& T, const Foam::List<Foam::scalar>& v,
-                         int r, int c, int k)
+                         int r, int c, int k, bool dry_rule)
         {
             const double x = Xf(r, c);
             double d = 0;
-            for (int m = 0; m < nnbr; ++m) d += T[size_t(m)*nM + k]*(v[stencil[c][m]] - x);
+            for (int m = 0; m < nnbr; ++m)
+            {
+                const int s = stencil[c][m];
+                const double dv = v[s] - x;
+                d += T[size_t(m)*nM + k]*(dry_rule && depth[s] <= shore->second
+                                          ? std::min(dv, 0.0) : dv);
+            }
             for (size_t j = 0; j < bfs[c].size(); ++j)
                 d += T[(nnbr + j)*nM + k]*((G ? (*G)(r, bfs[c][j]) : x) - x);
             return d;
@@ -734,10 +782,12 @@ struct Fit
         for (int c = 0; c < M.nown; ++c)
             for (size_t i = 0; i < ks.size(); ++i)
             {
-                double d = apply(table(c, cls), v, row, c, ks[i]);
+                const std::vector<double>* Tc = find(c, cls);
+                double d = Tc ? apply(*Tc, v, row, c, ks[i], false)
+                              : apply(A[c], v, row, c, ks[i], shore != nullptr);
                 for (size_t j = 0; j < partners.size(); ++j)
                     if (const std::vector<double>* T = find(c, partners[j][1]))
-                        d += apply(*T, vp[j], partners[j][0], c, ks[i]);
+                        d += apply(*T, vp[j], partners[j][0], c, ks[i], false);
                 out(int(i), c) = d;
             }
         M.exchange(out);
@@ -768,24 +818,53 @@ inline Field gradient(const Field& W, const Field& Wg, const Mesh& M)
     return G;
 }
 
+// ── the free surface at the shore (reconstruction.shore_extension) ──────────
+// In the free-surface row eta a DRY stencil cell k (depth row W(h, k) <= eps) enters cell i's
+// fit as min(eta_k, eta_i): the difference min(eta_k - eta_i, 0) in the LSQ gradient, the bound
+// min(eta_k, eta_i) in the limiter; boundary ghosts are not changed (zoomy_core lsq_derivatives /
+// the runtimes' ghost_bounds).  A remote stencil cell's depth comes with its value (the Fit's
+// distribution map), a coupled face neighbour's from the halo columns.
+// Ref: Audusse et al. 2004, https://doi.org/10.1137/S1064827503431090
+
+/// The LSQ gradient with the shore extension: ``shore`` = (eta, h) rows, a stencil cell with
+/// ``W(h) <= eps`` enters row eta as min(W_k, W_i) (``vocabulary.gradient``).
+template<class... I>
+Field gradient(const Field& W, const Field& Wg, const std::tuple<I...>& shore, double eps,
+               const Mesh& M)
+{
+    const auto [er, dr] = ints(shore);
+    const std::pair<int, double> dry{dr, eps};
+    Field G(3*W.nq, M.nc);
+    for (int q = 0; q < W.nq; ++q)
+    {
+        const Field D = fit(M).gradient(M, W, q, &Wg, q == er ? &dry : nullptr);
+        for (int a = 0; a < M.dim; ++a)
+            for (int c = 0; c < M.nc; ++c) G(3*q + a, c) = D(a, c);
+    }
+    return G;
+}
+
 /// The template's limiter factors of ``rows`` (1 elsewhere), as JAX / NumPy: bounds from the face
 /// neighbours and the ghosts (a ghost bounds its face's owner); per face of the cell the candidate
 /// ``cand(max - W, min - W, G . (x_f - x_c), c)``; ``phi`` their minimum, in [0, 1].
 template<class F, class... I>
 Field limit(F cand, const std::tuple<I...>& rows, const Field& W, const Field& Wg,
-            const Field& G, const Mesh& M)
+            const Field& G, const Mesh& M, int er = -1, int dr = -1, double eps = 0.0)
 {
     Field phi(W.nq, M.nc, 1.0);
     std::vector<double> lo(M.nc), hi(M.nc);
     for (const int q : ints(rows))
     {
+        // a neighbour k of cell c; row eta of the shore form: a dry k bounds as min(u_k, u_c)
+        auto nb = [&](int c, int k)
+        { return q == er && W(dr, k) <= eps ? std::min(W(q, k), W(q, c)) : W(q, k); };
         for (int c = 0; c < M.nc; ++c) lo[c] = hi[c] = W(q, c);
         for (int f = 0; f < M.nf; ++f)
         {
             const int o = M.own[f], n = M.nei[f];
             if (n < 0) continue;
-            lo[o] = std::min(lo[o], W(q, n)); hi[o] = std::max(hi[o], W(q, n));
-            if (f < M.nfi) { lo[n] = std::min(lo[n], W(q, o)); hi[n] = std::max(hi[n], W(q, o)); }
+            lo[o] = std::min(lo[o], nb(o, n)); hi[o] = std::max(hi[o], nb(o, n));
+            if (f < M.nfi) { lo[n] = std::min(lo[n], nb(n, o)); hi[n] = std::max(hi[n], nb(n, o)); }
         }
         for (int i = 0; i < M.nbf; ++i)
         {
@@ -829,13 +908,11 @@ template<class... I>
 Field barth_jespersen(const std::tuple<I...>& rows, const Field& W,
                       const Field& Wg, const Field& G, const Mesh& M)
 { return limit(ratio_limit, rows, W, Wg, G, M); }
-/// Venkatakrishnan limiter factors of ``rows`` (eps^2 = |V|^(2/dim)).
+/// Venkatakrishnan candidate of one face (eps^2 = |V|^(2/dim) of the cell).
 /// Ref: Venkatakrishnan 1995, https://doi.org/10.1006/jcph.1995.1084
-template<class... I>
-Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W,
-                      const Field& Wg, const Field& G, const Mesh& M)
+inline auto vk_limit(const Mesh& M)
 {
-    return limit([&M](double dp, double dm, double d, int c)
+    return [&M](double dp, double dm, double d, int c)
     {
         constexpr double eps = 1e-30;
         const double e2 = std::pow(std::pow(M.vol[c], 1.0/std::max(M.dim, 1)), 2);
@@ -847,7 +924,35 @@ Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W,
         if (d > eps) return vk(dp);
         if (d < -eps) return vk(dm);
         return 1.0;
-    }, rows, W, Wg, G, M);
+    };
+}
+/// Venkatakrishnan limiter factors of ``rows``.
+template<class... I>
+Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W,
+                      const Field& Wg, const Field& G, const Mesh& M)
+{ return limit(vk_limit(M), rows, W, Wg, G, M); }
+/// The limiters in ``gradient``'s shore form: the bounds of row eta with a dry neighbour as
+/// min(eta_k, eta_i).
+template<class... I, class... J>
+Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wg, const Field& G,
+             const std::tuple<J...>& shore, double eps, const Mesh& M)
+{
+    const auto [er, dr] = ints(shore);
+    return limit(ratio_limit, rows, W, Wg, G, M, er, dr, eps);
+}
+template<class... I, class... J>
+Field barth_jespersen(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
+                      const Field& G, const std::tuple<J...>& shore, double eps, const Mesh& M)
+{
+    const auto [er, dr] = ints(shore);
+    return limit(ratio_limit, rows, W, Wg, G, M, er, dr, eps);
+}
+template<class... I, class... J>
+Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
+                      const Field& G, const std::tuple<J...>& shore, double eps, const Mesh& M)
+{
+    const auto [er, dr] = ints(shore);
+    return limit(vk_limit(M), rows, W, Wg, G, M, er, dr, eps);
 }
 
 /// Fill the derivative aux rows of ``spec`` (orders 1, 2) by the fit; boundary faces carry ghosts ``Qg``.
@@ -951,12 +1056,14 @@ Field take(const Field& Q, const std::tuple<I...>& rows)
 }
 
 // ── implicit solves (rt_common.H's implicit() from the driver) ──────────────
-/// Linear-solve state: the solver (controlDict ``linearSolver``: ``gmres``, ``schur-gamg``, ``hypre``), solve / iteration counters, seconds in matrix assembly, preconditioner setup and Krylov solve.
+/// Linear-solve state: the solver (controlDict ``linearSolver``: ``gmres``, ``schur-gamg``, ``hypre``), solve / iteration counters, seconds in matrix assembly, preconditioner setup and Krylov solve; implicit diffusion: calls, residual evaluations, seconds in all, in the explicit right-hand side and in the residual evaluations.
 struct Krylov
 {
     std::string solver = "gmres";
     long solves = 0, iters = 0;
     double t_asm = 0, t_setup = 0, t_solve = 0;
+    long diffusions = 0, residuals = 0;
+    double t_diffusion = 0, t_rhs = 0, t_residual = 0;
 };
 /// The process-wide ``Krylov``.
 inline Krylov& krylov() { static Krylov k; return k; }
@@ -1511,11 +1618,30 @@ Field linsolve(A op, const Field& b)
     const double t1 = seconds();
     kr.t_setup += t1 - t0;
     const int m = o.ls_restart;
+    // met: the last cycle's own (Arnoldi) residual estimate reached ls_tol.  If the true residual
+    // then stays above ls_tol and no longer halves over such a cycle, it is the operator's
+    // round-off floor (a finite-difference Jacobian action: ~sqrt(eps) relative), which further
+    // cycles do not pass: stop there, as hypre_solve does
+    bool met = false;
+    double last = 0.0;
+    static bool warned = false;
     for (int outer = 0; outer < o.ls_maxiter; ++outer)
     {
         Field r = b - opx(x);
         double beta = norm(r);
         if (beta <= o.ls_tol*nb) break;
+        if (met && beta > 0.5*last)
+        {
+            if (!warned)
+            {
+                warned = true;
+                warn(text("linsolve: true residual ", beta/nb, " > ls_tol ", o.ls_tol,
+                          " stalls (the round-off floor of the operator; warned once)"));
+            }
+            break;
+        }
+        last = beta;
+        met = false;
         std::vector<Field> V{r/beta}, Z;
         std::vector<std::vector<double>> H(m + 1, std::vector<double>(m, 0.0));
         std::vector<double> cs(m), sn(m), g(m + 1, 0.0);
@@ -1542,7 +1668,7 @@ Field linsolve(A op, const Field& b)
             cs[j] = H[j][j]/d; sn[j] = H[j + 1][j]/d;
             H[j][j] = d; H[j + 1][j] = 0.0;
             g[j + 1] = -sn[j]*g[j]; g[j] = cs[j]*g[j];
-            if (std::abs(g[j + 1]) <= o.ls_tol*nb || hn == 0.0) { ++j; break; }
+            if (std::abs(g[j + 1]) <= o.ls_tol*nb || hn == 0.0) { met = true; ++j; break; }
             V.push_back(w/hn);
         }
         std::vector<double> y(j);
@@ -1733,20 +1859,50 @@ Field diffusion(K k, G ghost, const Field& X, const Field& Qaux, const Vec& p,
     return D + C;
 }
 
+/// The two-point part of ``diffusion`` (the ``diffusion_tpfa`` block).
+template<class K, class G>
+Field diffusion_tpfa(K k, G ghost, const Field& X, const Field& Qaux, const Vec& p,
+                     double time, const Mesh& M)
+{
+    return diffusion_parts(k, ghost, X, Qaux, p, time, M, false).first;
+}
+
+/// ``diffusion`` beyond its two-point part (the ``diffusion_correction`` block; zero in 1-D).
+template<class K, class G>
+Field diffusion_correction(K k, G ghost, const Field& X, const Field& Qaux, const Vec& p,
+                           double time, const Mesh& M)
+{
+    return diffusion_parts(k, ghost, X, Qaux, p, time, M, true).second;
+}
+
+/// Newton on a residual coupling face neighbours (the ``implicit_solve`` block): Jacobian-free Newton-Krylov.
+/// Ref: Knoll, Keyes 2004, https://doi.org/10.1016/j.jcp.2003.08.010
+template<class F> Field implicit_solve(F f, Field x) { return newton_krylov(f, std::move(x)); }
+
 /// One Crank-Nicolson step of the two-point part of ``diffusion`` over ``dt`` (A at the new state) solved by Newton-Krylov, the correction explicit at ``Q`` (deferred).
 /// Ref: Knoll, Keyes 2004, https://doi.org/10.1016/j.jcp.2003.08.010
 template<class K, class G>
 Field implicit_diffusion(K k, G ghost, const Field& Q, const Field& Qaux, const Vec& p,
                          double time, double dt, const Mesh& M)
 {
+    auto& kr = krylov();
+    const double t0 = seconds();
     const auto [D, C] = diffusion_parts(k, ghost, Q, Qaux, p, time, M, true);
     const Field b = Q + 0.5*dt*(D + 2.0*C);
+    kr.t_rhs += seconds() - t0;
     auto R = [&](const Field& X)
     {
+        const double s = seconds();
         const Field Y = halo(X, M);
-        return Y - b - 0.5*dt*diffusion_parts(k, ghost, Y, Qaux, p, time + dt, M, false).first;
+        Field r = Y - b - 0.5*dt*diffusion_parts(k, ghost, Y, Qaux, p, time + dt, M, false).first;
+        kr.t_residual += seconds() - s;
+        ++kr.residuals;
+        return r;
     };
-    return halo(newton_krylov(R, Q), M);
+    Field out = halo(newton_krylov(R, Q), M);
+    kr.t_diffusion += seconds() - t0;
+    ++kr.diffusions;
+    return out;
 }
 
 // ── control ─────────────────────────────────────────────────────────────────

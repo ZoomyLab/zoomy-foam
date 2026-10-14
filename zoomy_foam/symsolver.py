@@ -252,8 +252,11 @@ class FoamDriver(param.Parameterized):
                        binds=[case.parent, binary.parent] + ([] if ckpt is None else [ckpt]),
                        capture_output=True, text=True)
         if r.returncode != 0:
-            raise RuntimeError(f"symFoam failed, see {case}/log.symFoam:\n"
-                               + (case / "log.symFoam").read_text()[-3000:])
+            log = (case / "log.symFoam").read_text()
+            march = [ln.strip() for ln in log.splitlines() if "zoomy march" in ln]
+            if march:                   # check.march: the march stopped or ended non-finite
+                raise FloatingPointError(march[0])
+            raise RuntimeError(f"symFoam failed, see {case}/log.symFoam:\n" + log[-3000:])
 
         def read(name):
             """Read `out/<name>` of every part into the mesh cell order."""
