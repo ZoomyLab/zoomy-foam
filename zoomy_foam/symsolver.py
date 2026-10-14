@@ -186,7 +186,7 @@ class FoamDriver(param.Parameterized):
             f"endTime {1e30 if self.time_end is None else self.time_end!r}; deltaT 1; writeControl timeStep; "
             f"writeInterval 1; writeFormat ascii; writePrecision 17; spaceDimension {dim};\n"
             + ("" if ckpt is None else f"zoomyCheckpoint \"{ckpt}\";\n")
-            + self._control() + _precice_dict(self.couple))
+            + self._control())
         if structured:
             _write_grid_system(case, lo, hi, n, dim, names, cyclic)
             mesher = "blockMesh > log.blockMesh 2>&1"
@@ -212,6 +212,12 @@ class FoamDriver(param.Parameterized):
                 f.unlink()
             mesher = "true"
         (case / "system" / "fvSchemes").write_text(SCHEMES)
+        if self.couple:              # the preCICE entry, cells in OpenFOAM's numbering
+            if self.couple.get("overlap") is not None and self.nprocs > 1:
+                raise NotImplementedError("an overlap (Schwarz-coupled) participant on "
+                                          "several ranks")
+            with open(case / "system" / "controlDict", "a") as f:
+                f.write(_precice_dict(self.couple, mesh, order))
         Q0 = np.asarray(Q0)[:, order]
         patches = {nm: "cyclic" if nm in cyclic else "zeroGradient" for nm in names}
         if dim < 3:
@@ -317,13 +323,25 @@ def _options(hypre, build):
             f"EXE_LIBS = -lfiniteVolume -lmeshTools {lib}\n")
 
 
-def _precice_dict(c):
-    """The `precice` controlDict entry of a coupled run (empty without coupling)."""
+def _precice_dict(c, mesh=None, order=None):
+    """The `precice` controlDict entry of a coupled run (empty without coupling); an overlap
+    participant (`c['overlap']` rings, `ChorinTemplate.precice_march`) lists its overlap and mirror
+    cells in OpenFOAM's numbering (`order`: OpenFOAM cell -> mesh cell)."""
     if not c:
         return ""
+    cells = ""
+    if c.get("overlap") is not None:
+        from zoomy_core.mesh.overlap import overlap_layers
+        if int(c["overlap"]) < 2:
+            raise ValueError("overlap: at least 2 cell rings")
+        inv = np.empty(len(order), dtype=int)
+        inv[np.asarray(order)] = np.arange(len(order))
+        over, mirror = overlap_layers(mesh, c["tag"], c["overlap"])
+        cells = (f" overlap ({' '.join(map(str, inv[over]))});"
+                 f" mirror ({' '.join(map(str, inv[mirror]))});")
     return (f"precice {{ participant {c['participant']}; config \"{c['config']}\"; "
             f"mesh {c['mesh']}; write ({' '.join(c['write'])}); "
-            f"read ({' '.join(c['read'])}); tag {c['tag']}; }}\n")
+            f"read ({' '.join(c['read'])}); tag {c['tag']};{cells} }}\n")
 
 
 def _cyclic(nsm):

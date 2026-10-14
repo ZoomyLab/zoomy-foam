@@ -148,18 +148,40 @@ int main(int argc, char* argv[])
         for (const word& w : wordList(d.lookup("read"))) c.read.push_back(w);
         const word tag(d.lookup("tag"));
         std::vector<double> xy;
-        for (int i = 0; i < M.nbf; ++i)
-            if (M.bf_tag[i] == tag)
-            {
-                zs::interface().faces.push_back(M.bf_face[i]);
-                xy.push_back(M.fc[M.bf_face[i]].x());
-                xy.push_back(M.fc[M.bf_face[i]].y());
-            }
-        c.ids.resize(zs::interface().faces.size());
+        auto& o = zs::overlap();
+        if (d.found("overlap"))     // an overlap participant: mirror cells written, overlap read
+        {
+            if (Pstream::parRun())
+                FatalErrorInFunction << "an overlap (Schwarz-coupled) participant on several "
+                    "ranks" << exit(FatalError);
+            for (const label k : labelList(d.lookup("mirror"))) o.mirror.push_back(k);
+            for (const label k : labelList(d.lookup("overlap"))) o.cells.push_back(k);
+            for (const auto* C : {&o.mirror, &o.cells})
+                for (const int k : *C)
+                {
+                    xy.push_back(M.cc[k].x());
+                    xy.push_back(M.cc[k].y());
+                }
+        }
+        else
+            for (int i = 0; i < M.nbf; ++i)
+                if (M.bf_tag[i] == tag)
+                {
+                    zs::interface().faces.push_back(M.bf_face[i]);
+                    xy.push_back(M.fc[M.bf_face[i]].x());
+                    xy.push_back(M.fc[M.bf_face[i]].y());
+                }
+        c.ids.resize(xy.size()/2);
         c.participant = std::make_unique<precice::Participant>(
             word(d.lookup("participant")), fileName(d.lookup("config")),
             Pstream::myProcNo(), Pstream::nProcs());     // this rank's vertices only
         c.participant->setMeshVertices(c.mesh, xy, c.ids);
+        if (!o.cells.empty())
+        {
+            const auto n = long(o.mirror.size());
+            c.wids.assign(c.ids.begin(), c.ids.begin() + n);
+            c.rids.assign(c.ids.begin() + n, c.ids.end());
+        }
     }
 
     Qaux = std::get<0>(zs::initial_aux(Q, Qaux, p, std::cref(M), 0L));

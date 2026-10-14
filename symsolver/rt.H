@@ -1973,6 +1973,41 @@ inline Vertices interface_states(const Field& Q, const Mesh& M)
     return out;
 }
 
+/// The overlap of a Schwarz-coupled participant (``ChorinTemplate.precice_march``): its cells
+/// holding the peer's values and its mirror cells (the peer's overlap), in vertex order.
+struct Overlap { std::vector<int> cells, mirror; };
+/// The process-wide ``Overlap``.
+inline Overlap& overlap() { static Overlap o; return o; }
+
+/// Cell mask of the overlap.
+inline Field overlap_cells(const Mesh& M)
+{
+    Field out(1, M.nc);
+    for (const int c : overlap().cells) out(0, c) = 1.0;
+    return out;
+}
+
+/// The mirror cells' states, as preCICE vertices.
+inline Vertices overlap_states(const Field& Q, const Mesh&)
+{
+    const auto& C = overlap().mirror;
+    const int n = int(C.size());
+    Vertices out{Q.nq, n, std::vector<double>(size_t(Q.nq)*n)};
+    for (int j = 0; j < n; ++j)
+        for (int q = 0; q < Q.nq; ++q) out.v[size_t(q)*n + j] = Q(q, C[j]);
+    return out;
+}
+
+/// ``Q`` with the overlap cells' columns from ``peer`` (overlap vertex order).
+inline Field overlap_fill(const Field& Q, const Vertices& peer, const Mesh&)
+{
+    Field out = Q;
+    const auto& C = overlap().cells;
+    for (size_t j = 0; j < C.size(); ++j)
+        for (int q = 0; q < Q.nq; ++q) out(q, C[j]) = peer.v[size_t(q)*peer.n + j];
+    return out;
+}
+
 /// Riemann problem per coupled face, posed low -> high by kernel ``k``; aux of each state from ``kaux`` on a zero template.
 template<class K, class KA>
 Field interface_flux(K k, KA kaux, int side, const Field& Q, const Field& Qaux,
