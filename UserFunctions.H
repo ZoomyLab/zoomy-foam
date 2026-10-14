@@ -156,11 +156,11 @@ inline Foam::scalar eigensystem(I idx_, Ts... a_flat_args)
     return cache_out[idx];
 }
 
-// ── gelfand_bound(j, *A_flat) ─────────────────────────────────────────────
-/// Upper bound on ``rho(A)`` of the flat n x n matrix: ``j`` squarings, each after dividing by the max row sum ``s``, then ``w = max_i (|C| x)_i / x_i``, ``x`` the row sums of ``|C|`` plus 2^-30 their max; returns ``s_0 sqrt(s_1 sqrt(... sqrt(w)))``, ``+inf`` for a non-finite entry (kernel_functions.gelfand_bound).
+// ── gelfand_bound(j, delta, *A_flat) ────────────────────────────────────────
+/// Upper bound on ``rho(A)`` of the flat n x n matrix: ``j`` squarings, each after dividing by the max row sum ``s``, then ``w = max_i (|C| x)_i / x_i``, ``x`` the row sums of ``|C|`` plus ``delta`` their max; returns ``s_0 sqrt(s_1 sqrt(... sqrt(w)))``, ``+inf`` for a non-finite entry (kernel_functions.gelfand_bound).
 /// Ref: Horn, Johnson 2012, https://doi.org/10.1017/CBO9781139020411
-template <typename J, typename... Ts>
-inline Foam::scalar gelfand_bound(J j_, Ts... a_flat_args)
+template <typename J, typename D, typename... Ts>
+inline Foam::scalar gelfand_bound(J j_, D delta_, Ts... a_flat_args)
 {
     constexpr int M = sizeof...(Ts);
     const int N = static_cast<int>(std::lround(std::sqrt(double(M))));
@@ -200,7 +200,7 @@ inline Foam::scalar gelfand_bound(J j_, Ts... a_flat_args)
         x[i] = t;
         xmax = t > xmax ? t : xmax;
     }
-    for (int i = 0; i < N; ++i) x[i] += 9.31322574615478515625e-10*xmax;   // + 2^-30 max: w continuous in A
+    for (int i = 0; i < N; ++i) x[i] += static_cast<double>(delta_)*xmax;   // > 0: w continuous in A
     double w = 0.0;
     for (int i = 0; i < N; ++i)
     {
