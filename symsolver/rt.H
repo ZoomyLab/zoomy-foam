@@ -1888,6 +1888,26 @@ Field diffusion(K k, G ghost, const Field& X, const Field& Qaux, const Vec& p,
     return D + C;
 }
 
+/// The two-point part of ``diffusion`` (the ``diffusion_tpfa`` block).
+template<class K, class G>
+Field diffusion_tpfa(K k, G ghost, const Field& X, const Field& Qaux, const Vec& p,
+                     double time, const Mesh& M)
+{
+    return diffusion_parts(k, ghost, X, Qaux, p, time, M, false).first;
+}
+
+/// ``diffusion`` beyond its two-point part (the ``diffusion_correction`` block; zero in 1-D).
+template<class K, class G>
+Field diffusion_correction(K k, G ghost, const Field& X, const Field& Qaux, const Vec& p,
+                           double time, const Mesh& M)
+{
+    return diffusion_parts(k, ghost, X, Qaux, p, time, M, true).second;
+}
+
+/// Newton on a residual coupling face neighbours (the ``implicit_solve`` block): Jacobian-free Newton-Krylov.
+/// Ref: Knoll, Keyes 2004, https://doi.org/10.1016/j.jcp.2003.08.010
+template<class F> Field implicit_solve(F f, Field x) { return newton_krylov(f, std::move(x)); }
+
 /// One Crank-Nicolson step of the two-point part of ``diffusion`` over ``dt`` (A at the new state) solved by Newton-Krylov, the correction explicit at ``Q`` (deferred).
 /// Ref: Knoll, Keyes 2004, https://doi.org/10.1016/j.jcp.2003.08.010
 template<class K, class G>
