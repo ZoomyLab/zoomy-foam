@@ -123,19 +123,25 @@ class FoamDriver(param.Parameterized):
         h.update(files["Kernels.H"].encode())
         build = _BINCACHE / f"sym_{h.hexdigest()[:16]}"
         binary = build / "symFoam"
-        if binary.exists():
+        if binary.exists():                     # complete: it is renamed into place
             return binary
         (build / "Make").mkdir(parents=True, exist_ok=True)
-        for k, v in files.items():
-            (build / k).write_text(v)
-        (build / "Make" / "files").write_text(f"symFoam.C\n\nEXE = {binary}\n")
-        (build / "Make" / "options").write_text(_options(hypre, build))
-        r = _apptainer(f"cd {build}; wmake > wmake.log 2>&1; rc=$?; "
-                       f"tail -40 wmake.log; [ $rc -eq 0 ]",
-                       binds=[build] + ([hypre] if hypre else []),
-                       capture_output=True, text=True)
-        if r.returncode != 0 or not binary.exists():
-            raise RuntimeError(f"symFoam wmake failed ({build}):\n{r.stdout}\n{r.stderr}")
+        with open(build / ".lock", "w") as lock:    # concurrent builds of it: one builds
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if binary.exists():
+                return binary
+            for k, v in files.items():
+                (build / k).write_text(v)
+            tmp = binary.with_suffix(".tmp")
+            (build / "Make" / "files").write_text(f"symFoam.C\n\nEXE = {tmp}\n")
+            (build / "Make" / "options").write_text(_options(hypre, build))
+            r = _apptainer(f"cd {build}; wmake > wmake.log 2>&1; rc=$?; "
+                           f"tail -40 wmake.log; [ $rc -eq 0 ]",
+                           binds=[build] + ([hypre] if hypre else []),
+                           capture_output=True, text=True)
+            if r.returncode != 0 or not tmp.exists():
+                raise RuntimeError(f"symFoam wmake failed ({build}):\n{r.stdout}\n{r.stderr}")
+            os.replace(tmp, binary)             # never a partly linked binary under its name
         return binary
 
     def run(self, mesh, model, Q0, workdir):
@@ -332,8 +338,6 @@ def _precice_dict(c, mesh=None, order=None):
     cells = ""
     if c.get("overlap") is not None:
         from zoomy_core.mesh.overlap import overlap_layers
-        if int(c["overlap"]) < 2:
-            raise ValueError("overlap: at least 2 cell rings")
         inv = np.empty(len(order), dtype=int)
         inv[np.asarray(order)] = np.arange(len(order))
         over, mirror = overlap_layers(mesh, c["tag"], c["overlap"])
